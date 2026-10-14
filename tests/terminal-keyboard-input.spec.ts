@@ -127,3 +127,55 @@ test('keys typed while the terminal is still opening reach the shell', async ({ 
   await expect(terminal.getByRole('status', { name: 'Loading terminal' })).toHaveCount(0);
   await expect.poll(() => inputMessages(page)).toEqual(['p', 'w', 'd']);
 });
+
+for (const fullscreen of [false, true]) {
+  test(`Readline preset preserves editing input and escapes to the palette: fullscreen=${fullscreen}`, async ({ page }) => {
+    await installElectronApiMock(page, {
+      initialProjects: [project], initialSessions: [session], initialPanels: panels,
+      initialConfig: { terminalKeyboardPreset: 'readline-friendly' },
+      initialTerminalStates: { [panels[1].id]: { scrollbackBuffer: fullscreen ? '\x1b[?1049h' : '' } },
+      activeProjectId: project.id,
+    });
+    await page.goto('/');
+    await page.evaluate((isAlternateScreen) => {
+      window.__terminalInputMessages = [];
+      const invoke = window.electronAPI.invoke;
+      window.electronAPI.invoke = (channel: string, ...args: unknown[]) => {
+        if (channel === 'terminal:getAltScreenState') return Promise.resolve({ isAlternateScreen });
+        if (channel === 'terminal:input') window.__terminalInputMessages.push(String(args[1]));
+        return invoke(channel, ...args);
+      };
+    }, fullscreen);
+    await page.getByRole('button', { name: 'Expand project Terminal input fixture', exact: true }).click();
+    await page.getByRole('button', { name: session.name, exact: true }).click();
+    const terminal = page.getByRole('tabpanel');
+    const input = terminal.locator('.xterm-helper-textarea').first();
+    await expect(input).toBeAttached();
+    await expect(terminal.getByRole('status', { name: 'Loading terminal' })).toHaveCount(0);
+    await input.focus();
+    for (const [chord, bytes] of [
+      ['Control+a', '\x01'], ['Control+k', '\x0b'], ['Control+w', '\x17'],
+      ['Control+v', '\x16'], ['Alt+b', '\x1bb'], ['Alt+f', '\x1bf'],
+      ['Shift+Enter', '\r'],
+    ]) {
+      await page.evaluate(() => window.__terminalInputMessages.length = 0);
+      await page.keyboard.press(chord);
+      expect(await inputMessages(page), chord).toEqual([bytes]);
+      await expect(input).toBeFocused();
+      await expect(page.getByRole('dialog')).toHaveCount(0);
+    }
+    await page.evaluate(() => window.__terminalInputMessages.length = 0);
+    await page.keyboard.type('@word');
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('Enter');
+    expect(await inputMessages(page)).toEqual(['@', 'w', 'o', 'r', 'd', '\x1b[D', '\r']);
+    const escape = await page.evaluate(() => navigator.platform.toUpperCase().includes('MAC') ? 'Meta+Shift+p' : 'Control+Shift+p');
+    await page.evaluate(() => window.__terminalInputMessages.length = 0);
+    await page.keyboard.press(escape);
+    await expect(page.getByRole('dialog')).toBeVisible();
+    expect(await inputMessages(page)).toEqual([]);
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(input).toBeFocused();
+  });
+}

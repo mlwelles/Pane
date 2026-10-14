@@ -73,6 +73,7 @@ import * as os from 'os';
 import type { SessionManager } from './services/sessionManager';
 import type { ConfigManager } from './services/configManager';
 import { areKeyboardShortcutsEnabled, shouldForwardCommandPaletteShortcut } from './utils/keyboardShortcuts';
+import { installWindowKeyboardRouting } from './utils/windowKeyboardRouting';
 import {
   parseStoredOverlayColors,
   shouldEnableWindowControlsOverlay,
@@ -785,23 +786,7 @@ async function createWindow() {
   });
   } // end devToolsHandlersRegistered guard
 
-  // Prevent Ctrl+W / Cmd+W from closing the Electron window so the renderer
-  // can use it to close tabs. We intercept at before-input-event and re-emit
-  // the key as a DOM keydown via IPC so the renderer's hotkey system sees it.
-  mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (!areKeyboardShortcutsEnabled(configManager.getConfig())) return;
-    if ((input.control || input.meta) && input.key.toLowerCase() === 'w' && input.type === 'keyDown') {
-      event.preventDefault();
-      mainWindow?.webContents.send('synthetic-keydown', {
-        key: input.key,
-        code: input.code,
-        ctrlKey: input.control,
-        metaKey: input.meta,
-        shiftKey: input.shift,
-        altKey: input.alt,
-      });
-    }
-  });
+  const disposeKeyboardRouting = installWindowKeyboardRouting(mainWindow.webContents, ipcMain, () => configManager.getConfig());
 
   if (isDevelopment) {
     const devPort = process.env.VITE_PORT || process.env.PORT || '4521';
@@ -854,6 +839,7 @@ async function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    disposeKeyboardRouting();
     mainWindow = null;
     mainWindowRevealed = false;
   });

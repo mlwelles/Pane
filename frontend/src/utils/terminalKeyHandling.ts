@@ -1,4 +1,33 @@
+import { resolveTerminalKeyboardEvent, type TerminalKeyboardConfig } from '../../../shared/utils/terminalKeyboardPolicy';
+
 export const TERMINAL_MULTILINE_NEWLINE_SEQUENCE = '\x1b\r';
+
+export function isTerminalInputTarget(target: EventTarget | null): boolean {
+  // SAFETY: Non-element DOM targets lack matches and are excluded by the optional call.
+  const element = target as Element | null;
+  return element?.matches?.('textarea.xterm-helper-textarea') ?? false;
+}
+
+export function handleTerminalKeyboardPresetEvent(
+  event: KeyboardEvent,
+  config: TerminalKeyboardConfig,
+  actions: { copy: () => void; openPalette: () => void },
+  isMac: boolean,
+): boolean | undefined {
+  const decision = resolveTerminalKeyboardEvent(event, config, isTerminalInputTarget(event.target), isMac);
+  if (decision === 'standard') return undefined;
+  event.stopPropagation();
+  if (decision === 'terminal') {
+    if (event.code === 'KeyV' && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) event.preventDefault();
+    return true;
+  }
+  if (decision === 'palette') event.preventDefault();
+  if (event.type === 'keydown') {
+    if (decision === 'palette') actions.openPalette();
+    if (decision === 'copy') actions.copy();
+  }
+  return false;
+}
 
 export type TerminalKeyHandlingDecision =
   | { action: 'continue' }

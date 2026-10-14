@@ -13,11 +13,15 @@ import { getTerminalTheme, buildTerminalFontFamily, getMinimumContrastRatio, DEF
 import {
   isFineSurfaceScrollKey,
   isPageSurfaceScrollKey,
+  isTerminalInputTarget,
+  handleTerminalKeyboardPresetEvent,
   resolveTerminalKeyHandling,
   shouldOpenTerminalSearch,
   terminalClaimsFineSurfaceScroll,
 } from '../../utils/terminalKeyHandling';
 import { isMac } from '../../utils/platformUtils';
+import { resolveTerminalKeyboardEvent } from '../../../../shared/utils/terminalKeyboardPolicy';
+import { focusedSurfaceScroll } from '../../services/focusedSurfaceScroll';
 import { copyTerminalText, decodeOsc52Write, isTerminalCopyShortcut } from '../../utils/terminalClipboard';
 import { sendTerminalInput } from '../../utils/terminalInput';
 import { terminalTiming } from '../../utils/terminalTiming';
@@ -255,6 +259,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
   const terminalPowerMode = useConfigStore((state) => state.config?.terminalPowerMode ?? 'performance');
   const keyboardShortcutsEnabled = useConfigStore((state) => areKeyboardShortcutsEnabled(state.config));
   const keyboardShortcutsEnabledRef = useRef(keyboardShortcutsEnabled);
+  const terminalKeyboardPreset = useConfigStore(state => state.config?.terminalKeyboardPreset ?? 'standard');
+  const terminalKeyboardPresetRef = useRef(terminalKeyboardPreset);
   // Opt-in per application: a program has to ask for it with CSI > flags u, so
   // this only changes what reaches programs that requested enhanced reporting.
   const kittyKeyboardEnabled = useConfigStore((state) => state.config?.kittyKeyboardEnabled !== false);
@@ -319,6 +325,17 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
     if (!terminal) return;
     terminal.options.vtExtensions = { ...terminal.options.vtExtensions, kittyKeyboard: kittyKeyboardEnabled };
   }, [kittyKeyboardEnabled]);
+
+  useLayoutEffect(() => {
+    terminalKeyboardPresetRef.current = terminalKeyboardPreset;
+    const protectedInput = terminalKeyboardPreset === 'readline-friendly';
+    if (xtermRef.current) xtermRef.current.options.macOptionIsMeta = protectedInput;
+    if (protectedInput) {
+      interceptorRef.current?.forceCancel();
+      skipNextInterceptRef.current = false;
+      focusedSurfaceScroll.stop();
+    }
+  }, [terminalKeyboardPreset]);
 
   const terminalScrollSurfaceRef = useScrollSurface<HTMLDivElement>({
     id: `terminal:${panel.id}`,
@@ -836,6 +853,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
 
   // Open search on Ctrl/Cmd+F from the container div
   const handleTerminalKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (resolveTerminalKeyboardEvent(e.nativeEvent, useConfigStore.getState().config ?? {}, isTerminalInputTarget(e.target), isMac()) !== 'standard') return;
     if (shouldOpenTerminalSearch(e, keyboardShortcutsEnabled)) {
       e.preventDefault();
       openSearch();
@@ -988,7 +1006,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           drawBoldTextInBrightColors: true,
           rescaleOverlappingGlyphs: true,
           minimumContrastRatio: getMinimumContrastRatio(terminalRuntimeRef.current.highContrast),
-          macOptionIsMeta: false,
+          macOptionIsMeta: terminalKeyboardPresetRef.current === 'readline-friendly',
           linkHandler: {
             activate: (_event, uri) => {
               if (uri.startsWith('pane://')) {
@@ -1027,6 +1045,19 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
 
         // Intercept app-level shortcuts before xterm consumes them
         terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+          const presetHandling = handleTerminalKeyboardPresetEvent(e, useConfigStore.getState().config ?? {}, {
+            copy: () => {
+              if (terminal?.hasSelection()) {
+                void copyTerminalText(terminal.getSelection()).catch(() => {
+                  terminalRuntimeRef.current.handleClipboardError();
+                });
+              }
+            },
+            openPalette: () => {
+              if (isHotkeyEnabledForEvent(e)) useHotkeyStore.getState().hotkeys.get('open-command-palette')?.action();
+            },
+          }, isMac());
+          if (presetHandling !== undefined) return presetHandling;
           if (isTerminalCopyShortcut(e, isMac())) {
             if (e.type === 'keydown' && terminal?.hasSelection()) {
               void copyTerminalText(terminal.getSelection()).catch(() => {
@@ -1756,6 +1787,10 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           // Handle terminal input — route through interceptor first
           const handleInput = (data: string) => {
             if (data === '\r' && isCliPanelRef.current) startSendPrompt(panel.id);
+            if (terminalKeyboardPresetRef.current === 'readline-friendly') {
+              sendTerminalInput(panel.id, data);
+              return;
+            }
             // Skip interception for AltGr-produced @ (e.g. German keyboard)
             if (skipNextInterceptRef.current) {
               skipNextInterceptRef.current = false;
