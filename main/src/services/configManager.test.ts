@@ -3,6 +3,103 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AGENT_CONTEXT_DEFAULTS_VERSION, ConfigManager } from './configManager';
+import { PaneError } from '../../../shared/paneError';
+
+describe('ConfigManager terminal keyboard persistence', () => {
+  let paneDir: string;
+  let configPath: string;
+  const escape = { code: 'KeyB', ctrlKey: true, metaKey: false, altKey: true, shiftKey: false };
+  const defaultEscape = {
+    code: 'KeyP', ctrlKey: process.platform !== 'darwin', metaKey: process.platform === 'darwin',
+    altKey: false, shiftKey: true,
+  };
+
+  beforeEach(async () => {
+    paneDir = await fs.mkdtemp(path.join(process.env.PANE_TASK_TMP ?? os.tmpdir(), 'terminal-keyboard-'));
+    vi.stubEnv('PANE_DIR', paneDir);
+    configPath = path.join(paneDir, 'config.json');
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    await fs.rm(paneDir, { recursive: true, force: true });
+  });
+
+  it('creates Standard defaults and a platform escape shortcut for new installs', async () => {
+    const manager = new ConfigManager();
+    await manager.initialize();
+    expect(JSON.parse(await fs.readFile(configPath, 'utf8'))).toMatchObject({
+      terminalKeyboardPreset: 'standard', terminalEscapeShortcut: defaultEscape,
+    });
+  });
+
+  it.each([
+    {},
+    { terminalKeyboardPreset: '', terminalEscapeShortcut: null },
+    { terminalKeyboardPreset: 'unknown', terminalEscapeShortcut: { code: 'Unidentified' } },
+  ])('uses defaults for missing or corrupt disk settings: %j', async (fields) => {
+    await fs.writeFile(configPath, JSON.stringify(fields));
+    const manager = new ConfigManager();
+    await manager.initialize();
+    expect(manager.getConfig()).toMatchObject({
+      terminalKeyboardPreset: 'standard', terminalEscapeShortcut: defaultEscape,
+    });
+  });
+
+  it('repairs each corrupt disk field without discarding the other valid field', async () => {
+    await fs.writeFile(configPath, JSON.stringify({ terminalKeyboardPreset: 'unknown', terminalEscapeShortcut: escape }));
+    const manager = new ConfigManager();
+    await manager.initialize();
+    expect(manager.getConfig()).toMatchObject({ terminalKeyboardPreset: 'standard', terminalEscapeShortcut: escape });
+    await fs.writeFile(configPath, JSON.stringify({ terminalKeyboardPreset: 'readline-friendly', terminalEscapeShortcut: {} }));
+    await manager.reloadFromDisk();
+    expect(manager.getConfig()).toMatchObject({ terminalKeyboardPreset: 'readline-friendly', terminalEscapeShortcut: defaultEscape });
+  });
+
+  it('persists both settings through reload and restart', async () => {
+    const manager = new ConfigManager();
+    await manager.initialize();
+    await manager.updateConfig({ terminalKeyboardPreset: 'readline-friendly', terminalEscapeShortcut: escape });
+    await manager.reloadFromDisk();
+    const restarted = new ConfigManager();
+    await restarted.initialize();
+    expect(restarted.getConfig()).toMatchObject({ terminalKeyboardPreset: 'readline-friendly', terminalEscapeShortcut: escape });
+  });
+
+  it.each([
+    { terminalKeyboardPreset: 'unknown' },
+    { terminalKeyboardPreset: undefined },
+    { terminalEscapeShortcut: undefined },
+    { terminalEscapeShortcut: { ...escape, ctrlKey: 'yes' } },
+    { terminalEscapeShortcut: { ...escape, code: 'ControlLeft' } },
+    { terminalEscapeShortcut: { ...escape, ctrlKey: false, altKey: false } },
+    { terminalEscapeShortcut: { code: 'KeyC', ctrlKey: process.platform !== 'darwin', metaKey: process.platform === 'darwin', altKey: false, shiftKey: process.platform !== 'darwin' } },
+  ])('rejects an invalid explicit update without changing memory or disk: %j', async (updates) => {
+    const manager = new ConfigManager();
+    await manager.initialize();
+    const before = await fs.readFile(configPath, 'utf8');
+    const beforeConfig = manager.getConfig();
+    // SAFETY: Malformed fixtures deliberately exercise the runtime persistence boundary.
+    await expect(manager.updateConfigWith(() => updates as never)).rejects.toBeInstanceOf(PaneError);
+    expect(manager.getConfig()).toEqual(beforeConfig);
+    expect(await fs.readFile(configPath, 'utf8')).toBe(before);
+  });
+
+  it('retains the effective settings and emits no change when saving fails', async () => {
+    const manager = new ConfigManager();
+    await manager.initialize();
+    await manager.updateConfig({ terminalKeyboardPreset: 'readline-friendly', terminalEscapeShortcut: escape });
+    const before = await fs.readFile(configPath, 'utf8');
+    let changes = 0;
+    manager.on('config-updated', () => { changes += 1; });
+    vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('rename failed'));
+    await expect(manager.updateConfig({ terminalKeyboardPreset: 'standard', terminalEscapeShortcut: defaultEscape })).rejects.toThrow('rename failed');
+    expect(manager.getConfig()).toMatchObject({ terminalKeyboardPreset: 'readline-friendly', terminalEscapeShortcut: escape });
+    expect(changes).toBe(0);
+    expect(await fs.readFile(configPath, 'utf8')).toBe(before);
+  });
+});
 
 describe('ConfigManager appearance persistence', () => {
   let paneDir: string;

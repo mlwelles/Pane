@@ -16,6 +16,7 @@ import { AppearanceValidationError } from '../../../shared/types/appearance';
 import { agentPresetsForPlatform } from '../../../shared/constants/agentLaunchPresets';
 import { normalizePaneChatAgent, type PaneChatAgent } from '../../../shared/types/paneChat';
 import { getPaneEventSink } from '../core/runtime';
+import { PaneError, paneErrorText } from '../../../shared/paneError';
 
 export function registerConfigHandlers(
   ipcMain: IpcMain,
@@ -162,6 +163,9 @@ export function registerConfigHandlers(
       return { success: true, data: updatedConfig };
     } catch (error) {
       console.error('Failed to update config:', error);
+      if (error instanceof PaneError) {
+        return { success: false, error: paneErrorText(error) };
+      }
       if (error instanceof AppearanceValidationError) {
         return { success: false, error: error.message };
       }

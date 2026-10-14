@@ -5,6 +5,7 @@ import type { VoiceTranscriptionMode } from '../../../shared/types/voiceTranscri
 import type { WorktreeFileSyncEntry } from '../../../shared/types/worktreeFileSync';
 import type { ApnsCredentialConfig, SharedCredentialId, SharedCredentialMeta } from '../../../shared/types/sharedCredentials';
 import type { AppearanceMode, DarkTheme, LightTheme, Theme } from '../../../shared/types/appearance';
+import type { TerminalEscapeShortcut, TerminalKeyboardPreset } from '../../../shared/utils/terminalKeyboardPolicy';
 
 export interface TerminalShortcut {
   id: string;
@@ -158,6 +159,8 @@ export interface AppConfig {
   terminalShortcuts?: TerminalShortcut[];
   // Whether Pane intercepts application keyboard shortcuts
   keyboardShortcutsEnabled?: boolean;
+  terminalKeyboardPreset?: TerminalKeyboardPreset;
+  terminalEscapeShortcut?: TerminalEscapeShortcut;
   // Whether the Command Palette shortcut remains active when other shortcuts are disabled
   commandPaletteShortcutEnabled?: boolean;
   // Whether the terminal answers kitty keyboard protocol requests (CSI = | ? | > | < u)
@@ -219,6 +222,8 @@ export interface UpdateConfigRequest {
   defaultSessionPinned?: boolean;
   terminalShortcuts?: TerminalShortcut[];
   keyboardShortcutsEnabled?: boolean;
+  terminalKeyboardPreset?: TerminalKeyboardPreset;
+  terminalEscapeShortcut?: TerminalEscapeShortcut;
   commandPaletteShortcutEnabled?: boolean;
   kittyKeyboardEnabled?: boolean;
   worktreeFileSync?: WorktreeFileSyncEntry[];
