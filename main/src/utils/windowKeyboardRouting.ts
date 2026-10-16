@@ -8,21 +8,33 @@ export function installWindowKeyboardRouting(
   getConfig: () => TerminalKeyboardConfig,
 ): () => void {
   let terminalInputFocused = false;
+  let shortcutRecordingFocused = false;
   let disposed = false;
   const restoreMenus = () => {
     terminalInputFocused = false;
+    shortcutRecordingFocused = false;
     if (!contents.isDestroyed()) contents.setIgnoreMenuShortcuts(false);
   };
   const reportFocus = (event: Electron.IpcMainEvent, value: JsonValue) => {
     const focused = decodeOptionalBoundary(value, boundary.boolean);
     if (focused === undefined || event.sender !== contents || event.senderFrame !== contents.mainFrame) return;
     terminalInputFocused = focused;
-    if (!focused) contents.setIgnoreMenuShortcuts(false);
+    if (!focused) contents.setIgnoreMenuShortcuts(shortcutRecordingFocused);
+  };
+  const reportRecording = (event: Electron.IpcMainEvent, value: JsonValue) => {
+    const focused = decodeOptionalBoundary(value, boundary.boolean);
+    if (focused === undefined || event.sender !== contents || event.senderFrame !== contents.mainFrame) return;
+    shortcutRecordingFocused = focused;
+    contents.setIgnoreMenuShortcuts(focused);
   };
   const startNavigation = (event: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>) => {
     if (event.isMainFrame) restoreMenus();
   };
   const beforeInput = (event: Electron.Event, input: Electron.Input) => {
+    if (shortcutRecordingFocused) {
+      contents.setIgnoreMenuShortcuts(true);
+      return;
+    }
     const config = getConfig();
     const decision = resolveTerminalKeyboardEvent({
       code: input.code, ctrlKey: input.control, metaKey: input.meta,
@@ -46,6 +58,7 @@ export function installWindowKeyboardRouting(
     disposed = true;
     restoreMenus();
     ipcMain.removeListener('window:terminal-input-focus', reportFocus);
+    ipcMain.removeListener('window:shortcut-recording-focus', reportRecording);
     contents.removeListener('before-input-event', beforeInput);
     contents.removeListener('did-navigate', restoreMenus);
     contents.removeListener('did-start-navigation', startNavigation);
@@ -53,6 +66,7 @@ export function installWindowKeyboardRouting(
     contents.removeListener('destroyed', dispose);
   };
   ipcMain.on('window:terminal-input-focus', reportFocus);
+  ipcMain.on('window:shortcut-recording-focus', reportRecording);
   contents.on('before-input-event', beforeInput);
   contents.on('did-navigate', restoreMenus);
   contents.on('did-start-navigation', startNavigation);

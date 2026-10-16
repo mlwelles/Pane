@@ -29,6 +29,143 @@ async function bootSettings(page: Page, options: Parameters<typeof installElectr
 }
 
 test.describe('Settings', () => {
+  test('selects the terminal preset, persists its escape chord, and restores defaults', async ({ page }) => {
+    await bootSettings(page);
+    await page.getByRole('button', { name: 'Shortcuts', exact: true }).click();
+    const presets = page.getByRole('radiogroup', { name: 'Terminal keyboard preset' });
+    const isMac = await page.evaluate(() => navigator.platform.toUpperCase().includes('MAC'));
+    await expect(presets.getByRole('radio', { name: 'Standard', exact: true })).toHaveAttribute('aria-checked', 'true');
+    await presets.getByRole('radio', { name: 'Readline-friendly' }).click();
+    await expect(presets.getByRole('radio', { name: 'Readline-friendly' })).toHaveAttribute('aria-checked', 'true');
+    const record = page.getByRole('button', { name: 'Record terminal palette shortcut' });
+    await record.click();
+    await page.keyboard.press('Control+Alt+k');
+    await expect(record).toHaveText(isMac ? 'Ctrl+Option+K' : 'Ctrl+Alt+K');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Back', exact: true }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).first().click();
+    await expect(record).toHaveText(isMac ? 'Ctrl+Option+K' : 'Ctrl+Alt+K');
+    await expect(presets.getByRole('radio', { name: 'Readline-friendly' })).toHaveAttribute('aria-checked', 'true');
+    await page.getByRole('button', { name: 'Restore default', exact: true }).click();
+    await expect(record).toHaveText(isMac ? 'Command+Shift+P' : 'Ctrl+Shift+P');
+    await presets.getByRole('radio', { name: 'Standard', exact: true }).click();
+    await expect(presets.getByRole('radio', { name: 'Standard', exact: true })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  test('rejects invalid terminal palette chords and cancels recording', async ({ page }) => {
+    await page.addInitScript(() => Object.defineProperty(navigator, 'platform', { configurable: true, get: () => 'Linux' }));
+    await bootSettings(page, { platform: 'linux' });
+    await page.getByRole('button', { name: 'Shortcuts', exact: true }).click();
+    const record = page.getByRole('button', { name: 'Record terminal palette shortcut' });
+    await record.click();
+    await page.keyboard.press('Shift+k');
+    await expect(page.getByRole('alert')).toContainText('Use Ctrl, Command, or Alt with a key');
+    await page.keyboard.press('Control+Shift+v');
+    await expect(page.getByRole('alert')).toContainText('reserved for terminal clipboard');
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(record).toHaveText('Ctrl+Shift+P');
+    // SAFETY: installElectronApiMock installs this typed fixture bridge before navigation.
+    const updates = await page.evaluate(() => (
+      window as typeof window & { __paneTestElectronMock: SettingsMock }
+    ).__paneTestElectronMock.getConfigUpdates());
+    expect(updates).toEqual([]);
+  });
+
+  for (const releaseOrder of ['Command', 'Command then Control', 'Shift then Command', 'Command then extra Shift'] as const) {
+    test(`finishes a macOS recording after ${releaseOrder} release without the main keyup`, async ({ page }) => {
+      await page.addInitScript(() => Object.defineProperty(navigator, 'platform', { configurable: true, get: () => 'MacIntel' }));
+      await bootSettings(page, { platform: 'darwin' });
+      await page.getByRole('button', { name: 'Shortcuts', exact: true }).click();
+      const record = page.getByRole('button', { name: 'Record terminal palette shortcut' });
+      await record.evaluate(() => {
+        document.addEventListener('keydown', () => document.body.setAttribute('data-test-escaped-key', 'true'));
+        document.addEventListener('keyup', () => document.body.setAttribute('data-test-escaped-key', 'true'));
+      });
+      await record.click();
+      const ctrlKey = releaseOrder === 'Command then Control';
+      const shiftKey = releaseOrder === 'Shift then Command';
+      const extraShift = releaseOrder === 'Command then extra Shift';
+      await record.dispatchEvent('keydown', { key: ',', code: 'Comma', metaKey: true, ctrlKey, shiftKey });
+      await record.dispatchEvent('keydown', { key: ',', code: 'Comma', metaKey: true, ctrlKey, shiftKey, repeat: true });
+      if (extraShift) await record.dispatchEvent('keydown', { key: 'Shift', code: 'ShiftLeft', metaKey: true, shiftKey: true });
+      await record.dispatchEvent('keyup', { key: 'x', code: 'KeyX' });
+      await record.dispatchEvent('keyup', { key: 'Alt', code: 'AltLeft' });
+      await expect(record).toHaveText('Press a key combination');
+      if (ctrlKey || shiftKey || extraShift) {
+        await record.dispatchEvent('keyup', ctrlKey || extraShift
+          ? { key: 'Meta', code: 'MetaLeft', ctrlKey, shiftKey: extraShift }
+          : { key: 'Shift', code: 'ShiftLeft', metaKey: true });
+        await record.dispatchEvent('keyup', { key: 'x', code: 'KeyX' });
+        await expect(record).toHaveText('Press a key combination');
+      }
+      await record.dispatchEvent('keyup', ctrlKey
+        ? { key: 'Control', code: 'ControlLeft' }
+        : extraShift ? { key: 'Shift', code: 'ShiftLeft' } : { key: 'Meta', code: 'MetaLeft' });
+      await expect(record).toHaveText(ctrlKey ? 'Ctrl+Command+Comma' : shiftKey ? 'Command+Shift+Comma' : 'Command+Comma');
+      await expect(record).toBeEnabled();
+      await record.dispatchEvent('keydown', { key: ',', code: 'Comma', repeat: true });
+      await record.dispatchEvent('keyup', { key: ',', code: 'Comma' });
+      await expect(page.locator('body')).not.toHaveAttribute('data-test-escaped-key', 'true');
+      // SAFETY: installElectronApiMock installs this typed fixture bridge before navigation.
+      const updates = await page.evaluate(() => (
+        window as typeof window & { __paneTestElectronMock: SettingsMock }
+      ).__paneTestElectronMock.getConfigUpdates());
+      expect(updates).toEqual([{ terminalEscapeShortcut: { code: 'Comma', ctrlKey, metaKey: true, altKey: false, shiftKey } }]);
+      await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(0);
+    });
+  }
+
+  for (const cancel of ['Cancel', 'focus loss', 'window blur'] as const) {
+    test(`discards a pending macOS recording on ${cancel} before Command release`, async ({ page }) => {
+      await page.addInitScript(() => Object.defineProperty(navigator, 'platform', { configurable: true, get: () => 'MacIntel' }));
+      await bootSettings(page, { platform: 'darwin' });
+      await page.getByRole('button', { name: 'Shortcuts', exact: true }).click();
+      const record = page.getByRole('button', { name: 'Record terminal palette shortcut' });
+      const previous = await record.textContent();
+      await record.click();
+      await record.dispatchEvent('keydown', { key: ',', code: 'Comma', metaKey: true });
+      if (cancel === 'Cancel') await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+      else if (cancel === 'focus loss') await page.getByRole('button', { name: 'Restore default', exact: true }).focus();
+      else await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+      await record.dispatchEvent('keyup', { key: 'Meta', code: 'MetaLeft' });
+      await expect(record).toHaveText(previous ?? '');
+      // SAFETY: installElectronApiMock installs this typed fixture bridge before navigation.
+      expect(await page.evaluate(() => (
+        window as typeof window & { __paneTestElectronMock: SettingsMock }
+      ).__paneTestElectronMock.getConfigUpdates())).toEqual([]);
+    });
+  }
+
+  test('keeps saved terminal keyboard values after persistence failures', async ({ page }) => {
+    await bootSettings(page);
+    await page.getByRole('button', { name: 'Shortcuts', exact: true }).click();
+    // SAFETY: installElectronApiMock installs this typed fixture bridge before navigation.
+    const failSave = async () => page.evaluate(() => (
+      window as typeof window & { __paneTestElectronMock: SettingsMock }
+    ).__paneTestElectronMock.failNextConfigUpdate('Keyboard config is read-only'));
+    const presets = page.getByRole('radiogroup', { name: 'Terminal keyboard preset' });
+    await failSave();
+    await presets.getByRole('radio', { name: 'Readline-friendly' }).click();
+    await expect(page.getByRole('alert').last()).toContainText('Keyboard config is read-only');
+    await expect(presets.getByRole('radio', { name: 'Standard', exact: true })).toHaveAttribute('aria-checked', 'true');
+    const record = page.getByRole('button', { name: 'Record terminal palette shortcut' });
+    const previous = await record.textContent();
+    await failSave();
+    await record.click();
+    await page.keyboard.press('Control+Alt+k');
+    await expect(page.getByRole('alert').last()).toContainText('Keyboard config is read-only');
+    await expect(record).toHaveText(previous ?? '');
+  });
+
+  test('explains mouse access when both global shortcut switches are off', async ({ page }) => {
+    await bootSettings(page, { initialConfig: { terminalKeyboardPreset: 'readline-friendly' } });
+    await page.getByRole('button', { name: 'Shortcuts', exact: true }).click();
+    await page.getByRole('switch', { name: 'Enable Pane keyboard shortcuts' }).click();
+    await expect(page.getByText('Both shortcut switches are off. Use the mouse to return to Pane.')).toHaveCount(0);
+    await page.getByRole('switch', { name: 'Keep Command Palette shortcut enabled' }).click();
+    await expect(page.getByText('Both shortcut switches are off. Use the mouse to return to Pane.')).toBeVisible();
+  });
+
   test('pairs system palettes, preserves fixed selection, follows the OS, and rolls back failures', async ({ page }) => {
     await page.emulateMedia({ colorScheme: 'light' });
     await bootSettings(page);

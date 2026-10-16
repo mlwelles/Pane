@@ -90,6 +90,20 @@ They mount the production sidebar and views in Chromium with a controllable Elec
 they do not launch Electron or use a Pane data directory. Install Chromium with
 `pnpm exec playwright install chromium` first.
 
+The terminal keyboard tests run with
+`PANE_DIR=~/.pane_test pnpm test:terminal-keyboard`. Install Chromium first with
+`pnpm exec playwright install chromium`. This task runs Settings, xterm input, and native keyboard tests serially. The native fixture creates an isolated BrowserWindow and profile,
+and loads the production keyboard routing helper. Clipboard tests dispatch
+in-memory paste events; they do not change the system clipboard. The fixture
+does not start Pane or load real data.
+
+These tests verify key delivery and Pane shortcut routing. On macOS, this fixture
+verifies menu-policy calls rather than native menu accelerator activation;
+physical-key accelerator and clipboard checks remain manual.
+Manual checks in
+Claude, OpenCode, and Codex still require an isolated app environment that meets
+the safeguards in [Running a dev build safely](#running-a-dev-build-safely); they also check how each agent interprets the keys.
+
 ### Native modules
 
 `better-sqlite3-multiple-ciphers` is compiled for one runtime at a time.

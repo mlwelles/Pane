@@ -54,6 +54,8 @@ import { decodeAppearanceSnapshotArg, type Theme } from '../../shared/types/appe
 
 installTerminalInputFocusReporting(document, window, focused => {
   ipcRenderer.send('window:terminal-input-focus', focused);
+}, focused => {
+  ipcRenderer.send('window:shortcut-recording-focus', focused);
 });
 
 interface LogEntry {
