@@ -206,8 +206,11 @@ test('live preset and escape changes retain terminals and respect actual focus',
   await page.keyboard.press(formerEscape);
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(search).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(search).toHaveCount(0);
   const settingsButton = page.getByRole('button', { name: 'Settings', exact: true }).first();
   await settingsButton.focus();
+  await expect(settingsButton).toBeFocused();
   await page.keyboard.press(formerEscape);
   await expect(page.getByRole('dialog', { name: 'Command Palette' })).toBeVisible();
   await page.keyboard.press('Escape');
