@@ -338,6 +338,19 @@ Other tools build custom chat UIs that only work with agents they've explicitly 
 | `⌘⌥` (hold) / `Ctrl+Alt` (hold) | Show all configured shortcuts as an overlay |
 | `⌘B` / `Ctrl+B` | Toggle sidebar |
 
+For terminal editing keys, select **Settings → Shortcuts → Terminal keyboard
+preset → Readline-friendly**. While terminal input has focus, Pane passes keys
+such as Ctrl+A/K/W/V and Meta+B/F to the running program, including in full-screen
+agents. Snippet shortcuts and the `@` terminal picker stop intercepting input.
+On macOS, Option sends terminal Meta keys instead of special characters.
+
+Use Command+Shift+P on macOS or Ctrl+Shift+P on Windows/Linux to open Pane's
+command palette from a terminal. Record a replacement under **Open command
+palette from terminal**, or restore the default there. Terminal copy/paste stays
+Command+C/V on macOS and Ctrl+Shift+C/V on Windows/Linux. If both **Enable Pane keyboard shortcuts**
+and **Keep Command Palette shortcut enabled** are off, use the mouse to return to Pane. Select **Standard** to restore
+Pane's usual terminal shortcuts; it remains the default.
+
 ---
 
 ## Installation

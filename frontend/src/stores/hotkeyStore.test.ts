@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { areKeyboardShortcutsEnabled, isCommandPaletteShortcutEnabled, useConfigStore } from './configStore';
-import { useHotkeyStore } from './hotkeyStore';
+import { isHotkeyEnabledForEvent, useHotkeyStore } from './hotkeyStore';
+import { handleTerminalKeyboardPresetEvent } from '../utils/terminalKeyHandling';
 
 interface HotkeyTestTarget {
   tagName: string;
   isContentEditable: boolean;
   classList?: { contains: (name: string) => boolean };
   closest: (selector: string) => { matched: true } | null;
+  matches?: (selector: string) => boolean;
 }
 
 interface HotkeyTestEvent {
@@ -43,12 +45,156 @@ describe('hotkeyStore keyboard shortcut preference', () => {
   let keydownListener: ((event: HotkeyTestEvent) => void) | undefined;
 
   beforeEach(() => {
+    vi.stubGlobal('navigator', { platform: 'Linux' });
     vi.stubGlobal('window', {
       addEventListener: (type: string, listener: (event: HotkeyTestEvent) => void) => {
         if (type === 'keydown') keydownListener = listener;
       },
       removeEventListener: vi.fn(),
     });
+  });
+
+  it.each(['a', 'k', 'w'])('leaves Ctrl+%s to focused Readline terminal input', (letter) => {
+    const action = vi.fn();
+    const preventDefault = vi.fn();
+    useConfigStore.setState({ config: { terminalKeyboardPreset: 'readline-friendly' } });
+    useHotkeyStore.getState().register({
+      id: 'test-shortcut', label: 'Test shortcut', keys: `mod+${letter}`, category: 'tabs', action,
+    });
+    const event = keyboardEvent({ key: letter, code: `Key${letter.toUpperCase()}`, ctrlKey: true }, {
+      tagName: 'TEXTAREA', isContentEditable: false, closest: () => null,
+      matches: selector => selector === 'textarea.xterm-helper-textarea',
+      classList: { contains: name => name === 'xterm-helper-textarea' },
+    }, preventDefault);
+    keydownListener?.(event);
+    expect(action).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
+    const availabilityEvent: Event = Object.assign(new Event('keydown'), {
+      key: event.key, code: event.code, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false,
+      getModifierState: () => false,
+    });
+    Object.defineProperty(availabilityEvent, 'target', { value: Object.assign(new EventTarget(), event.target) });
+    // SAFETY: The structural event includes the keyboard fields read by hotkey matching.
+    expect(isHotkeyEnabledForEvent(availabilityEvent as KeyboardEvent)).toBe(false);
+  });
+
+  it('uses the rebound terminal palette escape instead of the registered palette chord', () => {
+    const action = vi.fn();
+    const preventDefault = vi.fn();
+    useConfigStore.setState({ config: {
+      terminalKeyboardPreset: 'readline-friendly',
+      terminalEscapeShortcut: { code: 'KeyO', ctrlKey: false, metaKey: false, altKey: true, shiftKey: false },
+    } });
+    useHotkeyStore.getState().register({
+      id: 'open-command-palette', label: 'Open Command Palette', keys: 'mod+shift+p', category: 'navigation', action,
+    });
+    const target = {
+      tagName: 'TEXTAREA', isContentEditable: false, closest: () => null,
+      matches: (selector: string) => selector === 'textarea.xterm-helper-textarea',
+      classList: { contains: (name: string) => name === 'xterm-helper-textarea' },
+    };
+    keydownListener?.(keyboardEvent({ key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true }, target, preventDefault));
+    expect(action).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
+    keydownListener?.(keyboardEvent({ key: 'o', code: 'KeyO', altKey: true }, target, preventDefault));
+    expect(action).toHaveBeenCalledOnce();
+    expect(preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { preset: 'standard' as const, helper: true },
+    { preset: 'readline-friendly' as const, helper: false },
+  ])('retains ordinary shortcut behavior for $preset, helper=$helper', ({ preset, helper }) => {
+    const action = vi.fn();
+    const preventDefault = vi.fn();
+    useConfigStore.setState({ config: { terminalKeyboardPreset: preset } });
+    useHotkeyStore.getState().register({
+      id: 'test-shortcut', label: 'Test shortcut', keys: 'mod+k', category: 'tabs', action,
+    });
+    keydownListener?.(keyboardEvent({ key: 'k', code: 'KeyK', ctrlKey: true }, {
+      tagName: helper ? 'TEXTAREA' : 'INPUT', isContentEditable: false, closest: () => null,
+      matches: () => helper,
+      classList: { contains: () => helper },
+    }, preventDefault));
+    expect(action).toHaveBeenCalledOnce();
+    expect(preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it('keeps modal and availability restrictions on the terminal palette escape', () => {
+    const action = vi.fn();
+    const preventDefault = vi.fn();
+    useConfigStore.setState({ config: { terminalKeyboardPreset: 'readline-friendly' } });
+    const definition = {
+      id: 'open-command-palette', label: 'Open Command Palette', keys: 'mod+shift+p',
+      category: 'navigation' as const, action,
+    };
+    let modalOpen = true;
+    const dispatch = () => keydownListener?.(keyboardEvent({ key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true }, {
+      tagName: 'TEXTAREA', isContentEditable: false,
+      closest: selector => modalOpen && selector === '[aria-modal="true"]' ? { matched: true } : null,
+      matches: () => true, classList: { contains: () => true },
+    }, preventDefault));
+    useHotkeyStore.getState().register(definition);
+    dispatch();
+    modalOpen = false;
+    useHotkeyStore.getState().register({ ...definition, enabled: () => false });
+    dispatch();
+    expect(action).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it.each(['standard', 'readline-friendly'] as const)('requires modal opt-in in the shared availability check for %s', preset => {
+    useConfigStore.setState({ config: { terminalKeyboardPreset: preset } });
+    const definition = {
+      id: 'open-command-palette', label: 'Open Command Palette', keys: 'mod+shift+p',
+      category: 'navigation' as const, action: () => {},
+    };
+    const target = Object.assign(new EventTarget(), {
+      matches: (selector: string) => selector === 'textarea.xterm-helper-textarea',
+      closest: (selector: string) => selector === '[aria-modal="true"]' ? target : null,
+    });
+    const event: Event = Object.assign(new Event('keydown'), {
+      key: 'P', code: 'KeyP', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true,
+      getModifierState: () => false,
+    });
+    Object.defineProperty(event, 'target', { value: target });
+    useHotkeyStore.getState().register(definition);
+    // SAFETY: The structural event supplies the keyboard fields consumed by hotkey matching.
+    expect(isHotkeyEnabledForEvent(event as KeyboardEvent)).toBe(false);
+    useHotkeyStore.getState().register({ ...definition, allowInModal: true });
+    // SAFETY: The structural event supplies the keyboard fields consumed by hotkey matching.
+    expect(isHotkeyEnabledForEvent(event as KeyboardEvent)).toBe(true);
+  });
+
+  it.each([false, true])('honors allowInModal=%s through the direct terminal palette callback', allowInModal => {
+    const config = { terminalKeyboardPreset: 'readline-friendly' as const };
+    useConfigStore.setState({ config });
+    let paletteOpens = 0;
+    useHotkeyStore.getState().register({
+      id: 'open-command-palette', label: 'Open Command Palette', keys: 'mod+shift+p',
+      category: 'navigation', allowInModal, action: () => { paletteOpens += 1; },
+    });
+    const target = Object.assign(new EventTarget(), {
+      matches: (selector: string) => selector === 'textarea.xterm-helper-textarea',
+      closest: (selector: string) => selector === '[aria-modal="true"]' ? target : null,
+    });
+    const event: Event = Object.assign(new Event('keydown', { cancelable: true }), {
+      key: 'P', code: 'KeyP', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true,
+      getModifierState: () => false,
+    });
+    Object.defineProperty(event, 'target', { value: target });
+    // SAFETY: The structural event supplies the DOM keyboard fields read by both routing helpers.
+    const input = event as KeyboardEvent;
+    const result = handleTerminalKeyboardPresetEvent(input, config, {
+      copy: () => {},
+      openPalette: () => {
+        if (isHotkeyEnabledForEvent(input)) useHotkeyStore.getState().hotkeys.get('open-command-palette')?.action();
+      },
+    }, false);
+
+    expect(result).toBe(false);
+    expect(event.defaultPrevented).toBe(true);
+    expect(paletteOpens).toBe(allowInModal ? 1 : 0);
   });
 
   afterEach(() => {

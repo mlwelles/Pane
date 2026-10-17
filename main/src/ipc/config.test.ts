@@ -17,6 +17,7 @@ import type { RemotePwaAffordances } from '../../../shared/types/remoteDaemon';
 import { AppearanceValidationError, normalizeAppearance } from '../../../shared/types/appearance';
 import { applyNativeThemeSource } from '../services/appearanceService';
 import { ConfigManager } from '../services/configManager';
+import { PaneError } from '../../../shared/paneError';
 
 interface TestIpcEvent { readonly sender?: { readonly id?: number } }
 type IpcHandler = (_event: TestIpcEvent, ...args: PaneCommandValue[]) => PaneCommandValue | Promise<PaneCommandValue>;
@@ -182,6 +183,36 @@ describe('config IPC handlers', () => {
     await expect(ipcMain.handlers.get('config:update')?.({}, { systemLightTheme: 'dark' })).resolves.toEqual({
       success: false,
       error: 'systemLightTheme must be a light palette',
+    });
+  });
+
+  it('returns the terminal shortcut validation message and next step', async () => {
+    const ipcMain = createIpcMainStub();
+    const configManager = await createTempConfigManager();
+    await configManager.initialize();
+    const services = createServicesStub([]);
+    services.configManager = configManager;
+    // SAFETY: The stub implements the IpcMain handle surface exercised by registerConfigHandlers.
+    registerConfigHandlers(ipcMain as IpcMain, services);
+    const response = await ipcMain.handlers.get('config:update')?.({}, {
+      terminalEscapeShortcut: { code: 'KeyB', ctrlKey: false, metaKey: false, altKey: false, shiftKey: true },
+    });
+    expect(response).toMatchObject({ success: false });
+    expect(response).toHaveProperty('error', expect.stringContaining('terminal escape shortcut'));
+    expect(response).toHaveProperty('error', expect.stringContaining('Next: Choose a key'));
+  });
+
+  it('preserves the existing error envelope for a reported save failure', async () => {
+    const ipcMain = createIpcMainStub();
+    const services = createServicesStub([]);
+    services.configManager.updateConfig = async () => {
+      throw new PaneError('SAVE_FAILED', 'Settings could not be saved. Your settings were not changed.', 'Check the configuration directory permissions.');
+    };
+    // SAFETY: The stub implements the IpcMain handle surface exercised by registerConfigHandlers.
+    registerConfigHandlers(ipcMain as IpcMain, services);
+    await expect(ipcMain.handlers.get('config:update')?.({}, { terminalKeyboardPreset: 'readline-friendly' })).resolves.toEqual({
+      success: false,
+      error: 'Settings could not be saved. Your settings were not changed. Next: Check the configuration directory permissions.',
     });
   });
 

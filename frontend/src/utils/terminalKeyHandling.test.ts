@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   isFineSurfaceScrollKey,
+  isTerminalInputTarget,
+  handleTerminalKeyboardPresetEvent,
   isPageSurfaceScrollKey,
   resolveTerminalKeyHandling,
   shouldOpenTerminalSearch,
@@ -18,6 +20,68 @@ const key = (overrides: Partial<TerminalKeyLike>): TerminalKeyLike => ({
   altKey: false,
   getModifierState: () => false,
   ...overrides,
+});
+
+describe('isTerminalInputTarget', () => {
+  it('recognizes only the xterm input textarea, rather than its containing surface', () => {
+    const target = (matches: boolean) => Object.assign(new EventTarget(), {
+      matches: (selector: string) => matches && selector === 'textarea.xterm-helper-textarea',
+    });
+    expect(isTerminalInputTarget(target(true))).toBe(true);
+    expect(isTerminalInputTarget(target(false))).toBe(false);
+    expect(isTerminalInputTarget(new EventTarget())).toBe(false);
+    expect(isTerminalInputTarget(null)).toBe(false);
+  });
+});
+
+describe('Readline-friendly xterm event routing', () => {
+  const config = { terminalKeyboardPreset: 'readline-friendly' as const };
+  const target = Object.assign(new EventTarget(), { matches: () => true });
+  // SAFETY: The synthetic event supplies the DOM keyboard fields consumed by the policy handler.
+  const event = (init: Partial<KeyboardEvent> = {}) => ({
+    ...key({}), type: 'keydown', target, stopPropagation: vi.fn(), preventDefault: vi.fn(), ...init,
+  }) as KeyboardEvent;
+  const actions = () => ({ copy: vi.fn(), openPalette: vi.fn() });
+
+  it.each(['KeyA', 'KeyK', 'KeyW', 'KeyV'])('returns %s to xterm without a Pane action', code => {
+    const input = event({ code, ctrlKey: true });
+    const callbacks = actions();
+    expect(handleTerminalKeyboardPresetEvent(input, config, callbacks, false)).toBe(true);
+    expect(input.stopPropagation).toHaveBeenCalledOnce();
+    expect(input.preventDefault).toHaveBeenCalledTimes(code === 'KeyV' ? 1 : 0);
+    expect(callbacks.copy).not.toHaveBeenCalled();
+    expect(callbacks.openPalette).not.toHaveBeenCalled();
+  });
+
+  it('opens the palette only on keydown and blocks terminal encoding on every event', () => {
+    const callbacks = actions();
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      const input = event({ code: 'KeyP', ctrlKey: true, shiftKey: true, type });
+      expect(handleTerminalKeyboardPresetEvent(input, config, callbacks, false)).toBe(false);
+      expect(input.preventDefault).toHaveBeenCalledOnce();
+      expect(input.stopPropagation).toHaveBeenCalledOnce();
+    }
+    expect(callbacks.openPalette).toHaveBeenCalledOnce();
+  });
+
+  it('copies once and leaves the exact paste chord available to native clipboard handling', () => {
+    const callbacks = actions();
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      expect(handleTerminalKeyboardPresetEvent(event({ code: 'KeyC', ctrlKey: true, shiftKey: true, type }), config, callbacks, false)).toBe(false);
+    }
+    const paste = event({ code: 'KeyV', ctrlKey: true, shiftKey: true });
+    expect(handleTerminalKeyboardPresetEvent(paste, config, callbacks, false)).toBe(false);
+    expect(paste.preventDefault).not.toHaveBeenCalled();
+    expect(callbacks.copy).toHaveBeenCalledOnce();
+    expect(callbacks.openPalette).not.toHaveBeenCalled();
+  });
+
+  it('leaves Standard mode and ordinary input fields on their existing paths', () => {
+    const input = event({ code: 'KeyK', ctrlKey: true });
+    expect(handleTerminalKeyboardPresetEvent(input, {}, actions(), false)).toBeUndefined();
+    expect(handleTerminalKeyboardPresetEvent(event({ target: new EventTarget() }), config, actions(), false)).toBeUndefined();
+    expect(input.stopPropagation).not.toHaveBeenCalled();
+  });
 });
 
 describe('focused surface terminal key boundary', () => {

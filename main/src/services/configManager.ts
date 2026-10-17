@@ -13,6 +13,12 @@ import { HOME_GIT_SCAN_WARNING, isHomeDirectory } from '../utils/gitScanSafety';
 import { getAppDirectory } from '../utils/appDirectory';
 import { clearShellPathCache } from '../utils/shellPath';
 import { restampSharedCredentials } from './sharedCredentials';
+import { PaneError } from '../../../shared/paneError';
+import {
+  defaultTerminalEscapeShortcut,
+  isValidTerminalEscapeShortcut,
+  normalizeTerminalKeyboardConfig,
+} from '../../../shared/utils/terminalKeyboardPolicy';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
 import {
   AppearanceValidationError,
@@ -100,6 +106,8 @@ export class ConfigManager extends EventEmitter {
       },
       remoteDaemon: createDefaultRemoteDaemonConfig(),
       keyboardShortcutsEnabled: true,
+      terminalKeyboardPreset: 'standard',
+      terminalEscapeShortcut: defaultTerminalEscapeShortcut(process.platform === 'darwin'),
       commandPaletteShortcutEnabled: true,
       terminalShortcuts: [
         {
@@ -152,6 +160,7 @@ export class ConfigManager extends EventEmitter {
         Reflect.deleteProperty(loadedConfig, legacyKey);
       }
       const normalizedAppearance = normalizeAppearance(loadedConfig);
+      const normalizedKeyboard = normalizeTerminalKeyboardConfig(loadedConfig, process.platform === 'darwin');
       for (const diagnostic of normalizedAppearance.diagnostics) {
         console.error(`[ConfigManager] appearance: ${diagnostic}`);
       }
@@ -180,6 +189,8 @@ export class ConfigManager extends EventEmitter {
         ...this.config,
         ...loadedConfig,
         ...normalizedAppearance.appearance,
+        terminalKeyboardPreset: normalizedKeyboard.terminalKeyboardPreset,
+        terminalEscapeShortcut: normalizedKeyboard.terminalEscapeShortcut,
         notifications: migratedNotifications,
         sessionCreationPreferences: {
           ...this.config.sessionCreationPreferences,
@@ -212,7 +223,9 @@ export class ConfigManager extends EventEmitter {
           : DEFAULT_WORKTREE_FILE_SYNC_ENTRIES
       };
 
-      let shouldPersistMigration = normalizedAppearance.migrated;
+      let shouldPersistMigration = normalizedAppearance.migrated
+        || loadedConfig.terminalKeyboardPreset !== normalizedKeyboard.terminalKeyboardPreset
+        || loadedConfig.terminalEscapeShortcut !== normalizedKeyboard.terminalEscapeShortcut;
       if (loadedConfig.agentContext?.registerMcp === undefined) {
         this.config.agentContext = { ...this.config.agentContext, registerMcp: true };
         shouldPersistMigration = true;
@@ -384,6 +397,21 @@ export class ConfigManager extends EventEmitter {
   async updateConfigWith(update: (current: AppConfig) => Partial<AppConfig>): Promise<AppConfig> {
     return this.enqueueConfigWrite(async () => {
       const updates = update(this.getConfig());
+      if ('terminalKeyboardPreset' in updates
+        && updates.terminalKeyboardPreset !== 'standard' && updates.terminalKeyboardPreset !== 'readline-friendly') {
+        throw new PaneError(
+          'INVALID_TERMINAL_PRESET',
+          'The terminal keyboard preset is invalid. Your settings were not changed.',
+          'Choose Standard or Readline-friendly.',
+        );
+      }
+      if ('terminalEscapeShortcut' in updates && !isValidTerminalEscapeShortcut(updates.terminalEscapeShortcut, process.platform === 'darwin')) {
+        throw new PaneError(
+          'INVALID_TERMINAL_SHORTCUT',
+          'The terminal escape shortcut is invalid. Your settings were not changed.',
+          'Choose a key with Ctrl, Command, or Alt that is not a clipboard shortcut.',
+        );
+      }
       const analytics = updates.analytics !== undefined
         ? { ...defaultAnalyticsConfig(), ...this.config.analytics, ...updates.analytics }
         : this.config.analytics;

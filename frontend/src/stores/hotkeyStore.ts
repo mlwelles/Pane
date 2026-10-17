@@ -30,6 +30,9 @@
  */
 import { create } from 'zustand';
 import { areKeyboardShortcutsEnabled, isCommandPaletteShortcutEnabled, useConfigStore } from './configStore';
+import { resolveTerminalKeyboardEvent } from '../../../shared/utils/terminalKeyboardPolicy';
+import { isTerminalInputTarget } from '../utils/terminalKeyHandling';
+import { isMac } from '../utils/platformUtils';
 
 export interface HotkeyDefinition {
   /** Unique identifier, e.g. 'open-prompt-history' */
@@ -163,8 +166,15 @@ function normalizeHotkeyString(keys: string): string {
 let listenerAttached = false;
 let lookupIndex: Map<string, string> = new Map(); // normalized keys → hotkey id
 
+function hotkeyIdForEvent(e: KeyboardEvent): string | undefined {
+  const decision = resolveTerminalKeyboardEvent(e, useConfigStore.getState().config ?? {}, isTerminalInputTarget(e.target), isMac());
+  if (decision === 'palette') return 'open-command-palette';
+  if (decision !== 'standard') return undefined;
+  return lookupIndex.get(normalizeKeyEvent(e));
+}
+
 export function isHotkeyEnabledForEvent(e: KeyboardEvent): boolean {
-  const hotkeyId = lookupIndex.get(normalizeKeyEvent(e));
+  const hotkeyId = hotkeyIdForEvent(e);
   if (!hotkeyId) return false;
 
   const config = useConfigStore.getState().config;
@@ -174,6 +184,9 @@ export function isHotkeyEnabledForEvent(e: KeyboardEvent): boolean {
 
   const def = useHotkeyStore.getState().hotkeys.get(hotkeyId);
   if (!def) return false;
+  // SAFETY: Non-element DOM targets lack closest and are excluded by the optional call.
+  const target = e.target as Element | null;
+  if (target?.closest?.('[aria-modal="true"]') && !def.allowInModal) return false;
   if (def.devOnly && process.env.NODE_ENV !== 'development') return false;
   return !def.enabled || def.enabled();
 }
@@ -191,17 +204,12 @@ function handleKeyDown(e: KeyboardEvent) {
     target.isContentEditable;
 
   const pressed = normalizeKeyEvent(e);
-  const hotkeyId = lookupIndex.get(pressed);
+  const hotkeyId = hotkeyIdForEvent(e);
   if (!hotkeyId) return;
 
   const store = useHotkeyStore.getState();
   const def = store.hotkeys.get(hotkeyId);
   if (!def) return;
-
-  // Modal-local commands can opt in, but all other application hotkeys remain
-  // suppressed while focus is trapped in a dialog.
-  const isInsideModal = target.closest('[aria-modal="true"]') !== null;
-  if (isInsideModal && !def.allowInModal) return;
 
   // Let native text editing win for shortcuts users expect in focused inputs.
   // In particular, tab cycling uses mod+a/mod+d, but inputs need mod+a
@@ -212,6 +220,7 @@ function handleKeyDown(e: KeyboardEvent) {
   if (
     isInput
     && !pressed.includes('mod')
+    && !(hotkeyId === 'open-command-palette' && isTerminalInputTarget(target))
     && !(def.allowInXterm && isXtermHelperTarget(target))
   ) return;
 

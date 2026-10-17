@@ -63,6 +63,8 @@ export type SettingsSettingId =
   | 'apns-credentials'
   | 'keyboard-shortcuts'
   | 'command-palette-shortcut'
+  | 'terminal-keyboard-preset'
+  | 'terminal-escape-shortcut'
   | 'kitty-keyboard'
   | 'terminal-shortcuts'
   | 'analytics'

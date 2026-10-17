@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import { installTerminalInputFocusReporting } from './utils/terminalInputFocus';
 import { isDaemonOwnedChannel } from '../../shared/types/daemon';
 import {
   WINDOW_CONTROLS_OVERLAY_ARG,
@@ -50,6 +51,12 @@ import type {
 // verification step rejects any remaining require other than Electron itself.
 import { boundary, decodeBoundary, type JsonObject } from '../../shared/validation/boundaryDecoder';
 import { decodeAppearanceSnapshotArg, type Theme } from '../../shared/types/appearance';
+
+installTerminalInputFocusReporting(document, window, focused => {
+  ipcRenderer.send('window:terminal-input-focus', focused);
+}, focused => {
+  ipcRenderer.send('window:shortcut-recording-focus', focused);
+});
 
 interface LogEntry {
   timestamp: string;
