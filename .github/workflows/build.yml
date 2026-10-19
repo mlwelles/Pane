@@ -3,7 +3,7 @@ name: Build & Release
 on:
   push:
     branches: [release]
-    tags: ['v*']
+    tags: ['v*', '!v*-mlwelles.*']
   workflow_dispatch:
     inputs:
       publish:
