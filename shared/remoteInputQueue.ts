@@ -64,7 +64,7 @@ export class RemoteInputQueue<Result> {
 
   cancel(error: Error): void {
     for (const [panelId, queue] of this.panels) {
-      this.fail(panelId, queue, error);
+      this.fail(panelId, queue, new Error(`Delivery unknown: terminal input was in flight when the connection changed. Check the original panel before resubmitting. ${error.message}`));
     }
   }
 
@@ -76,7 +76,7 @@ export class RemoteInputQueue<Result> {
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => {
-      this.fail(panelId, queue, new Error('Remote terminal input timed out; pending input was discarded'));
+      this.fail(panelId, queue, new Error('Delivery unknown: terminal input timed out. Check the original panel before resubmitting; pending input was discarded.'));
     }, INPUT_TIMEOUT_MS);
     queue.active = { batch, controller, timeout };
 
@@ -96,15 +96,14 @@ export class RemoteInputQueue<Result> {
   private fail(panelId: string, queue: PanelInputQueue<Result>, error: Error): void {
     if (this.panels.get(panelId) !== queue) return;
     this.panels.delete(panelId);
-    const batches = queue.pending;
     if (queue.active) {
       clearTimeout(queue.active.timeout);
       queue.active.controller.abort();
-      batches.unshift(queue.active.batch);
+      for (const waiter of queue.active.batch.waiters) waiter.reject(error);
     }
     // Delivery of an in-flight request is uncertain. Never replay it or send its queued suffix.
-    for (const batch of batches) {
-      for (const waiter of batch.waiters) waiter.reject(error);
+    for (const batch of queue.pending) {
+      for (const waiter of batch.waiters) waiter.reject(new Error('Remote connection interrupted: queued terminal input was not sent. Check the panel and re-enter it after reconnecting.'));
     }
   }
 }

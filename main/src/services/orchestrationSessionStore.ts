@@ -108,6 +108,7 @@ const sessionSchema: BoundarySchema<OrchestrationSessionRecord> = boundary.objec
 const storeSchema: BoundarySchema<OrchestrationSessionStoreData> = boundary.object({
   version: boundary.literal(ORCHESTRATION_SESSION_STORE_VERSION),
   selectedSessionId: boundary.optional(boundary.nonEmptyString),
+  order: boundary.optional(boundary.array(boundary.nonEmptyString)),
   sessions: boundary.array(sessionSchema),
 });
 
@@ -181,8 +182,8 @@ function validateStore(value: JsonValue | OrchestrationSessionStoreData): Orches
   }
   const ids = new Set<string>();
   for (const session of decoded.sessions) {
-    // Additive v1 migration: old snapshots keep their host launch behavior.
-    session.runtime ??= 'windows';
+    // Omitted runtime means the native host; 'windows' is a legacy alias for it.
+    if (session.runtime === 'windows') delete session.runtime;
     validateSession(session);
     if (ids.has(session.id)) throw new Error(`orchestration Session store contains duplicate id ${session.id}`);
     ids.add(session.id);
@@ -190,12 +191,14 @@ function validateStore(value: JsonValue | OrchestrationSessionStoreData): Orches
   if (decoded.selectedSessionId && !ids.has(decoded.selectedSessionId)) {
     throw new Error(`orchestration Session store selects missing Session ${decoded.selectedSessionId}`);
   }
+  // The order is a preference, not a record: forget ids of Sessions that no longer exist.
+  if (decoded.order) decoded.order = [...new Set(decoded.order)].filter(id => ids.has(id));
   return decoded;
 }
 
 function validateSession(session: OrchestrationSessionRecord): void {
   if (session.runtime === 'wsl' && !session.wslDistribution?.trim()) throw new Error('WSL Session requires a distribution');
-  if (session.runtime !== 'wsl' && session.wslDistribution) throw new Error('Windows Session cannot specify a WSL distribution');
+  if (session.runtime !== 'wsl' && session.wslDistribution) throw new Error('A native Session cannot specify a WSL distribution');
   validateText(session.id, `Session ${session.id} id`);
   validateText(session.name, `Session ${session.id} name`);
   validateText(session.internalSessionId, `Session ${session.id} internal id`);

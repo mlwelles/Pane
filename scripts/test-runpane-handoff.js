@@ -501,3 +501,97 @@ for (const partial of [false,true]) test(`generated remote ${partial?'partial-fa
  assert.equal(inspected.status,0,inspected.stderr); assert.match(inspected.stdout,/receiver screen proof/);
  const screen=calls().find(c=>c.channel==='runpane:panels:screen'); assert.equal(screen.target.machine,'windows-host'); assert.equal(screen.args[0].panelId,'host-panel');
 });
+
+// A Session sender: a Session's folder sits outside git, and its terminal sets
+// PANE_ORCHESTRATION_SESSION_ID. Tailnet and both daemons are external boundaries.
+function sessionSender(t, options = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'handoff-session-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const folder = path.join(root, 'session'); fs.mkdirSync(folder);
+  fs.writeFileSync(path.join(folder, 'note.md'), filled());
+  const log = path.join(root, 'calls.jsonl'); const preload = path.join(root, 'boundaries.cjs');
+  const machineOf = (name, self = false) => ({ name, dnsName: `${name}.tail.invalid`, os: 'macOS', online: true, ips: [], self, owner: 'tyler@github', mine: true });
+  const record = (fields) => ({ id: 'source-session', name: 'Pane Fixes', agent: 'claude', internalSessionId: 'internal', panelIds: { claude: 'p1', codex: 'p2', cursor: 'p3' },
+    goal: 'Ship the fixes', context: '', decisions: [], blockers: [], nextAction: '', evidence: [], outputs: [], associations: [], activity: [], revision: 1,
+    createdAt: '2026-10-11T00:00:00.000Z', updatedAt: '2026-10-11T00:00:00.000Z', ...fields });
+  const source = record(options.source ?? {});
+  const existing = (options.existing ?? []).map((name, index) => record({ id: `existing-${index}`, name }));
+  fs.writeFileSync(preload, `const fs=require('node:fs');const {decodeBoundary}=require(${JSON.stringify(path.join(dist, 'boundaryDecoder.js'))});
+const log=(entry)=>fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(entry)+'\\n');
+require(${JSON.stringify(path.join(dist, 'workspace.js'))}).readTailnet=async()=>({ok:true,self:${JSON.stringify(machineOf('tylers-macbook', true))},machines:[${JSON.stringify(machineOf('tylers-mac-mini'))}]});
+const client=require(${JSON.stringify(path.join(dist, 'daemonClient.js'))});
+client.invokeDaemon=async(channel,args,schema)=>{log({local:true,channel,args});
+ if(channel==='runpane:sessions:get'&&args[0].sessionId===${JSON.stringify(source.id)})return decodeBoundary({ok:true,session:${JSON.stringify(source)}},schema);
+ throw new Error('Unexpected local channel '+channel);};
+client.invokeRemoteDaemon=async(target,channel,args,schema)=>{log({target:target.machine,channel,args});
+ if(channel==='runpane:machine:exec')return decodeBoundary({os:'macOS',shell:'/bin/zsh',exitCode:0,stdout:'runpane-handoff\\n',stderr:''},schema);
+ if(channel==='runpane:machine:write')return decodeBoundary({path:'/Users/tyler/.pane/handoffs/'+args[0].path.split('/').pop(),bytes:args[0].content.length},schema);
+ if(channel==='runpane:sessions:list')return decodeBoundary({ok:true,sessions:${JSON.stringify(existing)}},schema);
+ if(channel==='runpane:sessions:create')return decodeBoundary({ok:true,session:{...${JSON.stringify(record({ id: 'received-session' }))},...args[0]},panelId:'received-panel'},schema);
+ throw new Error('Unexpected remote channel '+channel);};
+`);
+  const env = { ...process.env, RUNPANE_TELEMETRY_DISABLED: '1', HOME: path.join(root, 'home'), USERPROFILE: path.join(root, 'home'), PANE_DIR: path.join(root, 'isolated-data'),
+    GIT_CEILING_DIRECTORIES: root, PANE_ORCHESTRATION_SESSION_ID: source.id, PANE_SESSION_ID: 'internal', PANE_PANEL_ID: 'source-panel', NODE_OPTIONS: `--require=${JSON.stringify(preload)}` };
+  delete env.FOOZOL_DIR;
+  const calls = () => fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) : [];
+  const run = (destination, ...args) => spawnSync(process.execPath, [cli, 'handoff', destination, '--note-file', 'note.md', '--json', ...args], { cwd: folder, encoding: 'utf8', env });
+  return { root, folder, env, calls, run };
+}
+
+test('a handoff from a Session folder creates a Session on the target with the same name, goal and agent, and no git', (t) => {
+  const s = sessionSender(t);
+  const result = s.run('claude on tylers-mac-mini');
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /git/i);
+  const remote = s.calls().filter(c => c.target === 'tylers-mac-mini');
+  const write = remote.find(c => c.channel === 'runpane:machine:write');
+  assert.match(write.args[0].path, /^~\/\.pane\/handoffs\/.*\.md$/);
+  assert.match(write.args[0].content, /^origin_session: source-session$/m);
+  assert.match(write.args[0].content, /## Receiver instructions/);
+  const create = remote.find(c => c.channel === 'runpane:sessions:create').args[0];
+  assert.equal(create.name, 'Pane Fixes'); assert.equal(create.goal, 'Ship the fixes'); assert.equal(create.agent, 'claude');
+  const output = JSON.parse(result.stdout);
+  assert.match(create.nextAction, /^Read the handoff note at \/Users\/tyler\/\.pane\/handoffs\/.*\.md and continue from it\.$/);
+  assert.match(create.context, new RegExp(output.notePath.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')));
+  assert.match(create.context, /tylers-macbook/);
+  assert.equal(output.receiver.route, 'session');
+  assert.deepEqual(output.session, { id: 'received-session', name: 'Pane Fixes', machine: 'tylers-mac-mini' });
+  assert.equal(output.git, undefined);
+  assert.equal(remote.some(c => c.channel === 'runpane:panes:create' || c.channel === 'runpane:repos:list'), false);
+});
+
+test('a Session handoff numbers the name when the target already has a Session called that', (t) => {
+  const s = sessionSender(t, { existing: ['Pane Fixes', 'pane fixes 2'] });
+  const result = s.run('claude on tylers-mac-mini');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(s.calls().find(c => c.channel === 'runpane:sessions:create').args[0].name, 'Pane Fixes 3');
+  assert.equal(JSON.parse(result.stdout).session.name, 'Pane Fixes 3');
+});
+
+test('a Session handoff to this machine is refused before anything is sent', (t) => {
+  const s = sessionSender(t);
+  const result = s.run('claude here');
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /another machine/);
+  assert.match(result.stderr, /Nothing was sent/);
+  assert.deepEqual(s.calls().filter(c => !c.local), []);
+});
+
+test('a Session handoff dry run creates nothing and reports the Session route', (t) => {
+  const s = sessionSender(t, { existing: ['Pane Fixes'] });
+  const result = s.run('codex on tylers-mac-mini', '--dry-run');
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.dryRun, true); assert.equal(output.receiver.route, 'session');
+  assert.deepEqual(output.session, { name: 'Pane Fixes 2', machine: 'tylers-mac-mini' });
+  assert.equal(s.calls().some(c => c.channel === 'runpane:sessions:create' || c.channel === 'runpane:machine:write'), false);
+});
+
+test('a git checkout keeps the Pane route even inside a Session terminal', (t) => {
+  const f = fixture(t); fs.writeFileSync(path.join(f.root, 'note.md'), filled());
+  receiver(f); f.env.PANE_ORCHESTRATION_SESSION_ID = 'source-session';
+  const result = f.run('--dry-run');
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.notEqual(output.receiver?.route, 'session'); assert.equal(output.git.branch, 'task');
+});

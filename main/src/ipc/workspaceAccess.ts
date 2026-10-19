@@ -67,6 +67,7 @@ export function registerWorkspaceAccessHandlers(
     const list = await discoverTailnetMachines({
       ...dependencies,
       savedSecrets: new Map(codeless.flatMap((profile) => (profile.token ? [[profile.key, profile.token]] : []))),
+      includeRefused: true,
     });
     if (!list.ok) return list;
     const saved = new Map(codeless.map((profile) => [profile.key, profile.id]));

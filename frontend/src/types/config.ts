@@ -6,6 +6,7 @@ import type { WorktreeFileSyncEntry } from '../../../shared/types/worktreeFileSy
 import type { ApnsCredentialConfig, SharedCredentialId, SharedCredentialMeta } from '../../../shared/types/sharedCredentials';
 import type { AppearanceMode, DarkTheme, LightTheme, Theme } from '../../../shared/types/appearance';
 import type { TerminalEscapeShortcut, TerminalKeyboardPreset } from '../../../shared/utils/terminalKeyboardPolicy';
+import type { PortDiscoveryMode } from '../../../shared/types/listeningPorts';
 
 export interface TerminalShortcut {
   id: string;
@@ -55,7 +56,10 @@ interface AnalyticsConfig {
   gitUserName?: string;
 }
 
+export type HtmlFileOpenMode = 'preview' | 'source';
+
 export interface AppConfig {
+  portDiscoveryMode?: PortDiscoveryMode;
   verbose?: boolean;
   anthropicApiKey?: string;
   openaiApiKey?: string;
@@ -147,6 +151,8 @@ export interface AppConfig {
   usePtyHost?: boolean;
   // Experimental: show Mission Control, the grid of every agent pane (off by default).
   missionControlEnabled?: boolean;
+  // What a click on an .html file in Explorer opens: the browser preview (default when absent) or its source
+  htmlFileOpenMode?: HtmlFileOpenMode;
   // PostHog analytics settings
   analytics?: AnalyticsConfig;
   // User-defined custom commands for the Add Tool picker
@@ -181,6 +187,7 @@ export type PreferredShell = NonNullable<AppConfig['preferredShell']>;
 export type PreferredTerminalPowerMode = NonNullable<AppConfig['terminalPowerMode']>;
 
 export interface UpdateConfigRequest {
+  portDiscoveryMode?: PortDiscoveryMode;
   verbose?: boolean;
   anthropicApiKey?: string;
   openaiApiKey?: string;
@@ -214,6 +221,8 @@ export interface UpdateConfigRequest {
   usePtyHost?: boolean;
   // Experimental: show Mission Control, the grid of every agent pane (off by default).
   missionControlEnabled?: boolean;
+  // What a click on an .html file in Explorer opens: the browser preview (default when absent) or its source
+  htmlFileOpenMode?: HtmlFileOpenMode;
   analytics?: AnalyticsConfig;
   customCommands?: CustomCommand[];
   defaultSessionCommand?: string;

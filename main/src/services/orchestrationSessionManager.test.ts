@@ -628,6 +628,23 @@ describe('OrchestrationSessionManager', () => {
     expect(destroy).not.toHaveBeenCalled();
   });
 
+  it('keeps an Agent Farm Session\'s reported ID across refreshes and an unchanged settings save', async () => {
+    const fixture = createFixture();
+    const launchCommand = 'agent-farm run greenfield/implementer:opus';
+    const created = await fixture.manager.create({ name: 'Farm', agent: 'claude', launchCommand });
+    await panelManager.updatePanel(created.panel.id, { state: { ...created.panel.state, customState: {
+      ...created.panel.state.customState, agentSessionId: 'farm-launch-id', customResumeStarted: true,
+    } } });
+    for (const initialized of [false, true]) {
+      vi.mocked(terminalPanelManager.isTerminalInitialized).mockReturnValue(initialized);
+      await fixture.manager.update({ sessionId: created.session.id }, { launchCommand, profile: created.session.profile, customResume: null });
+      const view = await fixture.manager.getView({ sessionId: created.session.id });
+      expect(view.panel.id).toBe(created.panel.id);
+      expect(view.panel.state.customState).toMatchObject({ agentSessionId: 'farm-launch-id', customResumeStarted: true });
+      expect(view.panel.state.customState?.customResume ?? null).toBeNull();
+    }
+  });
+
   it('routes native custom commands to the right agent slot and preserves inactive histories', async () => {
     const fixture = createFixture();
     const created = await fixture.manager.create({ name: 'Switch commands', agent: 'claude' });
@@ -1303,6 +1320,120 @@ describe('OrchestrationSessionManager', () => {
     expect(listed.sessions).toHaveLength(1);
     expect(listed.selectedSessionId).toBeUndefined();
     expect(fixture.paneChatManager.getOrCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe('OrchestrationSessionManager Session order', () => {
+  const start = Date.parse('2026-10-11T10:00:00.000Z');
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Creates Sessions one second apart, so creation order is unambiguous. */
+  async function createInOrder(fixture: ReturnType<typeof createFixture>, names: string[]): Promise<Record<string, string>> {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const ids: Record<string, string> = {};
+    for (const [index, name] of names.entries()) {
+      vi.setSystemTime(start + (index + 1) * 1000);
+      ids[name] = (await fixture.manager.create({ name })).session.id;
+    }
+    return ids;
+  }
+
+  async function namesInOrder(fixture: ReturnType<typeof createFixture>, filter: (session: OrchestrationSessionRecord) => boolean = session => session.archived !== true): Promise<string[]> {
+    const listed = await fixture.manager.list();
+    return listed.sessions.filter(filter).filter(session => session.id !== LEGACY_ORCHESTRATION_SESSION_ID).map(session => session.name);
+  }
+
+  it('lists Sessions oldest first when no order was saved', async () => {
+    const fixture = createFixture();
+    await createInOrder(fixture, ['A', 'B', 'C', 'D']);
+
+    expect(await namesInOrder(fixture)).toEqual(['A', 'B', 'C', 'D']);
+  });
+
+  it('lists and selects in the saved order, and adds a new Session at the bottom', async () => {
+    const fixture = createFixture();
+    const ids = await createInOrder(fixture, ['A', 'B', 'C', 'D']);
+
+    await fixture.manager.reorder([ids.A, ids.D, ids.B, ids.C]);
+
+    expect(await namesInOrder(fixture)).toEqual(['A', 'D', 'B', 'C']);
+    const selected = await fixture.manager.select({ sessionId: ids.B });
+    expect(selected.sessions.map(session => session.name).filter(name => name !== 'Pane Chat')).toEqual(['A', 'D', 'B', 'C']);
+    vi.setSystemTime(start + 60_000);
+    await fixture.manager.create({ name: 'E' });
+    expect(await namesInOrder(fixture)).toEqual(['A', 'D', 'B', 'C', 'E']);
+  });
+
+  it('changes no Session revision, timestamp or activity, and tells clients the order changed', async () => {
+    const fixture = createFixture();
+    const ids = await createInOrder(fixture, ['A', 'B', 'C']);
+    const before = await fixture.manager.list();
+    const changes: unknown[] = [];
+    fixture.manager.on('changed', change => changes.push(change));
+
+    await fixture.manager.reorder([ids.C, ids.A]);
+
+    const after = await fixture.manager.list();
+    const fields = (session: OrchestrationSessionRecord) => [session.id, session.revision, session.updatedAt, session.activity.length];
+    expect(after.sessions.map(fields).sort()).toEqual(before.sessions.map(fields).sort());
+    expect(changes).toEqual([{ sessionId: ids.C, kind: 'reordered' }]);
+  });
+
+  it('moves only the listed Sessions, among the places they already hold', async () => {
+    const fixture = createFixture();
+    const ids = await createInOrder(fixture, ['A', 'B', 'C', 'D', 'E']);
+
+    // A list that shows only B and D (such as Pinned) swaps them; A, C and E stay where they are.
+    await fixture.manager.reorder([ids.D, ids.B]);
+
+    expect(await namesInOrder(fixture)).toEqual(['A', 'D', 'C', 'B', 'E']);
+  });
+
+  it('ignores unknown and repeated ids', async () => {
+    const fixture = createFixture();
+    const ids = await createInOrder(fixture, ['A', 'B', 'C']);
+
+    await fixture.manager.reorder(['missing-session', ids.C, ids.C, ids.A]);
+
+    expect(await namesInOrder(fixture)).toEqual(['C', 'B', 'A']);
+  });
+
+  it('returns a restored Session to the place it had before it was archived', async () => {
+    const fixture = createFixture();
+    const ids = await createInOrder(fixture, ['A', 'B', 'C', 'D']);
+    await fixture.manager.reorder([ids.A, ids.D, ids.B, ids.C]);
+
+    await fixture.manager.update({ sessionId: ids.B }, { archived: true });
+    // A client that sees only the active Sessions reorders them while B is archived.
+    await fixture.manager.reorder([ids.C, ids.A, ids.D]);
+    await fixture.manager.update({ sessionId: ids.B }, { archived: false });
+
+    expect(await namesInOrder(fixture)).toEqual(['C', 'A', 'B', 'D']);
+  });
+
+  it('selects the next Session in the saved order when the selected one is archived', async () => {
+    const fixture = createFixture();
+    const ids = await createInOrder(fixture, ['A', 'B', 'C']);
+    await fixture.manager.reorder([ids.C, ids.B, ids.A, LEGACY_ORCHESTRATION_SESSION_ID]);
+    await fixture.manager.select({ sessionId: ids.C });
+
+    await fixture.manager.update({ sessionId: ids.C }, { archived: true });
+
+    expect((await fixture.manager.list()).selectedSessionId).toBe(ids.B);
+  });
+
+  it('loads a store written before ordering, and one whose order names deleted Sessions', async () => {
+    const first = { ...orchestrationRecord('session-first', 'First'), createdAt: '2026-10-01T00:00:00.000Z' };
+    const second = { ...orchestrationRecord('session-second', 'Second'), createdAt: '2026-10-02T00:00:00.000Z' };
+    const unordered = createFixture('codex', { version: 1, sessions: [second, first] });
+    expect(await namesInOrder(unordered)).toEqual(['First', 'Second']);
+
+    const stale = createFixture('codex', { version: 1, order: ['session-gone', 'session-second', 'session-first'], sessions: [first, second] });
+    expect(await namesInOrder(stale)).toEqual(['Second', 'First']);
+    expect(stale.store.read().order).toEqual(['session-second', 'session-first']);
   });
 });
 

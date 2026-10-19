@@ -323,6 +323,11 @@ describe('pane creation name reuse', () => {
     expect((await runner.execFile('git', ['rev-parse', 'HEAD'], created.worktree_path)).stdout)
       .toBe((await runner.execFile('git', ['rev-parse', 'release/foo'], project.path)).stdout);
     await expect(runner.execFile('git', ['rev-parse', '--abbrev-ref', 'agents/W5a-fix@{upstream}'], project.path)).rejects.toThrow();
+    expect(result.base).toEqual({
+      ref: 'release/foo',
+      commit: (await runner.execFile('git', ['rev-parse', 'release/foo'], project.path)).stdout.trim(),
+      refresh: 'skipped',
+    });
   });
 
   it('refuses an existing requested branch instead of renaming it', async () => {

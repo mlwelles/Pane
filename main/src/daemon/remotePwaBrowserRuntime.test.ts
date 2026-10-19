@@ -8,12 +8,14 @@ import type { PaneRemoteConnectionImportPayload } from '../../../shared/types/re
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
 import type { JsonValue } from '../../../shared/validation/boundaryDecoder';
 
+const connectedClients: Array<RemoteDaemonBrowserClient | RemoteRuntimeAdapter> = [];
 const originalFetch = globalThis.fetch;
 const originalEventSource = globalThis.EventSource;
 const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
 
 afterEach(() => {
+  for (const client of connectedClients.splice(0)) client.disconnect();
   vi.restoreAllMocks();
   globalThis.fetch = originalFetch;
   globalThis.EventSource = originalEventSource;
@@ -104,8 +106,8 @@ describe('Remote PWA browser runtime', () => {
       });
       vi.stubGlobal('fetch', fetchMock);
 
-      await expect(createClient().invoke(channel, ['panel-1', 'echo once\r'])).rejects.toThrow(
-        /may have completed.+Check the current state/,
+      await expect((await connectReady(createClient())).invoke(channel, ['panel-1', 'echo once\r'])).rejects.toThrow(
+        channel === 'terminal:input' ? /Delivery unknown.+Check the original panel/ : /may have completed.+Check the current state/,
       );
       expect(applied).toMatchObject([{ channel, args: ['panel-1', 'echo once\r'] }]);
       expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -117,7 +119,7 @@ describe('Remote PWA browser runtime', () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: false }), { status }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(createClient().invoke('sessions:create')).rejects.toThrow(/may have completed/);
+    await expect((await connectReady(createClient())).invoke('sessions:create')).rejects.toThrow(/may have completed/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -126,7 +128,7 @@ describe('Remote PWA browser runtime', () => {
     const fetchMock = vi.fn(async () => new Response('truncated JSON', { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(createClient().invoke('terminal:input', ['panel-1', 'x'])).rejects.toThrow(/may have completed/);
+    await expect((await connectReady(createClient())).invoke('terminal:input', ['panel-1', 'x'])).rejects.toThrow(/Delivery unknown/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -309,6 +311,8 @@ describe('Remote PWA browser runtime', () => {
       '{"channel":"terminal:output","args":[{"panelId":"panel-1","data":"ok"}],"timestamp":"2026-05-19T00:00:02.000Z"}',
     );
 
+    expect(client.getState().status).toBe('restoring');
+    await vi.waitFor(() => expect(client.getState().status).toBe('connected'));
     expect(client.getState().status).toBe('connected');
     expect(client.getState().lastSeenAt).toBe('2026-05-19T00:00:02.000Z');
     expect(receivedEvents).toMatchObject([
@@ -457,6 +461,7 @@ describe('Remote PWA browser runtime', () => {
       transport: 'http+sse',
     });
 
+    await connectReady(adapter);
     await expect(adapter.toggleFavorite('session-1')).resolves.toEqual({
       isFavorite: true,
       favoritePinnedAt: '2026-01-03T00:00:00.000Z',
@@ -528,6 +533,7 @@ describe('Remote PWA browser runtime', () => {
       transport: 'http+sse',
     });
 
+    await connectReady(adapter);
     await expect(adapter.listProjectBranches(42)).resolves.toEqual([{
       name: 'origin/main',
       isCurrent: false,
@@ -698,4 +704,18 @@ function responseData(channel?: string): JsonValue | undefined {
   if (channel === 'projects:detect-branch') return 'main';
   if (channel === 'sessions:create') return { jobId: 'job-1' };
   return undefined;
+}
+
+async function connectReady<Client extends RemoteDaemonBrowserClient | RemoteRuntimeAdapter>(client: Client): Promise<Client> {
+  const fetch = globalThis.fetch;
+  const source = installMockEventSource();
+  globalThis.fetch = async () => new Response('{}', { status: 200 });
+  try {
+    await client.connect();
+    await vi.waitFor(() => expect(source.instances).toHaveLength(1));
+    source.instances[0].emit('ready', '{}');
+    await vi.waitFor(() => expect(client instanceof RemoteDaemonBrowserClient ? client.getState().status : client.getStatus().status).toBe('connected'));
+    connectedClients.push(client);
+    return client;
+  } finally { globalThis.fetch = fetch; }
 }

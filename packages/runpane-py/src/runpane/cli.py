@@ -40,6 +40,7 @@ from .local_control import (
     run_panels_submit_composer,
     run_panels_wait,
     run_panes_adopt,
+    run_panels_resume,
     run_panes_archive,
     run_panes_create,
     run_panes_focus,
@@ -61,6 +62,7 @@ from .local_control import (
     run_sessions_update,
     run_sessions_pin,
     run_watch,
+    run_pr_watch_command,
     run_workspace_state,
 )
 from .platforms import detect_platform
@@ -74,6 +76,7 @@ from .telemetry import (
     track_wrapper_event,
 )
 from .version import print_version
+from .update import run_update
 
 SOURCE = "pip"
 
@@ -115,6 +118,9 @@ class ParsedArgs:
     command: str
     target: str = DEFAULTS["target"]
     pane_version: str = DEFAULTS["paneVersion"]
+    update_scope: str = "both"
+    update_status: Optional[str] = None
+    update_wait: bool = False
     channel: str = DEFAULTS["channel"]
     format: str = DEFAULTS["format"]
     download_dir: Optional[str] = None
@@ -170,12 +176,14 @@ class ParsedArgs:
     merged: bool = False
     watch_as: Optional[str] = None
     watch_since: Optional[int] = None
+    watch_epoch: Optional[str] = None
     watch_from: Optional[str] = None
     watch_kinds: List[str] = field(default_factory=list)
     watch_pane_ids: List[str] = field(default_factory=list)
     watch_exclude_pane_ids: List[str] = field(default_factory=list)
     name_contains: Optional[str] = None
     follow: bool = False
+    until_event: bool = False
     agents_only: bool = False
     ack_now: bool = False
     include_held_input: bool = False
@@ -186,7 +194,9 @@ class ParsedArgs:
     blocked_settle_ms: Optional[int] = None
     min_interval_ms: Optional[int] = None
     idle_backoff: bool = False
+    expire_after_ms: Optional[float] = None
     all_managed: bool = False
+    all_stopped: bool = False
     include_shells: bool = False
     no_held_input: bool = False
     self_test: bool = False
@@ -342,7 +352,7 @@ def run_interactive_wizard(telemetry_context: WrapperTelemetryContext) -> int:
         print()
         print("Updating Pane desktop app on this machine...")
         set_setup_selection(telemetry_context, "update", "client")
-        return install_or_update(create_parsed_args("update", target="client"), telemetry_context)
+        return run_update(create_parsed_args("update", target="client"))
     if action == "doctor":
         print()
         print("Running runpane diagnostics...")
@@ -447,6 +457,8 @@ def parse_args(argv: List[str]) -> ParsedArgs:
         validate_panes_archive_args(parsed)
     if parsed.command == "watch" and parsed.follow and parsed.timeout_ms == 0:
         raise ValueError("--timeout-ms must be greater than 0 with --follow.")
+    if parsed.command == "watch" and parsed.until_event:
+        validate_until_event_args(parsed)
     if parsed.command == "watch" and parsed.session_id is not None and parsed.watch_pane_ids:
         raise ValueError(
             "runpane watch accepts either --session or --pane, not both; "
@@ -459,15 +471,70 @@ def parse_args(argv: List[str]) -> ParsedArgs:
     if parsed.command == "watch" and parsed.json and parsed.watch_format == "lines":
         raise ValueError("runpane watch accepts either --json or --format lines, not both.")
     cadence_value_flag_present = has_cadence_value_flag(parsed)
-    if parsed.command == "watch" and not parsed.follow and (cadence_value_flag_present or parsed.idle_backoff):
-        raise ValueError("--settle, --blocked-settle, --min-interval, and --idle-backoff require --follow.")
+    if parsed.command == "watch" and not parsed.follow and (cadence_value_flag_present or parsed.expire_after_ms is not None):
+        raise ValueError("--ready-settle, --blocked-settle, --min-interval, and --expire-after require --follow.")
     if parsed.command == "watch" and parsed.watch_since is not None and cadence_value_flag_present:
         raise ValueError(
-            "runpane watch accepts either --since or --settle/--blocked-settle/--min-interval, not both (cadence needs a named cursor)."
+            "runpane watch accepts either --since or --ready-settle/--blocked-settle/--min-interval, not both (cadence needs a named cursor)."
         )
+    if parsed.command == "watch" and parsed.watch_epoch is not None and (parsed.watch_since is None or parsed.watch_as):
+        raise ValueError("--epoch requires --since and cannot be combined with --as.")
+    if parsed.command == "watch":
+        apply_watch_defaults(parsed)
     if parsed.command == "report":
         validate_report_args(parsed)
     return parsed
+
+
+def parse_watch_duration(flag: str, value: str, bare_unit: int = 1) -> int:
+    if value == "off":
+        return 0
+    match = re.fullmatch(r"([0-9]+)(ms|s|m|h)?", value)
+    units = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}
+    duration = int(match[1]) * units.get(match[2], bare_unit) if match else -1
+    if duration < 0 or duration > 2147483647:
+        raise ValueError(f"{flag} must be a duration such as 30s, 3m, 3h, or 0 (at most 2147483647ms).")
+    return duration
+
+
+def apply_watch_defaults(parsed: ParsedArgs) -> None:
+    defaults = RUNPANE_CONTRACT["defaults"]["watch"]
+    if parsed.until_event and not parsed.watch_kinds:
+        parsed.watch_kinds = list(defaults["untilEvent"]["kinds"])
+    if not parsed.follow:
+        return
+    follow = defaults["follow"]
+    if not parsed.watch_kinds:
+        parsed.watch_kinds = list(follow["kinds"])
+    for field, key in [("settle_ms", "readySettle"), ("blocked_settle_ms", "blockedSettle"),
+                       ("min_interval_ms", "minInterval"), ("idle_after_ms", "idleAfter"),
+                       ("expire_after_ms", "expireAfter")]:
+        if getattr(parsed, field) is None:
+            setattr(parsed, field, parse_watch_duration(key, follow[key]))
+    if parsed.heartbeat_seconds is None:
+        parsed.heartbeat_seconds = parse_watch_duration("--heartbeat", follow["heartbeat"]) / 1000
+    parsed.idle_backoff = follow["idleBackoff"]
+    if parsed.watch_since is not None:
+        parsed.settle_ms = parsed.blocked_settle_ms = parsed.min_interval_ms = 0
+        parsed.idle_backoff = False
+
+
+def validate_until_event_args(parsed: ParsedArgs) -> None:
+    if parsed.follow:
+        raise ValueError(
+            "runpane watch accepts either --until-event or --follow, not both. "
+            "Use --until-event to exit on the first event, or --follow to stream until interrupted."
+        )
+    if parsed.self_test:
+        raise ValueError(
+            "runpane watch accepts either --until-event or --self-test, not both. "
+            "Run --self-test on its own to probe the watch path."
+        )
+    if parsed.timeout_ms == 0:
+        raise ValueError(
+            "--timeout-ms must be greater than 0 with --until-event; it is the total deadline. "
+            "Leave it out to wait as long as it takes."
+        )
 
 
 def validate_report_args(parsed: ParsedArgs) -> None:
@@ -529,13 +596,44 @@ def split_inline_values(raw_args: List[str]) -> Tuple[List[str], Set[int]]:
 
 
 def parse_flags(raw_args: List[str], parsed: ParsedArgs) -> None:
+    if parsed.command == "watch":
+        removed = {
+            "--settle": "--ready-settle",
+            "--format": "--json (or omit for lines)",
+            "--agents-only": "--include-shells to include shells; agents are the default",
+            "--all-managed": "omit it; all managed Panes are the default",
+            "--quiet": "omit it; heartbeats are off by default",
+            "--no-control-lines": "omit it; WATCH OK and errors always print",
+            "--idle-backoff": "omit it; backoff is the default",
+            "--present": "--follow with individual duration overrides such as --ready-settle 1m --blocked-settle 15s --min-interval 2m",
+            "--profile": "--follow with individual duration overrides such as --ready-settle 1m --blocked-settle 15s --min-interval 2m",
+        }
+        for token in raw_args:
+            flag = token.split("=", 1)[0]
+            if flag in removed:
+                raise ValueError(f"{flag} was removed from runpane watch. Use {removed[flag]}.")
     args, literal_values = split_inline_values(raw_args)
     index = 0
     while index < len(args):
         arg = args[index]
         is_agent_context_command = parsed.command == "agent-context"
         is_local_command = is_runpane_local_command(parsed.command)
-        if arg in {"-h", "--help"}:
+        if parsed.command == "update" and arg in {"--pane-only", "--cli-only"}:
+            scope = "pane" if arg == "--pane-only" else "cli"
+            if parsed.update_scope not in {"both", scope}:
+                raise ValueError("--pane-only and --cli-only are mutually exclusive.")
+            parsed.update_scope = scope
+        elif parsed.command == "update" and arg == "--status":
+            index += 1
+            parsed.update_status = read_value(args, index, arg, literal_values)
+        elif parsed.command == "update" and arg == "--wait":
+            parsed.update_wait = True
+        elif parsed.command == "update" and arg == "--json":
+            parsed.json = True
+        elif parsed.command == "update" and arg == "--pane-dir":
+            index += 1
+            parsed.pane_dir = read_value(args, index, arg, literal_values)
+        elif arg in {"-h", "--help"}:
             parsed.help_topic = parsed.command
             parsed.command = "help"
         elif arg == "--dry-run":
@@ -649,6 +747,9 @@ def parse_local_boolean_flag(parsed: ParsedArgs, flag: str) -> None:
     if flag == "--follow":
         parsed.follow = True
         return
+    if flag == "--until-event":
+        parsed.until_event = True
+        return
     if flag == "--idle-backoff":
         parsed.idle_backoff = True
         return
@@ -663,6 +764,9 @@ def parse_local_boolean_flag(parsed: ParsedArgs, flag: str) -> None:
         return
     if flag == "--all-managed":
         parsed.all_managed = True
+        return
+    if flag == "--all-stopped":
+        parsed.all_stopped = True
         return
     if flag == "--include-shells":
         parsed.include_shells = True
@@ -763,6 +867,9 @@ def parse_local_value_flag(parsed: ParsedArgs, flag: str, value: str) -> None:
         parsed.from_json = value
         return
     if flag == "--timeout-ms":
+        if parsed.command == "watch":
+            parsed.timeout_ms = parse_watch_duration(flag, value)
+            return
         try:
             timeout_ms = float(value)
         except ValueError as error:
@@ -828,6 +935,11 @@ def parse_local_value_flag(parsed: ParsedArgs, flag: str, value: str) -> None:
     if flag == "--as":
         parsed.watch_as = value
         return
+    if flag == "--epoch":
+        if not value.strip():
+            raise ValueError("--epoch must not be empty.")
+        parsed.watch_epoch = value
+        return
     if flag == "--since":
         try:
             since = int(value)
@@ -848,6 +960,8 @@ def parse_local_value_flag(parsed: ParsedArgs, flag: str, value: str) -> None:
     if flag == "--name-contains":
         parsed.name_contains = value
         return
+    if flag == "--format" and parsed.command == "watch":
+        raise ValueError("--format was removed from runpane watch. Use --json (or omit for lines).")
     if flag == "--format":
         if parsed.command == "watch":
             if value not in {"lines", "json"}:
@@ -859,19 +973,22 @@ def parse_local_value_flag(parsed: ParsedArgs, flag: str, value: str) -> None:
         parsed.format = value
         return
     if flag == "--heartbeat":
-        parsed.heartbeat_seconds = parse_non_negative_int_flag(flag, value)
+        parsed.heartbeat_seconds = parse_watch_duration(flag, value, 1000) / 1000
+        return
+    if flag == "--expire-after":
+        parsed.expire_after_ms = parse_watch_duration(flag, value)
         return
     if flag == "--idle-after":
-        parsed.idle_after_ms = parse_non_negative_int_flag(flag, value)
+        parsed.idle_after_ms = parse_watch_duration(flag, value)
         return
-    if flag == "--settle":
-        parsed.settle_ms = parse_non_negative_int_flag(flag, value)
+    if flag == "--ready-settle":
+        parsed.settle_ms = parse_watch_duration(flag, value)
         return
     if flag == "--blocked-settle":
-        parsed.blocked_settle_ms = parse_non_negative_int_flag(flag, value)
+        parsed.blocked_settle_ms = parse_watch_duration(flag, value)
         return
     if flag == "--min-interval":
-        parsed.min_interval_ms = parse_non_negative_int_flag(flag, value)
+        parsed.min_interval_ms = parse_watch_duration(flag, value)
         return
     if flag == "--body-file":
         parsed.body_file = value
@@ -1179,6 +1296,9 @@ COMMAND_HANDLERS: Dict[str, Callable[[ParsedArgs, WrapperTelemetryContext], int]
     "panes list": lambda parsed, context: run_panes_list(parsed),
     "panes cost": lambda parsed, context: run_panes_cost(parsed),
     "workspace state": lambda parsed, context: run_workspace_state(parsed),
+    "pr watch": lambda parsed, context: run_pr_watch_command(parsed),
+    "pr unwatch": lambda parsed, context: run_pr_watch_command(parsed),
+    "pr list": lambda parsed, context: run_pr_watch_command(parsed),
     "watch": lambda parsed, context: run_watch(parsed),
     "workspace list": lambda parsed, context: run_unsupported_contract(parsed, context),
     "workspace enable": lambda parsed, context: run_unsupported_contract(parsed, context),
@@ -1202,13 +1322,14 @@ COMMAND_HANDLERS: Dict[str, Callable[[ParsedArgs, WrapperTelemetryContext], int]
     "panels submit": lambda parsed, context: run_panels_submit(parsed),
     "panels submit-composer": lambda parsed, context: run_panels_submit_composer(parsed),
     "panels wait": lambda parsed, context: run_panels_wait(parsed),
+    "panels resume": lambda parsed, context: run_panels_resume(parsed),
     "panels last-message": lambda parsed, context: run_panels_last_message(parsed),
     "report": lambda parsed, context: run_report(parsed),
     "agents doctor": lambda parsed, context: run_agents_doctor(parsed),
     "panes adopt": lambda parsed, context: run_panes_adopt(parsed),
     "help": lambda parsed, context: print_help(parsed),
     "install": lambda parsed, context: install_or_update(parsed, context),
-    "update": lambda parsed, context: install_or_update(parsed, context),
+    "update": lambda parsed, context: run_update(parsed),
     "mcp": lambda parsed, context: run_unsupported_contract(parsed, context),
     "panes git-status": lambda parsed, context: run_daemon_action(parsed, contract_command(parsed.command)["daemonAction"]),
     "panes commit": lambda parsed, context: run_daemon_action(parsed, contract_command(parsed.command)["daemonAction"]),

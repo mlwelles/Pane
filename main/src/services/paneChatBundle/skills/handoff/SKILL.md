@@ -37,6 +37,15 @@ When the person asks for another agent to continue, on this machine or another o
 5. Send it: the same command without `--dry-run`. It finds the destination's saved repository with the same remote, writes the note to that machine's `~/.pane/handoffs/`, and starts the agent. On another machine it gets a new Pane branched from yours; on this machine, run from the Pane that owns this checkout, it opens as a new tab in your Pane (1 feature = 1 worktree = 1 branch = 1 Pane), and the JSON's `receiver.route` and `receiver.reason` say which happened. If it fails, relay its message; it names the fix (Pane not running there, repository not saved there, branch not pushed).
 6. Tell the person where the receiver started (a new tab in your Pane, or a new Pane on which machine), and give them the `agents status` command it printed. The receiver pushes to your branch and reports back to your panel, so stop changing that branch.
 
+## Hand off a Session
+
+When you are a Session's agent (your terminal sets `PANE_ORCHESTRATION_SESSION_ID`) and the person asks to move the Session to another machine, for example through **Move to host…** in the Session's right-click menu, run the same steps from the Session's folder. There is no git to move, so skip step 3 and don't push anything.
+
+- Write the note from `runpane handoff --template` as above. Under "Git state", list each Pane this Session coordinates with its machine, branch and PR, or write "None". Name the files in the Session folder worth reading, with their full paths: the receiver can read them with `runpane workspace <this machine> read <path>`, but nothing else is copied.
+- Check it with `--dry-run`, then send it: `runpane handoff "<agent> on <machine>" --note-file <note>`. It writes the note to that machine's `~/.pane/handoffs/` and creates a Session there with this Session's name (numbered "<name> 2" if taken), goal and the agent you named. The new Session's next action is to read the note. The JSON reports `receiver.route` `session` and the new `session`.
+- A Session can't be handed off to the machine it is on; handoff refuses before sending anything.
+- Tell the person the new Session's name and machine. It waits for their first message, like every Session: they switch Pane to that machine, open it, and send "continue". This Session stays as it is; they can archive it when they're done with it.
+
 The note is the handoff. Skip the two sections below unless the person also wants a saved page, a Grain workspace or a PR comment, or there is no receiving agent to start.
 
 ## Save one authoritative brief

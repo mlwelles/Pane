@@ -11,6 +11,8 @@ import { ensureFastGitConfig, forceRemoveWorktree } from './gitPerformanceConfig
 import { removeWorktreeViaTrash, sweepWorktreeTrash, type WorktreeTrashDeletion } from './worktreeTrash';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
 import { withArchiveRepositoryLock } from './archiveRepositoryLock';
+import { describeWorktreeBase, recordProjectFetch, refreshWorktreeBase } from './worktreeBaseRefresh';
+import type { RunpanePaneBase } from '../../../shared/types/runpaneOrchestration';
 
 type WorktreeAuditSource = 'session-delete' | 'project-delete' | 'create-cleanup';
 
@@ -415,6 +417,10 @@ export class WorktreeManager {
    * `branchName` names the new worktree branch exactly (for example
    * `agents/w5a`); it must not exist yet. Without it the branch is the
    * worktree name.
+   *
+   * A remote-tracking base is fetched first (capped, outside the repository
+   * lock), so the worktree starts at the remote's tip. If that fails the
+   * worktree starts from the local ref and `base.notice` says so.
    */
   async resolveWorkingDirectory(
     projectPath: string,
@@ -425,7 +431,7 @@ export class WorktreeManager {
     pathResolver: PathResolver,
     commandRunner: CommandRunner,
     options: { branchName?: string } = {},
-  ): Promise<{ worktreePath: string; baseCommit: string | undefined; baseBranch: string | undefined }> {
+  ): Promise<{ worktreePath: string; baseCommit: string | undefined; baseBranch: string | undefined; base?: RunpanePaneBase }> {
     if (!useWorktree && options.branchName) {
       throw new Error('A branch name can only be requested for a Pane with its own worktree.');
     }
@@ -434,6 +440,10 @@ export class WorktreeManager {
         ? await assertNewBranchName(projectPath, options.branchName, commandRunner)
         : undefined;
       const effectiveBase = baseBranch || await resolveDefaultWorktreeBase(projectPath, commandRunner);
+      const refresh = await refreshWorktreeBase(projectPath, effectiveBase, commandRunner);
+      if (refresh.status === 'failed') {
+        console.warn(`[WorktreeManager] Could not refresh ${effectiveBase} for ${projectPath}; creating from the local ref: ${refresh.reason}`);
+      }
 
       // Try claiming a pre-created reserve worktree for instant creation
       try {
@@ -454,7 +464,7 @@ export class WorktreeManager {
         if (claimed) {
           // Detect base commit from the claimed worktree
           const { baseCommit } = await detectGitBase(claimed.worktreePath, commandRunner);
-          return { worktreePath: claimed.worktreePath, baseCommit, baseBranch: effectiveBase };
+          return { worktreePath: claimed.worktreePath, baseCommit, baseBranch: effectiveBase, base: describeWorktreeBase(refresh, baseCommit) };
         }
       } catch (error) {
         console.warn('[WorktreeManager] Pool claim failed, falling back to fresh worktree:', error);
@@ -464,16 +474,23 @@ export class WorktreeManager {
       const result = await this.createWorktree(projectPath, worktreeName, requestedBranch, effectiveBase, worktreeFolder, pathResolver, commandRunner);
 
       // Trigger background replenishment after successful creation
-      worktreePoolManager.createReserve(projectPath, effectiveBase, worktreeFolder, pathResolver, commandRunner).catch(err => {
-        console.warn('[WorktreeManager] Background reserve creation failed:', err);
-      });
+      worktreePoolManager.replenishInBackground(projectPath, effectiveBase, worktreeFolder, pathResolver, commandRunner);
 
-      return result;
+      return { ...result, base: describeWorktreeBase(refresh, result.baseCommit) };
     }
 
     // Run directly in the project directory
     const { baseBranch: detectedBranch, baseCommit } = await detectGitBase(projectPath, commandRunner, baseBranch, true);
     return { worktreePath: projectPath, baseCommit, baseBranch: detectedBranch };
+  }
+
+  /**
+   * Pre-creates a reserve worktree under the base a create with no `--base`
+   * resolves to, so the first create after startup can claim it.
+   */
+  async seedReserve(projectPath: string, worktreeFolder: string | undefined, pathResolver: PathResolver, commandRunner: CommandRunner): Promise<void> {
+    const base = await resolveDefaultWorktreeBase(projectPath, commandRunner);
+    await worktreePoolManager.createReserve(projectPath, base, worktreeFolder, pathResolver, commandRunner);
   }
 
   async removeWorktree(projectPath: string, name: string, worktreeFolder: string | undefined, sessionCreatedAt: Date | undefined, pathResolver: PathResolver, commandRunner: CommandRunner, auditContext?: WorktreeAuditContext): Promise<WorktreeTrashDeletion> {
@@ -575,6 +592,7 @@ export class WorktreeManager {
       // Fetch latest from all remotes (silent, catch errors)
       try {
         await commandRunner.execAsync(`git fetch --all --prune`, projectPath, { timeout: 30000 });
+        recordProjectFetch(projectPath);
       } catch {
         // Ignore fetch errors - user may be offline
       }

@@ -38,6 +38,7 @@ const STATE_TEXT = {
   available: 'Ready',
   'password-required': 'Needs password',
   outdated: 'Older Pane',
+  refused: 'Owner only',
   unreachable: 'Pane not open',
   offline: 'Offline',
 } satisfies Record<TailnetMachine['state'], string>;

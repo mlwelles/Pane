@@ -17,7 +17,6 @@ interface DaemonContextValue {
 
 const DaemonContext = createContext<DaemonContextValue | null>(null);
 
-const OFFLINE_RETRY_MS = 15_000;
 
 /**
  * Owns the connection to the active host. Render it with `key={profile.id}` so
@@ -34,28 +33,23 @@ export function DaemonProvider({ profile, children }: { profile: RemotePaneConne
   const [connection, setConnection] = useState<RemoteDaemonConnectionState>(() => client.getState());
 
   useEffect(() => {
-    // The stream does not replay missed events, so refetch everything once it
-    // is back: after a drop, an error or a disconnect (app resume included).
-    // Both transports report status; only some emit the host's `ready` event.
-    // `onStatus` reports the new client's initial `local` state first; that is not a drop.
-    let missedEvents: boolean | null = null;
-    const unsubscribeStatus = client.onStatus(state => {
-      if (missedEvents === null) missedEvents = false;
-      else if (state.status === 'connected') {
-        if (missedEvents) void queryClient.invalidateQueries({ queryKey: [profile.id] });
-        missedEvents = false;
-      } else if (state.status !== 'connecting') missedEvents = true;
-      setConnection(state);
+    const unsubscribeRestore = client.onRestore(async signal => {
+      await queryClient.refetchQueries({ queryKey: [profile.id], type: 'active' }, { throwOnError: true });
+      if (signal.aborted) return;
     });
+    const unsubscribeStatus = client.onStatus(setConnection);
     const connect = () => client.connect().catch(() => undefined);
     void connect();
     const appState = AppState.addEventListener('change', status => {
       const { status: current } = client.getState();
-      if (status === 'active' && (current === 'error' || current === 'local')) void connect();
+      if (status !== 'active') client.suspend();
+      else if (current === 'local') void connect();
+      else client.resume();
     });
     return () => {
       appState.remove();
       unsubscribeStatus();
+      unsubscribeRestore();
       client.disconnect();
     };
   }, [client, profile.id, queryClient]);
@@ -67,16 +61,6 @@ export function DaemonProvider({ profile, children }: { profile: RemotePaneConne
     requestSharedCredentialSync();
   }), [client, profile.id, queryClient]);
 
-  // The client gives up after its reconnect backoff (about 30 s). A phone
-  // changing networks or waking a sleeping Mac needs longer, so keep trying
-  // while the app is open.
-  useEffect(() => {
-    if (connection.status !== 'error') return;
-    const timer = setTimeout(() => {
-      if (AppState.currentState === 'active') void client.connect().catch(() => undefined);
-    }, OFFLINE_RETRY_MS);
-    return () => clearTimeout(timer);
-  }, [client, connection]);
 
   return <DaemonContext value={{ client, profile, connection }}>{children}</DaemonContext>;
 }

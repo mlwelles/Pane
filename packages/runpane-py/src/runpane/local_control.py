@@ -7,7 +7,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .daemon_client import PaneDaemonClientError, invoke_daemon
 from .generated_contract import RUNPANE_CONTRACT
@@ -287,8 +287,7 @@ def read_session_payload(parsed: Any, command: str) -> Dict[str, Any]:
         raise ValueError(f"runpane sessions {command} received invalid JSON: {error}") from error
     if not isinstance(value, dict):
         raise ValueError(f"runpane sessions {command} JSON input must be an object.")
-    if command == "create" and not isinstance(value.get("name"), str):
-        raise ValueError("runpane sessions create JSON input requires a string name.")
+    # The daemon checks the fields and names every problem in one ERR_SESSION_PAYLOAD_INVALID.
     return value
 
 
@@ -355,40 +354,104 @@ def has_cadence_value_flag(parsed: Any) -> bool:
     return any(value is not None for value in (parsed.settle_ms, parsed.blocked_settle_ms, parsed.min_interval_ms))
 
 
+class WatchReaderClosed(Exception):
+    """Stdout's reader went away (`| head -1`); the watch has nobody left to tell."""
+
+
+class _ReaderClosedGuard:
+    """Wraps stdout so a failed write raises WatchReaderClosed, never a daemon-looking OSError.
+
+    A closed pipe surfaces as EPIPE, ENOTCONN (a socket pair on macOS) or EINVAL (Windows).
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        try:
+            return self._stream.write(text)
+        except OSError as error:
+            raise WatchReaderClosed() from error
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except OSError as error:
+            raise WatchReaderClosed() from error
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def run_pr_watch_command(parsed: Any) -> int:
+    action = parsed.command.split(" ")[1]
+    pane_id = parsed.pane_id or os.environ.get("PANE_SESSION_ID")
+    if action != "list" and (not pane_id or not parsed.url):
+        raise ValueError("Pass --pane <id> and --url <PR URL> (inside a Pane, --pane defaults to this Pane).")
+    result = invoke_daemon(f"runpane:pr:{action}", [{**optional_value("paneId", pane_id), **optional_value("url", parsed.url), **optional_value("head", parsed.report_head)}], pane_dir=parsed.pane_dir)
+    print_json(result)
+    return 0
+
+
 def run_watch(parsed: Any) -> int:
+    stdout = sys.stdout
+    sys.stdout = _ReaderClosedGuard(stdout)
+    try:
+        return watch_until_done(parsed)
+    except WatchReaderClosed:
+        # End quietly, and keep the interpreter's final flush from reporting the closed pipe.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), stdout.fileno())
+        return 0
+    finally:
+        sys.stdout = stdout
+
+
+def watch_until_done(parsed: Any) -> int:
     if parsed.watch_as and parsed.watch_since is not None:
         raise ValueError("runpane watch accepts either --as or --since, not both.")
 
-    defaults = RUNPANE_CONTRACT["defaults"]["watch"]
+    defaults = RUNPANE_CONTRACT["defaults"]["watch"]["follow"]
     output_format = parsed.watch_format or ("json" if parsed.json else "lines")
+    # --until-event takes --follow's scope defaults; it only stops after the first event.
+    keeps_waiting = bool(parsed.follow or parsed.until_event)
     heartbeat_seconds = parsed.heartbeat_seconds
     if heartbeat_seconds is None:
-        heartbeat_seconds = defaults["heartbeatSeconds"] if parsed.follow else 0
+        heartbeat_seconds = 0
     heartbeat_ms = effective_watch_heartbeat_ms(heartbeat_seconds)
     idle_after_ms = parsed.idle_after_ms
     if idle_after_ms is None:
-        idle_after_ms = defaults["idleAfterMs"] if parsed.follow else 0
-    effective_agents_only = None if parsed.include_shells else (True if parsed.agents_only or parsed.follow else None)
+        idle_after_ms = 0
+    effective_agents_only = None if parsed.include_shells else (True if parsed.agents_only or keeps_waiting else None)
     include_held_input = True if parsed.include_held_input and not parsed.no_held_input else None
     # Lines mode turns presence into STUCK; JSON mode passes heldInputPresent through as the equivalent.
     include_held_input_presence = (
-        True if defaults["includeHeldInputPresence"]
-        and not parsed.no_held_input and parsed.follow else None
+        True if defaults["heldInputDetection"]
+        and not parsed.no_held_input and keeps_waiting else None
     )
     cadence_value_flag_present = has_cadence_value_flag(parsed)
+    own_panel_id = (os.environ.get("PANE_PANEL_ID") or "").strip() or None
     # Cadence state lives in the daemon per named consumer, so an anonymous follower names itself.
     # A Session watch is named after the Session, so it survives an orchestrator agent switch.
     watch_as = parsed.watch_as
-    if watch_as is None and parsed.follow:
+    if watch_as is None and parsed.until_event and own_panel_id and parsed.watch_since is None:
+        # An --until-event re-arm resumes where the last one stopped, under a name apart from the
+        # panel's --follow cursor so it never takes over a running monitor.
+        watch_as = derived_watch_cursor_name("until", f"until-{own_panel_id}")
+    if watch_as is None and parsed.follow and parsed.watch_since is None:
         session_cursor = session_watch_cursor_name(parsed.session_id) if parsed.session_id else None
-        panel_id = os.environ.get("PANE_PANEL_ID")
-        panel_cursor = derived_watch_cursor_name("panel", panel_id) if panel_id else None
+        panel_cursor = derived_watch_cursor_name("panel", own_panel_id) if own_panel_id else None
         watch_as = session_cursor or panel_cursor or (f"follow-{os.getpid()}" if cadence_value_flag_present else None)
+    # Under --until-event, --timeout-ms is the deadline for the whole wait, not for one daemon call.
+    deadline_at = (
+        time.monotonic() * 1_000 + parsed.timeout_ms
+        if parsed.until_event and parsed.timeout_ms is not None else None
+    )
     # --quiet drops lines that only prove liveness; --self-test still prints its WATCH OK result.
-    quiet = bool(parsed.quiet)
+    quiet = False
     request: Dict[str, Any] = {
         **optional_value("as", watch_as),
         **optional_value("since", parsed.watch_since),
+        **optional_value("epoch", parsed.watch_epoch),
         **optional_value("from", parsed.watch_from),
         **optional_value("timeoutMs", parsed.timeout_ms),
         **optional_value("limit", parsed.limit),
@@ -407,28 +470,51 @@ def run_watch(parsed: Any) -> int:
         **optional_value("settleMs", parsed.settle_ms),
         **optional_value("blockedSettleMs", parsed.blocked_settle_ms),
         **optional_value("minIntervalMs", parsed.min_interval_ms),
-        **optional_value("idleBackoff", True if parsed.idle_backoff else None),
+        **optional_value("idleBackoff", parsed.idle_backoff),
     }
 
     armed = False
     failing_code: Optional[str] = None
     last_failure_at = 0.0
     last_heartbeat_at = time.monotonic() * 1_000
-    anonymous_idle_window_start_ms = 0 if not watch_as and parsed.follow else None
+    anonymous_idle_window_start_ms = 0 if not watch_as and keeps_waiting else None
+    # --expire-after: IDLE re-fires and control lines don't count as activity.
+    expire_after_ms = parsed.expire_after_ms if parsed.follow and parsed.expire_after_ms else None
+    last_activity_at = time.monotonic() * 1_000
+    last_activity_generation = None
     try:
         while True:
-            requested_wait_ms = parsed.timeout_ms if parsed.timeout_ms is not None else (heartbeat_ms or 60_000)
+            if expire_after_ms is not None and time.monotonic() * 1_000 - last_activity_at >= expire_after_ms:
+                if failing_code:
+                    return 1
+                emit_watch_non_entry("_expired", output_format, expireAfterMs=expire_after_ms)
+                return 0
+            if deadline_at is not None and time.monotonic() * 1_000 >= deadline_at:
+                if not quiet:
+                    emit_watch_non_entry("_timeout", output_format, timeoutMs=parsed.timeout_ms)
+                return 124
+            if deadline_at is not None:
+                requested_wait_ms = deadline_at - time.monotonic() * 1_000
+            elif parsed.timeout_ms is not None:
+                requested_wait_ms = parsed.timeout_ms
+            else:
+                requested_wait_ms = heartbeat_ms or (120_000 if parsed.until_event else 60_000)
             heartbeat_wait_ms = (
                 max(0, heartbeat_ms - (time.monotonic() * 1_000 - last_heartbeat_at))
                 if heartbeat_ms > 0 else requested_wait_ms
             )
-            timeout_ms = 0 if parsed.self_test else min(requested_wait_ms, heartbeat_wait_ms, 120_000)
+            expiry_wait_ms = (
+                max(0, expire_after_ms - (time.monotonic() * 1_000 - last_activity_at))
+                if expire_after_ms is not None else requested_wait_ms
+            )
+            timeout_ms = 0 if parsed.self_test else int(min(requested_wait_ms, heartbeat_wait_ms, expiry_wait_ms, 120_000))
             try:
                 call_request = dict(request)
                 call_request["timeoutMs"] = timeout_ms
                 if parsed.self_test:
                     call_request.pop("as", None)
                     call_request.pop("since", None)
+                    call_request.pop("epoch", None)
                     call_request.update({"from": "now", "idleAfterMs": 0, "timeoutMs": 0})
                 elif anonymous_idle_window_start_ms is not None:
                     call_request["idleWindowStartMs"] = anonymous_idle_window_start_ms
@@ -440,7 +526,7 @@ def run_watch(parsed: Any) -> int:
                     event_include=[],
                 )
             except PaneDaemonClientError as error:
-                if not parsed.follow or error.code not in {
+                if not keeps_waiting or error.code not in {
                     "ERR_RUNPANE_DAEMON_CLOSED",
                     "ERR_RUNPANE_DAEMON_CONNECT_FAILED",
                     "ERR_RUNPANE_DAEMON_TIMEOUT",
@@ -456,6 +542,11 @@ def run_watch(parsed: Any) -> int:
                 failing_code = code
                 time.sleep(1)
                 continue
+            activity_generation = result.get("activityGeneration")
+            if activity_generation is not None:
+                if last_activity_generation is not None and activity_generation > last_activity_generation:
+                    last_activity_at = time.monotonic() * 1_000
+                last_activity_generation = activity_generation
             if request.get("session") and not result.get("session"):
                 # An older daemon ignores the unknown field and would watch every Pane instead.
                 return emit_watch_failure(
@@ -469,8 +560,9 @@ def run_watch(parsed: Any) -> int:
                 if not quiet:
                     emit_watch_non_entry("_reconnected", output_format, generation=result.get("generation"))
                 failing_code = None
-            if not armed and (parsed.follow or parsed.self_test):
-                if parsed.self_test or not quiet:
+            if not armed and (keeps_waiting or parsed.self_test):
+                # A follow monitor sees WATCH OK as proof it is armed; --until-event prints only its event.
+                if parsed.follow or parsed.self_test:
                     emit_watch_non_entry(
                         "_ok",
                         output_format,
@@ -480,7 +572,23 @@ def run_watch(parsed: Any) -> int:
                 armed = True
                 if parsed.self_test:
                     return 0
-            print_workspace_wait_result(result, output_format)
+            if parsed.until_event:
+                # A reset restates current state; it never ends the wait. Nor does the caller's own panel.
+                if result.get("reset") or result.get("dropped") is not None:
+                    if not quiet:
+                        print_workspace_wait_result(result, output_format)
+                else:
+                    entries = [
+                        entry for entry in result.get("entries", [])
+                        if not own_panel_id or entry.get("panelId") != own_panel_id
+                    ]
+                    if entries:
+                        print_workspace_wait_result({**result, "entries": entries}, output_format)
+                        return 0
+            else:
+                print_workspace_wait_result(result, output_format)
+                if any(entry.get("kind") != "agent.idle" and not entry.get("replay") and not entry.get("baseline") for entry in result.get("entries", [])):
+                    last_activity_at = time.monotonic() * 1_000
             now_ms = time.monotonic() * 1_000
             if heartbeat_ms > 0 and now_ms - last_heartbeat_at >= heartbeat_ms:
                 if not quiet:
@@ -493,9 +601,10 @@ def run_watch(parsed: Any) -> int:
                 last_heartbeat_at = now_ms
             if not watch_as:
                 request["since"] = result.get("generation")
-                if parsed.follow:
+                request["epoch"] = result.get("epoch")
+                if keeps_waiting:
                     anonymous_idle_window_start_ms = time.time() * 1_000
-            if not parsed.follow:
+            if not keeps_waiting:
                 break
     except KeyboardInterrupt:
         return 0
@@ -920,10 +1029,34 @@ def run_report(parsed: Any, env: Optional[Dict[str, str]] = None) -> int:
     if parsed.json:
         print_json(result)
     else:
-        session_ids = result.get("sessionIds") or []
-        sessions = f" Recorded on Session {', '.join(session_ids)}." if session_ids else ""
-        print(f"Reported {describe_report(result.get('report') or {})} for panel {result.get('panelId')}.{sessions}")
+        for line in describe_report_delivery(result):
+            print(line)
     return 0
+
+
+def describe_report_delivery(result: Dict[str, Any]) -> List[str]:
+    """What `runpane report` prints: the report, who recorded it, and how many watches were waiting.
+
+    Zero waiting watchers means nobody is waiting right now, not that the report is lost.
+    """
+    session_ids = result.get("sessionIds") or []
+    sessions = f" Recorded on Session {', '.join(session_ids)}." if session_ids else ""
+    live_watchers = result.get("liveWatchers")
+    watchers = live_watchers or 0
+    delivered = f" Delivered to {watchers} waiting watcher{'' if watchers == 1 else 's'}." if watchers > 0 else ""
+    panel_id = result.get("panelId")
+    lines = [f"Reported {describe_report(result.get('report') or {})} for panel {panel_id}.{sessions}{delivered}"]
+    if session_ids or watchers > 0:
+        return lines
+    stored = f"It is stored on the panel (runpane agents status --panel {panel_id})"
+    if live_watchers is None:
+        lines.append(f"No Session recorded this report. {stored}, and only watchers that list agent.report receive it.")
+    else:
+        lines.append(
+            f"No Session recorded this report and no watcher was waiting for it. {stored}, "
+            "and a watch with a named cursor (runpane watch --as <name> --kinds agent.report) still receives it when it next waits."
+        )
+    return lines
 
 
 def run_panels_submit(parsed: Any) -> int:
@@ -1021,6 +1154,69 @@ def run_panels_wait(parsed: Any) -> int:
         print_json(result)
     else:
         print_panel_wait_result(result)
+    return 0 if result.get("ok") else 1
+
+
+def run_panels_resume(parsed: Any) -> int:
+    scopes = [value for value in (parsed.panel_id, parsed.session_id, parsed.all_stopped) if value]
+    if len(scopes) != 1:
+        raise ValueError("runpane panels resume requires exactly one of --panel, --session, or --all-stopped.")
+    if parsed.panel_id and parsed.concurrency is not None:
+        raise ValueError("runpane panels resume --concurrency applies only to --session or --all-stopped.")
+    confirm_panel_resume(parsed)
+    if not parsed.panel_id:
+        return run_panels_resume_many(parsed)
+
+    result = invoke_daemon("runpane:panels:resume", [{
+        "panelId": parsed.panel_id,
+        **optional_value("waitReady", True if parsed.wait_ready else None),
+        **optional_value("readyTimeoutMs", parsed.ready_timeout_ms),
+    }], pane_dir=parsed.pane_dir, timeout_ms=(parsed.ready_timeout_ms or 30_000) + 10_000)
+
+    if parsed.json:
+        print_json(result)
+    else:
+        verb = "Resumed" if result.get("action") == "resumed" else "Already running:"
+        print(f"{verb} panel {result.get('panelId')} in pane {result.get('paneId')}. {result.get('message')}")
+        readiness = result.get("readiness")
+        if readiness:
+            print_readiness(readiness)
+        print(f"Next: {result.get('nextCommand')}")
+    return 0 if result.get("ok") else 1
+
+
+def run_panels_resume_many(parsed: Any) -> int:
+    # The resumed panels wait together, so the wait adds one --ready-timeout-ms however many there are.
+    timeout_ms = 5 * 60_000 + ((parsed.ready_timeout_ms or 30_000) if parsed.wait_ready else 0)
+    result = invoke_daemon("runpane:panels:resume-many", [{
+        **optional_value("sessionId", parsed.session_id),
+        **optional_value("allStopped", True if parsed.all_stopped else None),
+        **optional_value("waitReady", True if parsed.wait_ready else None),
+        **optional_value("readyTimeoutMs", parsed.ready_timeout_ms),
+        **optional_value("concurrency", parsed.concurrency),
+    }], pane_dir=parsed.pane_dir, timeout_ms=timeout_ms)
+
+    if parsed.json:
+        print_json(result)
+    else:
+        scope = result.get("scope") or {}
+        label = f"Session {scope.get('sessionName')}" if scope.get("kind") == "session" else "every Pane"
+        resumed = result.get("resumed", 0)
+        not_ready = f", {result.get('notReady')} not ready" if result.get("notReady") else ""
+        print(
+            f"Resumed {resumed} stopped agent panel{'' if resumed == 1 else 's'} in {label}, "
+            f"{result.get('concurrency')} at a time; "
+            f"{result.get('alreadyRunning', 0)} already running, {result.get('failed', 0)} failed{not_ready}."
+        )
+        for item in result.get("items", []):
+            readiness = item.get("readiness") or {}
+            if item.get("error"):
+                status = f"failed: {item.get('error')}"
+            elif readiness and not readiness.get("ok"):
+                status = not_ready_summary(readiness)
+            else:
+                status = item.get("action") or "resumed"
+            print(f"{'OK' if item.get('ok') else 'FAIL'} {item.get('paneName')} panel {item.get('panelId')}: {status}")
     return 0 if result.get("ok") else 1
 
 
@@ -1355,6 +1551,23 @@ def confirm_panel_create(parsed: Any, request: Dict[str, Any]) -> None:
         raise ValueError("Cancelled.")
 
 
+def confirm_panel_resume(parsed: Any) -> None:
+    if parsed.yes:
+        return
+    if not is_interactive_shell():
+        raise ValueError("runpane panels resume restarts a Pane terminal. Rerun with --yes in non-interactive shells.")
+
+    if parsed.panel_id:
+        target = f"panel {parsed.panel_id}"
+    elif parsed.session_id:
+        target = f"every stopped agent panel in Session {parsed.session_id}"
+    else:
+        target = "every stopped agent panel"
+    answer = input(f"Resume {target}? [y/N] ").strip().lower()
+    if answer not in {"y", "yes"}:
+        raise ValueError("Cancelled.")
+
+
 def confirm_panel_input(parsed: Any, request: Dict[str, Any], command: str = "input") -> None:
     if parsed.yes:
         return
@@ -1425,19 +1638,20 @@ def print_workspace_wait_result(result: Dict[str, Any], output_format: str) -> N
                 "kind": "_reset",
                 "reason": reset.get("reason"),
                 "epoch": result.get("epoch"),
+                "generation": result.get("generation"),
             }, separators=(",", ":")), flush=True)
         else:
             print(f"RESET {sanitize_watch_value(reset.get('reason'))} epoch {sanitize_watch_value(result.get('epoch'))}", flush=True)
 
     if result.get("dropped") is not None:
         if output_format == "json":
-            print(json.dumps({"kind": "_dropped", "count": result.get("dropped")}, separators=(",", ":")), flush=True)
+            print(json.dumps({"kind": "_dropped", "count": result.get("dropped"), "epoch": result.get("epoch"), "generation": result.get("generation")}, separators=(",", ":")), flush=True)
         else:
             print(f"DROPPED {result.get('dropped')}", flush=True)
 
     for entry in result.get("entries", []):
         if output_format == "json":
-            print(json.dumps(entry, separators=(",", ":")), flush=True)
+            print(json.dumps({**entry, "epoch": result.get("epoch")}, separators=(",", ":")), flush=True)
             continue
         line = format_workspace_entry_line(entry)
         if line:
@@ -1456,9 +1670,11 @@ def format_workspace_entry_line(entry: Dict[str, Any]) -> Optional[str]:
     name = sanitize_watch_value(entry.get("paneName"))
     pane = f"pane {sanitize_watch_value(entry.get('paneId'))}"
     panel = f" panel {sanitize_watch_value(entry.get('panelId'))}" if entry.get("panelId") else ""
-    if entry.get("changedWhileAway"):
-        return f"CHANGED {name} {pane}{panel}"
     kind = entry.get("kind")
+    if entry.get("changedWhileAway") and kind != "panel.stopped":
+        return f"CHANGED {name} {pane}{panel}"
+    if kind == "panel.stopped":
+        return f"STOPPED {name} {pane}{panel}"
     if kind == "agent.idle":
         minutes = max(0, int(entry.get("idleMs") or 0) // 60_000)
         return f"IDLE {name} {minutes}m {pane}{panel}"
@@ -1469,6 +1685,10 @@ def format_workspace_entry_line(entry: Dict[str, Any]) -> Optional[str]:
         return f"{workspace_label(kind)} {name} {pane}"
     if kind in {"pane.associated", "pane.detached"}:
         return f"{workspace_label(kind)} {name} {pane} session {sanitize_watch_value(entry.get('sessionId') or '')}"
+    pr_labels = {"pr.closed": "CLOSED", "pr.head": "HEAD CHANGED", "pr.review": "REVIEW", "pr.comment": "COMMENT", "pr.stopped": "WATCH STOPPED", "github.unavailable": "GITHUB UNAVAILABLE", "github.recovered": "GITHUB RECOVERED"}
+    if kind in pr_labels:
+        reason = ": " + sanitize_watch_value(entry["reason"]) if entry.get("reason") else ""
+        return f"PR {name} {pane} #{(entry.get('pr') or {}).get('number', '?')} {pr_labels[kind]}{reason}"
     if kind in {"pr.conflicted", "pr.checks", "pr.merged"}:
         return format_pr_entry_line(kind, f"PR {name} {pane} #{(entry.get('pr') or {}).get('number', '?')}", entry)
     if kind == "agent.report":
@@ -1516,6 +1736,10 @@ def emit_watch_non_entry(kind: str, output_format: str, **fields: Any) -> None:
         print(f"HEARTBEAT gen {fields.get('generation')} at {fields.get('at')}", flush=True)
     elif kind == "_reconnected":
         print(f"WATCH RECONNECTED gen {fields.get('generation')}", flush=True)
+    elif kind == "_timeout":
+        print(f"WATCH TIMEOUT after {fields.get('timeoutMs')}ms", flush=True)
+    elif kind == "_expired":
+        print(f"WATCH EXPIRED after {int(fields.get('expireAfterMs') or 0)}ms quiet", flush=True)
     else:
         print(f"WATCH ERROR {sanitize_watch_value(fields.get('code'))}: {sanitize_watch_value(fields.get('message'))}", flush=True)
 
@@ -1541,6 +1765,7 @@ def workspace_label(kind: Any) -> str:
         "pane.created": "NEW",
         "pane.gone": "GONE",
         "panel.exited": "EXIT",
+        "panel.stopped": "STOPPED",
         "pane.associated": "JOINED",
         "pane.detached": "LEFT",
         "pr.conflicted": "PR CONFLICTED",
@@ -1613,7 +1838,8 @@ def print_pane_cost_models(models: list[Dict[str, Any]]) -> None:
 def print_pane_create_result(result: Dict[str, Any], dry_run: bool = False, action: str = "create") -> None:
     for item in result.get("items", []):
         name = item.get("name") or f"pane {item.get('index')}"
-        if item.get("ok"):
+        # A created item can be not ok (agent not ready, prompt unverified); only an error item failed.
+        if "error" not in item:
             worktree = f" at {item.get('worktreePath')}" if item.get("worktreePath") else ""
             if dry_run:
                 print(f"Would {action} {name}{worktree}")
@@ -1621,11 +1847,7 @@ def print_pane_create_result(result: Dict[str, Any], dry_run: bool = False, acti
             print(f"{'Adopted' if action == 'adopt' else 'Created'} {name}: session {item.get('sessionId', 'unknown')} panel {item.get('panelId', 'unknown')}{worktree}")
             readiness = item.get("readiness")
             if readiness:
-                ready_state = "yes" if readiness.get("ok") else "timed out" if readiness.get("timedOut") else "blocked"
-                print(f"  Ready: {ready_state} after {readiness.get('elapsedMs')}ms")
-                blocked = readiness.get("blocked")
-                if blocked:
-                    print(f"  Blocked: {blocked.get('message')}")
+                print_readiness(readiness, "  ")
             print_initial_input_delivery(item.get("initialInput"), "  ")
             association = item.get("association")
             if association:
@@ -1634,6 +1856,9 @@ def print_pane_create_result(result: Dict[str, Any], dry_run: bool = False, acti
                 else:
                     print(f"  Not associated with Session {association.get('sessionId')}: {association.get('error', 'unknown error')}")
             print_prompt_notes(item, "  ")
+            base = item.get("base") or {}
+            if base.get("notice"):
+                print(f"  ! {base.get('notice')}")
             setup_queue = item.get("setupQueue")
             if setup_queue:
                 print(f"  {setup_queue.get('message')}")
@@ -1721,15 +1946,39 @@ def print_panel_create_result(result: Dict[str, Any]) -> None:
     print(f"Created panel {result.get('panelId')} in pane {result.get('paneId')}: {result.get('title')}{active}")
     readiness = result.get("readiness")
     if readiness:
-        ready_state = "yes" if readiness.get("ok") else "timed out" if readiness.get("timedOut") else "blocked"
-        print(f"Ready: {ready_state} after {readiness.get('elapsedMs')}ms")
-        blocked = readiness.get("blocked")
-        if blocked:
-            print(f"Blocked: {blocked.get('message')}")
+        print_readiness(readiness)
     print_initial_input_delivery(result.get("initialInput"))
     print_prompt_notes(result)
     if result.get("nextCommand"):
         print(f"Next: {result.get('nextCommand')}")
+
+
+def not_ready_summary(readiness: Dict[str, Any]) -> str:
+    """One-line status for a bulk resume item that resumed but did not become ready."""
+    blocked = readiness.get("blocked")
+    if blocked:
+        return f"blocked: {blocked.get('message')}"
+    reason = readiness.get("reason") or {}
+    state = "command exited" if reason.get("code") == "command-exited" else "not ready"
+    return f"{state}: {reason.get('message')}" if reason else state
+
+
+def print_readiness(readiness: Dict[str, Any], prefix: str = "") -> None:
+    reason = readiness.get("reason") or {}
+    if readiness.get("ok"):
+        state = "yes"
+    elif readiness.get("blocked"):
+        state = "blocked"
+    elif reason.get("code") == "command-exited":
+        state = "command exited"
+    else:
+        state = "timed out" if readiness.get("timedOut") else "no"
+    print(f"{prefix}Ready: {state} after {readiness.get('elapsedMs')}ms")
+    blocked = readiness.get("blocked")
+    if blocked:
+        print(f"{prefix}Blocked: {blocked.get('message')}")
+    if reason:
+        print(f"{prefix}Why: {reason.get('message')}")
 
 
 def print_initial_input_delivery(initial_input: Optional[Dict[str, Any]], prefix: str = "") -> None:
@@ -1758,15 +2007,20 @@ def print_panel_wait_result(result: Dict[str, Any]) -> None:
     elapsed = result.get("elapsedMs")
     if result.get("ok"):
         print(f"Matched {condition} for panel {panel_id} after {elapsed}ms.")
+    elif result.get("stopped") and not result.get("timedOut"):
+        print(f"Panel {panel_id} is not running, so it cannot become {condition}.")
     elif result.get("blocked"):
         print(f"Blocked waiting for {condition} on panel {panel_id}: {result['blocked'].get('message')}")
     elif result.get("timedOut"):
         print(f"Timed out waiting for {condition} on panel {panel_id} after {elapsed}ms.")
     else:
         print(f"Did not match {condition} for panel {panel_id}.")
+    if result.get("reason"):
+        print(f"Why: {result['reason'].get('message')}")
 
     state = result.get("state") or {}
     status_parts = [
+        "stopped" if state.get("running") is False else None,
         "initialized" if state.get("initialized") else "not-initialized",
         state.get("activityStatus"),
         None if state.get("isCliReady") is None else "cli-ready" if state.get("isCliReady") else "cli-not-ready",
@@ -1805,10 +2059,13 @@ def print_panel_list_result(result: Dict[str, Any]) -> None:
         initialized = ""
         if panel.get("initialized") is not None:
             initialized = " initialized" if panel.get("initialized") else " not-initialized"
+        if panel.get("running") is False:
+            initialized += " stopped"
         agent = f" {panel.get('agentType')}" if panel.get("agentType") else ""
         detection = panel.get("agentDetection")
         detection_label = f" ({detection})" if detection and detection != "command" else ""
-        print(f"{marker} {panel.get('id')}\t{panel.get('type')}\t{panel.get('title')}{initialized}{agent}{detection_label}")
+        resume = f" resume {panel.get('resumeId')}" if panel.get("resumeId") else ""
+        print(f"{marker} {panel.get('id')}\t{panel.get('type')}\t{panel.get('title')}{initialized}{agent}{detection_label}{resume}")
 
 
 def optional_value(key: str, value: Any) -> Dict[str, Any]:

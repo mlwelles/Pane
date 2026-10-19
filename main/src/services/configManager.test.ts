@@ -10,7 +10,7 @@ describe('ConfigManager terminal keyboard persistence', () => {
   let configPath: string;
   const escape = { code: 'KeyB', ctrlKey: true, metaKey: false, altKey: true, shiftKey: false };
   const defaultEscape = {
-    code: 'KeyP', ctrlKey: process.platform !== 'darwin', metaKey: process.platform === 'darwin',
+    code: 'KeyP', ctrlKey: false, metaKey: true,
     altKey: false, shiftKey: true,
   };
 

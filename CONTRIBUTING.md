@@ -71,7 +71,10 @@ install's data:
 - **Electron's browser profile** (localStorage, cache, cookies) is not covered
   by `PANE_DIR`. An unpackaged build uses the same profile folder as the
   installed app (`~/Library/Application Support/Pane` on macOS). `pnpm dev`
-  and `pnpm electron-dev`, and therefore Playwright, can't change it. To isolate
+  and `pnpm electron-dev`, and therefore Playwright, can't change it. That
+  includes the browser tab logins in `Partitions/pane-browser`, so an
+  unisolated dev build is signed in wherever the installed app is, and its
+  Settings → Privacy → Clear browser data signs the installed app out. To isolate
   it, build once and launch Electron yourself with `--user-data-dir`:
   ```bash
   pnpm run build:frontend && pnpm run build:main
@@ -319,3 +322,5 @@ rebuilding unrelated transitive modules such as `msgpackr-extract`.
 The rebuild targets the host architecture. Use `npm rebuild
 better-sqlite3-multiple-ciphers` for Node tests, then `pnpm electron:rebuild`
 before running Electron again; only one ABI can be installed at a time.
+
+For native update/reconnect QA, set `PANE_DISABLE_OS_INTEGRATION=1` as well as an isolated `PANE_DIR` and `--user-data-dir`. This disables login-item, URL-protocol, and MCP-registration writes. Use an isolated app/install target; it does not make a real user installation a safe test target. Close every test app and supervisor after collecting evidence.

@@ -120,7 +120,7 @@ test('remote browser loads host HTML, assets and linked pages through the remote
     await expect.poll(() => guest('location.href')).toBe(externalUrl);
     await page.evaluate(() => window.electronAPI.invoke('preview-test:host-http'));
     await expect.poll(() => guest('location.href')).toBe(externalUrl);
-    await expect.poll(() => guest('document.cookie')).toContain('project-session=available');
+    await expect.poll(() => guest('document.cookie')).toContain('shared-session=available');
     const nextHttpUrl = `${externalUrl}?next=1`;
     await page.locator('input').fill(nextHttpUrl);
     await page.locator('input').press('Enter');

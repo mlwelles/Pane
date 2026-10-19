@@ -99,7 +99,8 @@
         "scripts/mark-executable.js"
       ],
       "project": ["src/**/*.ts", "scripts/**/*.js"],
-      "ignoreBinaries": ["ditto"]
+      "ignoreBinaries": ["ditto"],
+      "ignoreUnresolved": ["/usr/bin/codesign", "/usr/bin/ditto", "/usr/sbin/spctl", "/usr/libexec/PlistBuddy", "/usr/bin/otool"]
     },
     "mobile": {
       "entry": ["capacitor.config.ts", "src/**/*.test.ts", "scripts/**/*.mjs"],

@@ -31,11 +31,13 @@ const cases = [
   { key: 'F6', vt: '\x1b[17~', win32: ['\x1b[117;64;0;1;0;1_', '\x1b[117;64;0;0;0;1_'] },
 ];
 
+for (const preset of ['standard', 'readline-friendly'] as const) {
 for (const fullscreen of [false, true]) {
   for (const win32 of [false, true]) {
-    test(`terminal input stays intact: fullscreen=${fullscreen}, win32=${win32}`, async ({ page }) => {
+    test(`terminal input stays intact: preset=${preset}, fullscreen=${fullscreen}, win32=${win32}`, async ({ page }) => {
       const modes = (fullscreen ? '\x1b[?1049h' : '') + (win32 ? '\x1b[?9001h' : '');
       await installElectronApiMock(page, {
+        initialConfig: { terminalKeyboardPreset: preset },
         initialProjects: [project], initialSessions: [session], initialPanels: panels,
         initialTerminalStates: { [panels[1].id]: { scrollbackBuffer: modes } },
         activeProjectId: project.id,
@@ -71,6 +73,7 @@ for (const fullscreen of [false, true]) {
       }
     });
   }
+}
 }
 
 test('keys typed while the terminal is still opening reach the shell', async ({ page }) => {
@@ -122,7 +125,7 @@ for (const fullscreen of [false, true]) {
     for (const [chord, bytes] of [
       ['Control+a', '\x01'], ['Control+k', '\x0b'], ['Control+w', '\x17'],
       ['Control+v', '\x16'], ['Alt+b', '\x1bb'], ['Alt+f', '\x1bf'],
-      ['Shift+Enter', '\r'], ['Control+Alt+k', '\x1b\x0b'], ['Shift+ArrowUp', '\x1b[1;2A'],
+      ['Control+Alt+k', '\x1b\x0b'],
     ]) {
       await resetTerminalCapture(page);
       await page.keyboard.press(chord);
@@ -131,12 +134,7 @@ for (const fullscreen of [false, true]) {
       await expect(input).toBeFocused();
       await expect(page.getByRole('dialog')).toHaveCount(0);
     }
-    await resetTerminalCapture(page);
-    await page.keyboard.type('@word');
-    await page.keyboard.press('ArrowLeft');
-    await page.keyboard.press('Enter');
-    expect(await inputMessages(page)).toEqual(['@', 'w', 'o', 'r', 'd', '\x1b[D', '\r']);
-    const escape = await page.evaluate(() => navigator.platform.toUpperCase().includes('MAC') ? 'Meta+Shift+p' : 'Control+Shift+p');
+    const escape = 'Meta+Shift+p';
     await resetTerminalCapture(page);
     await page.keyboard.press(escape);
     await expect(page.getByRole('dialog', { name: 'Command Palette' })).toBeVisible();
@@ -146,6 +144,104 @@ for (const fullscreen of [false, true]) {
     await expect(input).toBeFocused();
   });
 }
+
+for (const fullscreen of [false, true]) {
+  test(`Readline keeps nonconflicting Command actions and prefix sequences: fullscreen=${fullscreen}`, async ({ page }) => {
+    await page.addInitScript(() => Object.defineProperty(navigator, 'platform', { configurable: true, get: () => 'MacIntel' }));
+    await installTerminalFixture(page, {
+      initialConfig: { terminalKeyboardPreset: 'readline-friendly', terminalShortcuts: [
+        { id: 'snippet', key: 'k', label: 'Fixture snippet', text: 'SNIPPET', enabled: true },
+      ] },
+      initialTerminalStates: { [panels[1].id]: { scrollbackBuffer: fullscreen ? '\x1b[?1049h' : '' } },
+    });
+    await page.goto('/');
+    const input = await openTerminalFixture(page);
+    await page.keyboard.press('Meta+k');
+    expect(await paneActions(page)).toEqual(['terminal:clearScrollback']);
+    expect(await inputMessages(page)).toEqual([]);
+    await resetTerminalCapture(page);
+    await page.keyboard.press('Meta+f');
+    await expect(page.getByPlaceholder('Search...', { exact: true })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(page.getByPlaceholder('Search...', { exact: true })).toHaveCount(0);
+    await input.focus();
+    await page.evaluate(() => {
+      if (window.electron) window.electron.invoke = window.electronAPI.invoke;
+    });
+    await page.keyboard.down('Meta');
+    await page.keyboard.down('Alt');
+    await expect(page.getByRole('heading', { name: 'Terminal Shortcuts', exact: true })).toBeVisible();
+    await page.keyboard.up('Alt');
+    await page.keyboard.up('Meta');
+    await page.keyboard.press('Meta+Alt+k');
+    expect(await page.evaluate(() => window.__terminalCalls.filter(call => call.channel === 'clipboard:paste').map(call => call.args))).toEqual([['SNIPPET']]);
+    expect(await inputMessages(page)).toEqual([]);
+    await resetTerminalCapture(page);
+    await page.keyboard.press('Control+x');
+    await page.keyboard.press('Control+r');
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('b');
+    await page.keyboard.press('Control+Shift+p');
+    expect(await inputMessages(page)).toEqual(['\x18', '\x12', '\x1b', 'b']);
+    await expect(input).toBeFocused();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await page.keyboard.press('Meta+Shift+p');
+    await expect(page.getByRole('dialog', { name: 'Command Palette' })).toBeVisible();
+  });
+}
+
+test('Readline prefix input bypasses the picker once and ordinary @ still opens it', async ({ page }) => {
+  await installTerminalFixture(page, { initialConfig: { terminalKeyboardPreset: 'readline-friendly' } });
+  await page.goto('/');
+  await openTerminalFixture(page);
+  for (const [prefix, bytes] of [['Control+x', '\x18'], ['Escape', '\x1b'], ['Control+[', '\x1b'], ['Control+3', '\x1b'], ['Control+q', '\x11'], ['Control+v', '\x16']]) {
+    await resetTerminalCapture(page);
+    await page.keyboard.press(prefix);
+    await page.keyboard.type('@');
+    expect(await inputMessages(page), prefix).toEqual([bytes, '@']);
+    await expect(page.getByText('Bottom Terminal', { exact: true })).toHaveCount(0);
+    await page.keyboard.press('c');
+    await resetTerminalCapture(page);
+    await page.keyboard.type('@');
+    await expect(page.getByText('Bottom Terminal', { exact: true })).toBeVisible();
+    expect(await inputMessages(page)).toEqual([]);
+    await page.keyboard.press(prefix === 'Control+[' || prefix === 'Control+3' ? prefix : 'Escape');
+    await expect(page.getByText('Bottom Terminal', { exact: true })).toHaveCount(0);
+    await resetTerminalCapture(page);
+    await page.keyboard.type('@');
+    await expect(page.getByText('Bottom Terminal', { exact: true })).toBeVisible();
+    expect(await inputMessages(page)).toEqual([]);
+    await page.keyboard.press('Space');
+    await expect(page.getByText('Bottom Terminal', { exact: true })).toHaveCount(0);
+  }
+});
+
+test('Mission Control keeps Escape prefixes and editing input in typing mode', async ({ page }) => {
+  await installTerminalFixture(page, { initialConfig: { terminalKeyboardPreset: 'readline-friendly', missionControlEnabled: true },
+    initialMissionControlAgents: [{
+      panelId: panels[1].id, sessionId: session.id, sessionName: session.name,
+      projectId: project.id, projectName: project.name, worktreePath: project.path,
+      worktreeName: 'terminal-input', panelTitle: 'Input Terminal', agentType: 'claude',
+      isPermanent: false, isLive: true,
+    }],
+  });
+  await page.goto('/');
+  await page.getByTestId('mission-control-nav').click();
+  await page.getByRole('button', { name: `Interact with ${session.name}`, exact: true }).click();
+  const input = page.locator('.xterm-helper-textarea');
+  await expect(input).toBeFocused();
+  await expect(page.getByText('Typing goes to this agent — Escape is sent to it too')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.__terminalCalls.some(call => call.channel === 'terminal:getState'))).toBe(true);
+  await resetTerminalCapture(page);
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('b');
+  await page.keyboard.press('Control+x');
+  await page.keyboard.press('Control+r');
+  await expect.poll(() => inputMessages(page)).toEqual(['\x1b', 'b', '\x18', '\x12']);
+  await expect(input).toBeFocused();
+  await page.keyboard.press('Meta+Shift+p');
+  await expect(page.getByRole('dialog', { name: 'Command Palette' })).toBeVisible();
+});
 
 async function updateKeyboardConfig(page: Page, patch: JsonObject) {
   await page.evaluate(async (updates) => {
@@ -172,19 +268,18 @@ test('live preset and escape changes retain terminals and respect actual focus',
   });
   await resetTerminalCapture(page);
   await page.keyboard.press('Control+k');
+  expect(await inputMessages(page)).toEqual(['\x0b']);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await updateKeyboardConfig(page, {
+    terminalEscapeShortcut: { code: 'F6', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false },
+  });
+  await resetTerminalCapture(page);
+  await page.keyboard.press('Control+F6');
   await expect(page.getByRole('dialog', { name: 'Command Palette' })).toBeVisible();
   expect(await inputMessages(page)).toEqual([]);
   await page.keyboard.press('Escape');
   await expect(input).toBeFocused();
   const formerEscape = await page.evaluate(() => navigator.platform.toUpperCase().includes('MAC') ? 'Meta+Shift+p' : 'Control+Shift+p');
-  await page.keyboard.press(formerEscape);
-  await expect(page.getByRole('dialog')).toHaveCount(0);
-  await expect(input).toBeFocused();
-  await updateKeyboardConfig(page, { terminalEscapeShortcut: { code: 'KeyP', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true } });
-  await resetTerminalCapture(page);
-  await page.keyboard.press('Control+k');
-  expect(await inputMessages(page)).toEqual(['\x0b']);
-  expect(await paneActions(page)).toEqual([]);
   await resetTerminalCapture(page);
   await page.getByRole('button', { name: 'Expand terminal', exact: true }).click();
   const otherInput = page.locator('.xterm-helper-textarea').last();
@@ -203,9 +298,6 @@ test('live preset and escape changes retain terminals and respect actual focus',
   await resetTerminalCapture(page);
   await page.keyboard.type('find');
   expect(await inputMessages(page)).toEqual([]);
-  await page.keyboard.press(formerEscape);
-  await expect(page.getByRole('dialog')).toHaveCount(0);
-  await expect(search).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(search).toHaveCount(0);
   const settingsButton = page.getByRole('button', { name: 'Settings', exact: true }).first();
@@ -221,7 +313,7 @@ test('palette navigation keeps its destination focused', async ({ page }) => {
   await installTerminalFixture(page, { initialConfig: { terminalKeyboardPreset: 'readline-friendly' } });
   await page.goto('/');
   await openTerminalFixture(page);
-  const escape = await page.evaluate(() => navigator.platform.toUpperCase().includes('MAC') ? 'Meta+Shift+p' : 'Control+Shift+p');
+  const escape = 'Meta+Shift+p';
   await page.keyboard.press(escape);
   await page.getByRole('combobox', { name: 'Search commands' }).fill('Focus Sidebar');
   await page.keyboard.press('Enter');
@@ -235,17 +327,17 @@ for (const paletteEnabled of [true, false]) {
     await installTerminalFixture(page, { initialConfig: {
       terminalKeyboardPreset: 'readline-friendly', keyboardShortcutsEnabled: false,
       commandPaletteShortcutEnabled: paletteEnabled,
-      terminalEscapeShortcut: { code: 'KeyK', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false },
+      terminalEscapeShortcut: { code: 'F6', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false },
     } });
     await page.goto('/');
     const input = await openTerminalFixture(page);
-    await page.keyboard.press('Control+k');
+    await page.keyboard.press('Control+F6');
     if (paletteEnabled) {
       await expect(page.getByRole('dialog', { name: 'Command Palette' })).toBeVisible();
       expect(await inputMessages(page)).toEqual([]);
       await page.keyboard.press('Escape');
     } else {
-      expect(await inputMessages(page)).toEqual(['\x0b']);
+      expect(await inputMessages(page)).toEqual(['\x1b[17;5~']);
       await expect(page.getByRole('dialog')).toHaveCount(0);
     }
     await expect(input).toBeFocused();
@@ -311,9 +403,9 @@ for (const mode of ['kitty', 'win32'] as const) {
     });
     await page.goto('/');
     await openTerminalFixture(page);
-    await page.keyboard.press(mode === 'kitty' ? 'Shift+Enter' : 'F6');
+    await page.keyboard.press(mode === 'kitty' ? 'Control+k' : 'F6');
     expect(await inputMessages(page)).toEqual(mode === 'kitty'
-      ? ['\x1b[13;2u']
+      ? ['\x1b[107;5u']
       : ['\x1b[117;64;0;1;0;1_', '\x1b[117;64;0;0;0;1_']);
     expect(await paneActions(page)).toEqual([]);
   });

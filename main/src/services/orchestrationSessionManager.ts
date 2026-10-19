@@ -57,8 +57,10 @@ import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDec
 import { OrchestrationSessionStore } from './orchestrationSessionStore';
 import type { WorkspaceSessionMembership } from './workspaceJournal';
 import { readPanelAgentReport } from './agentReport';
+import { paneChatFirstPrompt } from './paneChatMigrateOffer';
 import { applyTerminalInput, sessionNameFromMessage } from './sessionAutoName';
 import { PaneError } from '../../../shared/paneError';
+import { moveWithinOwnPlaces } from '../../../shared/utils/sessionOrder';
 import type { MobileAlertSubject } from '../daemon/mobilePushSender';
 
 const ORCHESTRATION_SESSION_PANEL_PREFIX = '__orchestration_panel_';
@@ -105,9 +107,34 @@ export class OrchestrationSessionManager extends EventEmitter {
       await this.ensureInitializedUnlocked();
       const data = this.store.read();
       return {
-        sessions: data.sessions.sort((left, right) => left.createdAt.localeCompare(right.createdAt)).map(clone),
+        sessions: orderedSessions(data).map(clone),
         selectedSessionId: data.selectedSessionId,
       };
+    });
+  }
+
+  /**
+   * Saves the order a person arranged Sessions in. The listed Sessions trade places among the
+   * positions they already hold, so Sessions left out of the request (archived ones, ones in
+   * another list, ones created during a drag) keep theirs. Unknown ids are ignored. The Sessions
+   * themselves are untouched: no revision, timestamp or activity changes.
+   */
+  async reorder(sessionIds: string[]): Promise<OrchestrationSessionListResult> {
+    return withLock('orchestration-sessions', async () => {
+      await this.ensureInitializedUnlocked();
+      if (sessionIds.length > MAX_ORCHESTRATION_ITEMS) {
+        throw new PaneError(
+          'ERR_SESSION_ORDER_TOO_LONG',
+          `A Session order can name at most ${MAX_ORCHESTRATION_ITEMS} Sessions; this one named ${sessionIds.length}`,
+          'The order was not saved. Send only the Sessions being moved.',
+        );
+      }
+      const data = this.store.read();
+      const order = moveWithinOwnPlaces(orderedSessions(data).map(session => session.id), sessionIds, id => id);
+      const nextData: OrchestrationSessionStoreData = { ...data, order };
+      this.store.write(nextData);
+      this.emit('changed', { sessionId: sessionIds.find(id => order.includes(id)) ?? '', kind: 'reordered' });
+      return { sessions: orderedSessions(nextData).map(clone), selectedSessionId: nextData.selectedSessionId };
     });
   }
 
@@ -123,7 +150,7 @@ export class OrchestrationSessionManager extends EventEmitter {
       this.store.write(next);
       this.emit('changed', { sessionId: session.id, kind: 'selected' });
       return {
-        sessions: next.sessions.sort((left, right) => left.createdAt.localeCompare(right.createdAt)).map(clone),
+        sessions: orderedSessions(next).map(clone),
         selectedSessionId: next.selectedSessionId,
       };
     });
@@ -171,7 +198,7 @@ export class OrchestrationSessionManager extends EventEmitter {
         const runtimeError = await validateWSLAvailable(input.wslDistribution);
         if (runtimeError) throw new Error(runtimeError);
         if (sourcePanelId) throw new Error('Moving a chat cannot change its runtime');
-      } else if (input.wslDistribution) throw new Error('Windows Session cannot specify a WSL distribution');
+      } else if (input.wslDistribution) throw new Error('A native Session cannot specify a WSL distribution');
       const data = this.store.read();
       const name = input.name.trim();
       if (data.sessions.some(session => normalizeSessionName(session.name) === normalizeSessionName(name))) {
@@ -219,7 +246,8 @@ export class OrchestrationSessionManager extends EventEmitter {
         ?? normalizePaneChatAgent(config.defaultOrchestratorAgent);
       this.assertAgentSupported(agent, input.runtime);
       const record: OrchestrationSessionRecord = {
-        runtime: input.runtime ?? 'windows',
+        // Omitted runtime is the native host; 'windows' is a legacy name for it.
+        runtime: input.runtime === 'wsl' ? 'wsl' : undefined,
         wslDistribution: input.wslDistribution,
         id,
         name,
@@ -251,7 +279,7 @@ export class OrchestrationSessionManager extends EventEmitter {
         updatedAt: now,
       };
       const next: OrchestrationSessionStoreData = {
-        version: data.version,
+        ...data,
         selectedSessionId: record.id,
         sessions: [...data.sessions, record],
       };
@@ -357,7 +385,7 @@ export class OrchestrationSessionManager extends EventEmitter {
       const replaced = replaceSession(data, nextRecord);
       const isArchiving = current.archived !== true && nextRecord.archived === true;
       const selectedSessionId = isArchiving && data.selectedSessionId === current.id
-        ? replaced.sessions.find(session => session.id !== current.id && session.archived !== true)?.id
+        ? orderedSessions(replaced).find(session => session.id !== current.id && session.archived !== true)?.id
         : data.selectedSessionId;
       const nextData: OrchestrationSessionStoreData = {
         ...replaced,
@@ -954,7 +982,7 @@ export class OrchestrationSessionManager extends EventEmitter {
     return {
       initialCommand: record.launchCommand?.trim() || (record.runtime === 'wsl' ? command : this.skillCacheManager?.launchCommand(record.agent)) || command,
       customResume: record.customResume,
-      initialInput: undefined,
+      initialInput: this.firstPrompt(record),
       initialInputMode: 'argument',
       initialInputSubmitStrategy: 'enter',
       initialInputDeliveryVersion: ORCHESTRATION_BOOTSTRAP_VERSION,
@@ -966,6 +994,14 @@ export class OrchestrationSessionManager extends EventEmitter {
       isCliPanel: true,
       isCliReady: false,
     };
+  }
+
+  /** Only the built-in Pane Chat ever speaks first; see paneChatMigrateOffer. */
+  private firstPrompt(record: OrchestrationSessionRecord): string | undefined {
+    if (record.id !== LEGACY_ORCHESTRATION_SESSION_ID || record.customResume) return undefined;
+    // SAFETY: Session-owned terminal panels persist TerminalPanelState as their custom state.
+    const current = panelManager.getPanel(record.panelIds[record.agent])?.state.customState as TerminalPanelState | undefined;
+    return paneChatFirstPrompt(record.agent, current, this.skillCacheManager?.paneChatSkillsRoot);
   }
 
   private async ensureGuidePath(): Promise<string> {
@@ -1218,6 +1254,17 @@ function validateLinks(links: OrchestrationLink[] | undefined, label: string): v
     validateOptionalText(link.url, `${label} URL`);
     if (!/^(?:https?:\/\/|file:\/\/|grain:\/\/)/i.test(link.url)) throw new Error(`${label} URL must use https, file, or grain scheme`);
   }
+}
+
+/** Sessions in their saved order; any the order does not name follow, oldest first. */
+function orderedSessions(data: OrchestrationSessionStoreData): OrchestrationSessionRecord[] {
+  const position = new Map((data.order ?? []).map((id, index) => [id, index]));
+  return [...data.sessions].sort((left, right) => {
+    const leftPosition = position.get(left.id) ?? Infinity;
+    const rightPosition = position.get(right.id) ?? Infinity;
+    if (leftPosition !== rightPosition) return leftPosition - rightPosition;
+    return left.createdAt.localeCompare(right.createdAt);
+  });
 }
 
 function replaceSession(data: OrchestrationSessionStoreData, record: OrchestrationSessionRecord): OrchestrationSessionStoreData {

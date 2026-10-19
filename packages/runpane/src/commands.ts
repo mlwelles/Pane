@@ -15,6 +15,9 @@ export interface ParsedArgs {
   helpTopic?: string;
   target: InstallTarget;
   paneVersion: string;
+  updateScope?: 'both' | 'pane' | 'cli';
+  updateStatus?: string;
+  updateWait?: boolean;
   channel: RunpaneChannel;
   format: ArtifactFormat;
   downloadDir?: string;
@@ -70,12 +73,15 @@ export interface ParsedArgs {
   launch?: boolean;
   watchAs?: string;
   watchSince?: number;
+  watchEpoch?: string;
   watchFrom?: 'now' | 'earliest';
   watchKinds?: string[];
   watchPaneIds?: string[];
   watchExcludePaneIds?: string[];
   nameContains?: string;
   follow?: boolean;
+  /** Watch only: wait across daemon calls for the first matching event, print it, and exit 0. */
+  untilEvent?: boolean;
   agentsOnly?: boolean;
   ackNow?: boolean;
   includeHeldInput?: boolean;
@@ -86,7 +92,10 @@ export interface ParsedArgs {
   blockedSettleMs?: number;
   minIntervalMs?: number;
   idleBackoff?: boolean;
+  /** Watch --follow only: exit after this long with no events but IDLE. */
+  expireAfterMs?: number;
   allManaged?: boolean;
+  allStopped?: boolean;
   includeShells?: boolean;
   noHeldInput?: boolean;
   selfTest?: boolean;
@@ -161,6 +170,8 @@ const INLINE_VALUE_FLAGS = new Set<string>([
 const DEFAULTS: Omit<ParsedArgs, 'command'> = {
   target: RUNPANE_CONTRACT.defaults.target,
   paneVersion: RUNPANE_CONTRACT.defaults.paneVersion,
+  updateScope: 'both',
+  updateWait: false,
   channel: RUNPANE_CONTRACT.defaults.channel,
   format: RUNPANE_CONTRACT.defaults.format,
   dryRun: RUNPANE_CONTRACT.defaults.dryRun,
@@ -236,14 +247,33 @@ export function parseRunpaneArgs(argv: string[]): ParsedArgs {
 
   if (parsed.command === 'update') {
     parsed.target = 'client';
+    parsed.updateScope = 'both';
   }
 
   Object.assign(parsed, workspaceArgs, workspaceMachine ? { workspaceMachine } : {});
   args.unshift(...leadingPaneDirArgs);
+  if (parsed.command === 'watch') {
+    const removed = new Map(Object.entries({
+      '--settle': '--ready-settle',
+      '--format': '--json (or omit for lines)',
+      '--agents-only': '--include-shells to include shells; agents are the default',
+      '--all-managed': 'omit it; all managed Panes are the default',
+      '--quiet': 'omit it; heartbeats are off by default',
+      '--no-control-lines': 'omit it; WATCH OK and errors always print',
+      '--idle-backoff': 'omit it; backoff is the default',
+      '--present': '--follow with individual duration overrides such as --ready-settle 1m --blocked-settle 15s --min-interval 2m',
+      '--profile': '--follow with individual duration overrides such as --ready-settle 1m --blocked-settle 15s --min-interval 2m'
+    }));
+    for (const token of args) {
+      const flag = token.split('=')[0];
+      if (removed.get(flag)) throw new Error(`${flag} was removed from runpane watch. Use ${removed.get(flag)}.`);
+    }
+  }
   parseFlags(args, parsed);
   if (parsed.command === 'watch' && parsed.follow && parsed.timeoutMs === 0) {
     throw new Error('--timeout-ms must be greater than 0 with --follow.');
   }
+  if (parsed.command === 'watch' && parsed.untilEvent) validateUntilEventArgs(parsed);
   if (parsed.command === 'watch' && parsed.sessionId !== undefined && parsed.watchPaneIds?.length) {
     throw new Error('runpane watch accepts either --session or --pane, not both; --session already follows every Pane in the Session.');
   }
@@ -260,14 +290,64 @@ export function parseRunpaneArgs(argv: string[]): ParsedArgs {
     throw new Error('runpane watch accepts either --json or --format lines, not both.');
   }
   const cadenceValueFlagPresent = hasCadenceValueFlag(parsed);
-  if (parsed.command === 'watch' && !parsed.follow && (cadenceValueFlagPresent || parsed.idleBackoff)) {
-    throw new Error('--settle, --blocked-settle, --min-interval, and --idle-backoff require --follow.');
+  if (parsed.command === 'watch' && !parsed.follow && (cadenceValueFlagPresent || parsed.expireAfterMs !== undefined)) {
+    throw new Error('--ready-settle, --blocked-settle, --min-interval, and --expire-after require --follow.');
   }
   if (parsed.command === 'watch' && parsed.watchSince !== undefined && cadenceValueFlagPresent) {
-    throw new Error('runpane watch accepts either --since or --settle/--blocked-settle/--min-interval, not both (cadence needs a named cursor).');
+    throw new Error('runpane watch accepts either --since or --ready-settle/--blocked-settle/--min-interval, not both (cadence needs a named cursor).');
   }
+  if (parsed.command === 'watch' && parsed.watchEpoch !== undefined && (parsed.watchSince === undefined || parsed.watchAs)) {
+    throw new Error('--epoch requires --since and cannot be combined with --as.');
+  }
+  if (parsed.command === 'watch') applyWatchDefaults(parsed);
   if (parsed.command === 'report') validateReportArgs(parsed);
   return parsed;
+}
+
+/** Bare values preserve the old millisecond convention (heartbeat: seconds). */
+function parseWatchDuration(flag: string, value: string, bareUnit = 1): number {
+  if (value === 'off') return 0;
+  const match = /^(\d+)(ms|s|m|h)?$/u.exec(value);
+  const units = new Map(Object.entries({ ms: 1, s: 1000, m: 60000, h: 3600000 }));
+  const duration = match ? Number(match[1]) * (match[2] ? (units.get(match[2]) ?? bareUnit) : bareUnit) : NaN;
+  if (!Number.isSafeInteger(duration) || duration < 0 || duration > 2147483647) {
+    throw new Error(`${flag} must be a duration such as 30s, 3m, 3h, or 0 (at most 2147483647ms).`);
+  }
+  return duration;
+}
+
+function applyWatchDefaults(parsed: ParsedArgs): void {
+  const defaults = RUNPANE_CONTRACT.defaults.watch;
+  if (parsed.untilEvent) parsed.watchKinds ??= [...defaults.untilEvent.kinds];
+  if (!parsed.follow) return;
+  const follow = defaults.follow;
+  parsed.watchKinds ??= [...follow.kinds];
+  parsed.settleMs ??= parseWatchDuration('--ready-settle', follow.readySettle);
+  parsed.blockedSettleMs ??= parseWatchDuration('--blocked-settle', follow.blockedSettle);
+  parsed.minIntervalMs ??= parseWatchDuration('--min-interval', follow.minInterval);
+  parsed.idleAfterMs ??= parseWatchDuration('--idle-after', follow.idleAfter);
+  parsed.expireAfterMs ??= parseWatchDuration('--expire-after', follow.expireAfter);
+  parsed.heartbeatSeconds ??= parseWatchDuration('--heartbeat', follow.heartbeat) / 1000;
+  parsed.idleBackoff = follow.idleBackoff;
+  // Numeric --since has no durable cadence state; keep it an immediate replay.
+  if (parsed.watchSince !== undefined) {
+    parsed.settleMs = 0;
+    parsed.blockedSettleMs = 0;
+    parsed.minIntervalMs = 0;
+    parsed.idleBackoff = false;
+  }
+}
+
+function validateUntilEventArgs(parsed: ParsedArgs): void {
+  if (parsed.follow) {
+    throw new Error('runpane watch accepts either --until-event or --follow, not both. Use --until-event to exit on the first event, or --follow to stream until interrupted.');
+  }
+  if (parsed.selfTest) {
+    throw new Error('runpane watch accepts either --until-event or --self-test, not both. Run --self-test on its own to probe the watch path.');
+  }
+  if (parsed.timeoutMs === 0) {
+    throw new Error('--timeout-ms must be greater than 0 with --until-event; it is the total deadline. Leave it out to wait as long as it takes.');
+  }
 }
 
 const WORKSPACE_VERBS = new Set(['read', 'write', 'exec']);
@@ -343,6 +423,19 @@ function parseFlags(rawArgs: string[], parsed: ParsedArgs): void {
     const arg = args[index];
     const isAgentContextCommand = parsed.command === 'agent-context';
     const isLocalCommand = isRunpaneLocalCommand(parsed.command);
+
+    if (parsed.command === 'update') {
+      if (arg === '--pane-only' || arg === '--cli-only') {
+        const scope = arg === '--pane-only' ? 'pane' : 'cli';
+        if (parsed.updateScope !== 'both' && parsed.updateScope !== scope) throw new Error('--pane-only and --cli-only are mutually exclusive.');
+        parsed.updateScope = scope;
+        continue;
+      }
+      if (arg === '--status') { parsed.updateStatus = readValue(args, ++index, arg, literalValues); continue; }
+      if (arg === '--wait') { parsed.updateWait = true; continue; }
+      if (arg === '--json') { parsed.json = true; continue; }
+      if (arg === '--pane-dir') { parsed.paneDir = readValue(args, ++index, arg, literalValues); continue; }
+    }
 
     if (arg === '-h' || arg === '--help') {
       const topic = parsed.command;
@@ -512,6 +605,10 @@ function parseLocalBooleanFlag(flag: string, parsed: ParsedArgs): void {
     parsed.follow = true;
     return;
   }
+  if (flag === '--until-event') {
+    parsed.untilEvent = true;
+    return;
+  }
   if (flag === '--idle-backoff') {
     parsed.idleBackoff = true;
     return;
@@ -530,6 +627,10 @@ function parseLocalBooleanFlag(flag: string, parsed: ParsedArgs): void {
   }
   if (flag === '--all-managed') {
     parsed.allManaged = true;
+    return;
+  }
+  if (flag === '--all-stopped') {
+    parsed.allStopped = true;
     return;
   }
   if (flag === '--include-shells') {
@@ -692,7 +793,7 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     return;
   }
   if (flag === '--timeout-ms') {
-    const timeoutMs = Number(value);
+    const timeoutMs = parsed.command === 'watch' ? parseWatchDuration(flag, value) : Number(value);
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || (timeoutMs === 0 && parsed.command !== 'watch')) {
       throw new Error('--timeout-ms must be a positive number (watch also accepts 0).');
     }
@@ -760,6 +861,11 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     parsed.watchAs = value;
     return;
   }
+  if (flag === '--epoch') {
+    if (!value.trim()) throw new Error('--epoch must not be empty.');
+    parsed.watchEpoch = value;
+    return;
+  }
   if (flag === '--since') {
     const since = Number(value);
     if (!Number.isInteger(since) || since < 0) throw new Error('--since must be a non-negative integer.');
@@ -794,23 +900,27 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
     return;
   }
   if (flag === '--heartbeat') {
-    parsed.heartbeatSeconds = parseNonNegativeIntegerFlag(flag, value);
+    parsed.heartbeatSeconds = parseWatchDuration(flag, value, 1000) / 1000;
+    return;
+  }
+  if (flag === '--expire-after') {
+    parsed.expireAfterMs = parseWatchDuration(flag, value);
     return;
   }
   if (flag === '--idle-after') {
-    parsed.idleAfterMs = parseNonNegativeIntegerFlag(flag, value);
+    parsed.idleAfterMs = parseWatchDuration(flag, value);
     return;
   }
-  if (flag === '--settle') {
-    parsed.settleMs = parseNonNegativeIntegerFlag(flag, value);
+  if (flag === '--ready-settle') {
+    parsed.settleMs = parseWatchDuration(flag, value);
     return;
   }
   if (flag === '--blocked-settle') {
-    parsed.blockedSettleMs = parseNonNegativeIntegerFlag(flag, value);
+    parsed.blockedSettleMs = parseWatchDuration(flag, value);
     return;
   }
   if (flag === '--min-interval') {
-    parsed.minIntervalMs = parseNonNegativeIntegerFlag(flag, value);
+    parsed.minIntervalMs = parseWatchDuration(flag, value);
     return;
   }
   if (flag === '--body-file') {

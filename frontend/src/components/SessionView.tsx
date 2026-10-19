@@ -31,6 +31,7 @@ import { OuterResizeSeparator } from './ui/OuterResizeSeparator';
 import { usePanelStore } from '../stores/panelStore';
 import { useProjectViewActionsStore } from '../stores/projectViewActionsStore';
 import { panelApi } from '../services/panelApi';
+import { requestBrowserNavigation } from './panels/browser/browserNavigation';
 import { setPendingViewCommit } from './panels/diff/pendingViewCommit';
 import { PanelTabBar } from './panels/PanelTabBar';
 import { PanelContainer } from './panels/PanelContainer';
@@ -47,6 +48,7 @@ import {
   removePanelFromLayout,
   addPanelToGroup,
   placePanelInSplit,
+  showPanelInSplit,
   findGroup,
   primaryGroup,
   allGroups,
@@ -369,9 +371,10 @@ export const SessionView = memo(() => {
           sortedLive.filter(p => !splitIdsNow.has(p.id)).map(p => p.id),
           fallbackActiveId,
         );
-        // This desktop's own memory takes new tabs inactive into its own groups;
-        // the shared split placement only shapes the host's seed layout.
-        const { layout: reconciledLayout } = reconcileLayout(base, liveIdsNow, remembered ? new Set<string>() : splitIdsNow);
+        // Agent pages this desktop has never placed (opened while it showed
+        // something else) go beside the primary group, inactive. Tabs already
+        // in its remembered layout keep their place.
+        const { layout: reconciledLayout } = reconcileLayout(base, liveIdsNow, splitIdsNow);
         const layout = fallbackActiveId
           ? activatePanelInLayout(reconciledLayout, fallbackActiveId)
           : reconciledLayout;
@@ -504,8 +507,9 @@ export const SessionView = memo(() => {
     if (getDockTerminalPanel(sessionPanelList)?.id === panel.id || isInspectorPanelType(panel.type)) return;
     const focusedGid = store.focusedGroupIds[sid];
     const group = (focusedGid && findGroup(current.root, focusedGid)) || primaryGroup(current.root);
+    // A split request also moves a tab out of the primary group.
     const root = activationRequest.placement === 'split'
-      ? placePanelInSplit(current.root, panel.id)
+      ? showPanelInSplit(current.root, panel.id)
       : addPanelToGroup(current.root, group.id, panel.id);
     applyLayout(sid, activatePanelInLayout({ ...current, root }, panel.id));
   }, [activationRequest, panelLoadReady, applyLayout]);
@@ -1127,9 +1131,7 @@ export const SessionView = memo(() => {
       await panelApi.updatePanel(existingPanel.id, { title, state: updatedPanel.state });
       updatePanelState(updatedPanel);
       await handlePanelSelect(updatedPanel);
-      window.dispatchEvent(new CustomEvent('browser-panel:navigate', {
-        detail: { url, sessionId: activeSession.id },
-      }));
+      requestBrowserNavigation({ url, sessionId: activeSession.id, panelId: existingPanel.id });
       return;
     }
 

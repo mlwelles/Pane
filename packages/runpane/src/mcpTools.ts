@@ -63,8 +63,9 @@ export interface McpTool {
   };
 }
 
-// --json is always passed; --follow streams forever, which a single tool call cannot return.
-const OMITTED_FLAGS = new Set(['--json', '--follow', '--help']);
+// --json is always passed; --follow streams forever, and --until-event prints event lines rather
+// than one result and can wait without limit, which a single tool call cannot return.
+const OMITTED_FLAGS = new Set(['--json', '--follow', '--until-event', '--help']);
 const FLAG_PATTERN = /--[a-z][a-z0-9-]*/g;
 // Clients sometimes send numeric flags such as timeoutMs as JSON numbers.
 const flagValueSchema = boundary.union(boundary.string, boundary.number);

@@ -1,7 +1,7 @@
 import { CreateOrchestrationSessionDialog, type SessionCreateRequest } from './CreateOrchestrationSessionDialog';
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { create as createStore } from 'zustand';
-import { Archive, ChevronDown, ChevronRight, MoreHorizontal, Pin, PinOff, Plus, Pencil, RefreshCw, Terminal } from 'lucide-react';
+import { Archive, ArrowRightLeft, ChevronDown, ChevronRight, MoreHorizontal, Pin, PinOff, Plus, Pencil, RefreshCw, Terminal } from 'lucide-react';
 import { useNavigationStore } from '../stores/navigationStore';
 import { useSessionStore } from '../stores/sessionStore';
 import {
@@ -20,7 +20,11 @@ import { UndoToast } from './ui/UndoToast';
 import { PopoverButton, TerminalPopover } from './terminal/TerminalPopover';
 import { cn } from '../utils/cn';
 import { SessionActivityDot, SessionActivitySummary } from './SessionActivity';
-import { startSessionDrag } from '../utils/sessionDrag';
+import { readDraggedSessionId, startSessionDrag, useDraggedSessionId } from '../utils/sessionDrag';
+import { dropOrder, stepOrder, type SessionDropTarget } from '../utils/sessionReorder';
+import { ipcErrorMessage } from '../utils/ipcErrorMessage';
+import { MoveSessionToHostDialog } from './MoveSessionToHostDialog';
+import { useMoveToHostBlockedReason } from '../hooks/useMoveToHostBlockedReason';
 
 interface OrchestrationSessionNavProps {
   compact?: boolean;
@@ -44,9 +48,38 @@ interface SessionContextMenuState {
   y: number;
   /** The ⋯ button that opened the menu; focus moves into the menu and returns here on Escape. */
   trigger?: HTMLElement;
+  /** Where a dialog opened from the menu returns focus: the trigger, or the row right-clicked. */
+  returnFocusTo?: HTMLElement;
 }
 
 type SessionRowPlacement = 'pinned' | 'sessions';
+/** The lists a Session can be reordered in. A drag reorders only the list it started in. */
+type SessionOrderList = SessionRowPlacement | 'rail';
+
+interface SessionListDrop extends SessionDropTarget {
+  list: SessionOrderList;
+}
+
+/** What a failed reorder tells the person: what happened, what changed, why, and the next step. */
+function sessionOrderError(cause: unknown): string {
+  const reason = ipcErrorMessage(cause, 'The host did not answer.').trim();
+  const sentence = /[.!?]$/.test(reason) ? reason : `${reason}.`;
+  const next = /\bNext:/.test(reason) ? '' : ' Try the move again.';
+  return `The Session order was not saved, so the list is back in its previous order. ${sentence}${next}`;
+}
+
+function sessionTestId(session: OrchestrationSessionRecord, list: SessionOrderList): string {
+  const isLegacy = session.id === LEGACY_ORCHESTRATION_SESSION_ID;
+  if (list === 'rail') return isLegacy ? 'compact-pane-chat' : `compact-orchestration-session-${session.id}`;
+  if (isLegacy) return list === 'pinned' ? 'orchestration-pinned-pane-chat' : 'orchestration-pane-chat';
+  return `${list === 'pinned' ? 'orchestration-pinned-session' : 'orchestration-session'}-${session.id}`;
+}
+
+/** A drop in the top half of a Session (its row and Panes together) lands before it, else after. */
+function dropEdge(event: { clientY: number; currentTarget: Element }): SessionDropTarget['edge'] {
+  const bounds = event.currentTarget.getBoundingClientRect();
+  return event.clientY < bounds.top + bounds.height / 2 ? 'before' : 'after';
+}
 
 interface ArchivedSessionToast {
   sessionId: string;
@@ -100,17 +133,28 @@ export function OrchestrationSessionNav({
   const select = useOrchestrationSessionStore(state => state.select);
   const create = useOrchestrationSessionStore(state => state.create);
   const update = useOrchestrationSessionStore(state => state.update);
+  const reorder = useOrchestrationSessionStore(state => state.reorder);
   const navigateToPaneChat = useNavigationStore(state => state.navigateToPaneChat);
   const navigateToSessions = useNavigationStore(state => state.navigateToSessions);
   const activeView = useNavigationStore(state => state.activeView);
   const setActiveSession = useSessionStore(state => state.setActiveSession);
   const [showCreate, setShowCreate] = useState(false);
-  const collapsedSessions = useNavigationStore(state => state.collapsedSessions);
-  const toggleSessionCollapsed = useNavigationStore(state => state.toggleSessionCollapsed);
+  const expandedSessions = useNavigationStore(state => state.expandedSessions);
+  const toggleStoredSessionExpanded = useNavigationStore(state => state.toggleSessionExpanded);
   const [localSectionExpanded, setLocalSectionExpanded] = useState(true);
   const [localPinnedSectionExpanded, setLocalPinnedSectionExpanded] = useState(true);
   const [sessionMenu, setSessionMenu] = useState<SessionContextMenuState | null>(null);
+  const [movingSessionId, setMovingSessionId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const draggedSessionId = useDraggedSessionId();
+  // The list a Session drag started in; the drag reorders only that list. A ref, not state:
+  // the window's drop listener ends the in-flight drag (and re-renders) before the row's own
+  // drop handler runs, so only the drag's own drop or dragend may clear it.
+  const dragOrigin = useRef<{ sessionId: string; list: SessionOrderList } | null>(null);
+  const [drop, setDrop] = useState<SessionListDrop | null>(null);
+  const [orderAnnouncement, setOrderAnnouncement] = useState('');
+  // The row Alt+Up/Down moved, refocused after the list renders in its new order.
+  const focusAfterMove = useRef<string | null>(null);
   const hostRevision = useOrchestrationSessionStore(state => state.hostRevision);
   const pendingToast = useArchivedSessionToastStore(state => state.toast);
   const archivedToast = pendingToast?.hostRevision === hostRevision ? pendingToast : null;
@@ -171,13 +215,19 @@ export function OrchestrationSessionNav({
   }, [navigateToPaneChat, select, setActiveSession]);
 
   const toggleSessionExpanded = useCallback((sessionId: string) => {
-    const collapsedSessionIds = toggleSessionCollapsed(sessionId);
-    void window.electronAPI.uiState.saveCollapsedSessions(collapsedSessionIds).catch(error => {
-      console.error('Failed to save collapsed Sessions:', error);
+    const expandedSessionIds = toggleStoredSessionExpanded(sessionId);
+    void window.electronAPI.uiState.saveExpandedSessions(expandedSessionIds).catch(error => {
+      console.error('Failed to save opened Sessions:', error);
     });
-  }, [toggleSessionCollapsed]);
+  }, [toggleStoredSessionExpanded]);
 
-  const openSessionMenu = useCallback((session: OrchestrationSessionRecord, x: number, y: number, trigger?: HTMLElement) => {
+  const openSessionMenu = useCallback((
+    session: OrchestrationSessionRecord,
+    x: number,
+    y: number,
+    trigger?: HTMLElement,
+    returnFocusTo = trigger,
+  ) => {
     setSessionMenu({
       sessionId: session.id,
       sessionName: session.name || 'Pane Chat',
@@ -185,21 +235,117 @@ export function OrchestrationSessionNav({
       x,
       y,
       trigger,
+      returnFocusTo,
     });
   }, []);
 
   const handleSessionContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>, session: OrchestrationSessionRecord) => {
     event.preventDefault();
     event.stopPropagation();
-    openSessionMenu(session, event.clientX, event.clientY);
+    // Not a trigger: a right-click leaves focus where it was, but a dialog closes back to this row.
+    openSessionMenu(session, event.clientX, event.clientY, undefined, event.currentTarget);
   }, [openSessionMenu]);
 
-  const handleSessionKeyDown = useCallback((event: ReactKeyboardEvent<HTMLElement>, session: OrchestrationSessionRecord) => {
+  const listSessions = useCallback((list: SessionOrderList) => (
+    list === 'pinned' ? pinnedSessions : activeSessions
+  ), [activeSessions, pinnedSessions]);
+
+  const moveSession = useCallback(async (session: OrchestrationSessionRecord, order: string[]) => {
+    setActionError(null);
+    setOrderAnnouncement(`Moved ${session.name || 'Pane Chat'} to position ${order.indexOf(session.id) + 1} of ${order.length}`);
+    try {
+      await reorder(order);
+    } catch (cause) {
+      setOrderAnnouncement('');
+      setActionError(sessionOrderError(cause));
+      void refresh();
+    }
+  }, [refresh, reorder]);
+
+  const handleSessionKeyDown = useCallback((event: ReactKeyboardEvent<HTMLElement>, session: OrchestrationSessionRecord, list: SessionOrderList) => {
+    if (event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+      event.preventDefault();
+      const order = stepOrder(listSessions(list).map(item => item.id), session.id, event.key === 'ArrowUp' ? -1 : 1);
+      if (!order) return;
+      focusAfterMove.current = sessionTestId(session, list);
+      void moveSession(session, order);
+      return;
+    }
     if (event.key !== 'ContextMenu' && !(event.key === 'F10' && event.shiftKey)) return;
     event.preventDefault();
     const bounds = event.currentTarget.getBoundingClientRect();
-    openSessionMenu(session, bounds.left, bounds.bottom);
-  }, [openSessionMenu]);
+    // The row is the trigger: focus moves into the menu for arrow keys and returns here on Escape.
+    openSessionMenu(session, bounds.left, bounds.bottom, event.currentTarget);
+  }, [listSessions, moveSession, openSessionMenu]);
+
+  // Moving a row in the DOM can drop its focus; put it back on the row that moved.
+  useEffect(() => {
+    const testId = focusAfterMove.current;
+    if (!testId) return;
+    focusAfterMove.current = null;
+    const row = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
+    if (row && document.activeElement !== row) row.focus();
+  }, [sessions]);
+
+  // A drag that ends anywhere, dropped or cancelled, takes its drop line with it.
+  useEffect(() => {
+    if (draggedSessionId === null) setDrop(null);
+  }, [draggedSessionId]);
+
+  /** Drag handlers for one Session in one list: the row starts the drag, the whole Session takes drops. */
+  const sessionDragProps = (session: OrchestrationSessionRecord, list: SessionOrderList) => {
+    // Only a drag that started in this list, over a Session other than the dragged one.
+    const fromThisList = () => {
+      const origin = dragOrigin.current;
+      return origin !== null && origin.list === list && origin.sessionId !== session.id ? origin : null;
+    };
+    return {
+      source: {
+        draggable: true,
+        onDragStart: (event: DragEvent<HTMLElement>) => {
+          startSessionDrag(event.dataTransfer, session.id);
+          dragOrigin.current = { sessionId: session.id, list };
+        },
+        onDragEnd: () => {
+          dragOrigin.current = null;
+          setDrop(null);
+        },
+      },
+      target: {
+        onDragOver: (event: DragEvent<HTMLElement>) => {
+          if (!fromThisList()) {
+            if (drop?.list === list) setDrop(null);
+            return;
+          }
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'move';
+          const edge = dropEdge(event);
+          if (drop?.list !== list || drop.targetId !== session.id || drop.edge !== edge) setDrop({ list, targetId: session.id, edge });
+        },
+        onDragLeave: (event: DragEvent<HTMLElement>) => {
+          const into = event.relatedTarget;
+          if (into instanceof Node && event.currentTarget.contains(into)) return;
+          if (drop?.list === list && drop.targetId === session.id) setDrop(null);
+        },
+        onDrop: (event: DragEvent<HTMLElement>) => {
+          const origin = fromThisList();
+          if (!origin) return;
+          event.preventDefault();
+          const movedId = readDraggedSessionId(event.dataTransfer) ?? origin.sessionId;
+          const moved = listSessions(list).find(item => item.id === movedId);
+          const order = moved && dropOrder(listSessions(list).map(item => item.id), movedId, { targetId: session.id, edge: dropEdge(event) });
+          dragOrigin.current = null;
+          setDrop(null);
+          if (moved && order) void moveSession(moved, order);
+        },
+      },
+      indicator: drop?.list === list && drop.targetId === session.id ? drop.edge : null,
+    };
+  };
+
+  const orderAnnouncer = (
+    <p role="status" aria-live="polite" className="sr-only">{orderAnnouncement}</p>
+  );
 
   const archiveSession = useCallback(async () => {
     if (!sessionMenu) return;
@@ -248,6 +394,10 @@ export function OrchestrationSessionNav({
     }
   }, [archivedToast, openSession, refresh, update]);
 
+  const moveDialogElement = (
+    <MoveSessionToHostDialog sessionId={movingSessionId} onClose={() => setMovingSessionId(null)} onMoved={sessionId => void openSession(sessionId)} />
+  );
+
   const archivedToastElement = archivedToast && (
     <UndoToast
       key={archivedToast.sessionId}
@@ -284,17 +434,23 @@ export function OrchestrationSessionNav({
       : [];
     // Rows the attention inbox hides still count toward the Session's activity.
     const visiblePaneIds = renderPane ? visibleAssociations.map(association => association.paneId) : [];
-    const expanded = paneRows.length > 0 && !collapsedSessions.has(session.id);
+    const expanded = paneRows.length > 0 && expandedSessions.has(session.id);
     const isLegacy = session.id === LEGACY_ORCHESTRATION_SESSION_ID;
     const label = session.name || 'Pane Chat';
-    const rowId = isLegacy
-      ? placement === 'pinned' ? 'orchestration-pinned-pane-chat' : 'orchestration-pane-chat'
-      : `${placement === 'pinned' ? 'orchestration-pinned-session' : 'orchestration-session'}-${session.id}`;
+    const rowId = sessionTestId(session, placement);
     const panesId = `orchestration-session-panes-${placement}-${session.id}`;
     const isOpen = activeView === 'pane-chat' && session.id === selectedSessionId;
+    const drag = sessionDragProps(session, placement);
 
     return (
-      <div key={`${placement}-${session.id}`} className="group/orchestration-session">
+      <div key={`${placement}-${session.id}`} className="group/orchestration-session relative" {...drag.target}>
+        {drag.indicator && (
+          <div
+            data-testid="session-drop-indicator"
+            aria-hidden="true"
+            className={cn('pointer-events-none absolute inset-x-3 z-20 h-0.5 rounded-full bg-interactive', drag.indicator === 'before' ? '-top-px' : '-bottom-px')}
+          />
+        )}
         <div className={cn(
           'group/orchestration-row relative mx-2 flex h-7 w-[calc(100%-1rem)] items-center rounded-md text-[13px] transition-colors',
           isOpen ? 'bg-surface-selected text-text-primary' : 'text-text-secondary hover:bg-surface-hover',
@@ -312,13 +468,12 @@ export function OrchestrationSessionNav({
             data-testid={rowId}
             aria-label={isLegacy ? label : `Open Session ${session.name}`}
             // Dragging a row tiles the Session beside another, the same gesture
-            // as dragging a tab. Repository rows carry only text/plain, so the
-            // two drags never answer each other's drop targets.
-            draggable
-            onDragStart={event => startSessionDrag(event.dataTransfer, session.id)}
+            // as dragging a tab, or reorders it within its own list. Repository
+            // rows carry only text/plain, so the drags never answer each other.
+            {...drag.source}
             onClick={() => void openSession(session.id)}
             onContextMenu={event => handleSessionContextMenu(event, session)}
-            onKeyDown={event => handleSessionKeyDown(event, session)}
+            onKeyDown={event => handleSessionKeyDown(event, session, placement)}
             className="flex min-w-0 flex-1 items-center gap-2 rounded pl-2 pr-2 py-1 text-left focus:outline-none"
           >
             <SessionActivityDot session={session} paneIds={visiblePaneIds} />
@@ -375,22 +530,28 @@ export function OrchestrationSessionNav({
             </button>
           </Tooltip>
         </div>
-        {activeSessions.map(session => (
+        {activeSessions.map(session => {
+          const drag = sessionDragProps(session, 'rail');
+          return (
           <Tooltip key={session.id} content={`${session.name} · ${statusLabel(session)}`} side="right">
             <button
               type="button"
-              data-testid={session.id === LEGACY_ORCHESTRATION_SESSION_ID ? 'compact-pane-chat' : `compact-orchestration-session-${session.id}`}
+              data-testid={sessionTestId(session, 'rail')}
               data-compact-rail-item
               aria-label={session.id === LEGACY_ORCHESTRATION_SESSION_ID ? 'Pane Chat' : `Open Session ${session.name}`}
               title={session.name}
-              draggable
-              onDragStart={event => startSessionDrag(event.dataTransfer, session.id)}
+              {...drag.source}
+              {...drag.target}
               onClick={() => void openSession(session.id)}
               onContextMenu={event => handleSessionContextMenu(event, session)}
-              onKeyDown={event => handleSessionKeyDown(event, session)}
+              onKeyDown={event => handleSessionKeyDown(event, session, 'rail')}
               className={cn(
                 'flex h-9 min-h-9 w-9 min-w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-interactive',
                 session.id === selectedSessionId ? 'bg-surface-selected text-text-primary' : 'text-text-tertiary hover:bg-surface-hover hover:text-text-primary',
+                // The drop line is drawn outside the item, so it takes no room and moves nothing.
+                drag.indicator && 'relative before:pointer-events-none before:absolute before:inset-x-1 before:h-0.5 before:rounded-full before:bg-interactive before:content-[""]',
+                drag.indicator === 'before' && 'before:-top-[3px]',
+                drag.indicator === 'after' && 'before:-bottom-[3px]',
               )}
             >
               <span className="flex h-6 w-6 items-center justify-center rounded-full border border-border-primary">
@@ -398,7 +559,8 @@ export function OrchestrationSessionNav({
               </span>
             </button>
           </Tooltip>
-        ))}
+          );
+        })}
         {sessionError && (
           <Tooltip content={sessionError} side="right">
             <button
@@ -426,9 +588,12 @@ export function OrchestrationSessionNav({
           onClose={() => setSessionMenu(null)}
           onArchive={() => void archiveSession()}
           onPin={() => void pinSession()}
+          onMoveToHost={() => { setMovingSessionId(sessionMenu?.sessionId ?? null); setSessionMenu(null); }}
         />
+        {moveDialogElement}
         <CreateOrchestrationSessionDialog isOpen={showCreate} onClose={() => setShowCreate(false)} onCreate={createSession} />
         {archivedToastElement}
+        {orderAnnouncer}
       </div>
     );
   }
@@ -530,9 +695,12 @@ export function OrchestrationSessionNav({
         onClose={() => setSessionMenu(null)}
         onArchive={() => void archiveSession()}
         onPin={() => void pinSession()}
+        onMoveToHost={() => { setMovingSessionId(sessionMenu?.sessionId ?? null); setSessionMenu(null); }}
       />
+      {moveDialogElement}
       <CreateOrchestrationSessionDialog isOpen={showCreate} onClose={() => setShowCreate(false)} onCreate={createSession} />
       {archivedToastElement}
+      {orderAnnouncer}
     </>
   );
 }
@@ -542,9 +710,11 @@ interface SessionContextMenuProps {
   onClose: () => void;
   onArchive: () => void;
   onPin: () => void;
+  onMoveToHost: () => void;
 }
 
-function SessionContextMenu({ menu, onClose, onArchive, onPin }: SessionContextMenuProps) {
+function SessionContextMenu({ menu, onClose, onArchive, onPin, onMoveToHost }: SessionContextMenuProps) {
+  const moveBlockedReason = useMoveToHostBlockedReason();
   const [renaming, setRenaming] = useState<SessionContextMenuState | null>(null);
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
@@ -595,6 +765,21 @@ function SessionContextMenu({ menu, onClose, onArchive, onPin }: SessionContextM
           setRenaming(menu); setName(menu.sessionName); setError(null); onClose();
         }}>
           <span className="flex items-center gap-2"><Pencil className="h-4 w-4" />Rename Session…</span>
+        </PopoverButton>
+        <PopoverButton
+          role="menuitem"
+          // Focusable while unavailable, so arrow keys reach it and its reason is announced.
+          aria-disabled={moveBlockedReason !== null}
+          title={moveBlockedReason ?? undefined}
+          className={cn(moveBlockedReason && 'cursor-not-allowed opacity-50')}
+          onClick={() => {
+            if (moveBlockedReason) return;
+            // The dialog returns focus to whatever had it when it opened; make that the row, not this closing item.
+            menu?.returnFocusTo?.focus();
+            onMoveToHost();
+          }}
+        >
+          <span className="flex items-center gap-2"><ArrowRightLeft className="h-4 w-4" />Move to host…</span>
         </PopoverButton>
         <PopoverButton role="menuitem" variant="danger" onClick={onArchive}>
           <span className="flex items-center gap-2">

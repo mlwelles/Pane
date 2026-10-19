@@ -128,7 +128,7 @@ Automated tests cover the registration and link logic on every OS. Check these b
 
 ## Not supported
 
-- Streaming. `watch --follow` isn't offered; use `agents_status`, or `watch` with `timeoutMs`.
+- Streaming. `watch --follow` and `watch --until-event` aren't offered; use `agents_status`, or `watch` with `timeoutMs`.
 - App settings. Agents can't read or change Pane's settings.
 - Permanently deleting Panes or removing repositories. Those stay in the app, where the user sees what goes.
 - Progress notifications and pagination (the full list is small).
@@ -154,7 +154,7 @@ Tools are generated from [`contracts/runpane/contract.json`](../contracts/runpan
 
 Adding or changing a command in the contract changes its tool. There is no per-tool code.
 
-A few flags are left out. `--json` is always passed. `--follow` is omitted because a streaming watch cannot return a single result; call `watch` with `timeoutMs` instead. Tools have no stdin, so pass exact terminal bytes in `text` (for example `\u0003` for Ctrl-C) rather than `inputFile: "-"`.
+A few flags are left out. `--json` is always passed. `--follow` and `--until-event` are omitted because a streaming or open-ended watch cannot return a single result; call `watch` with `timeoutMs` instead. Tools have no stdin, so pass exact terminal bytes in `text` (for example `\u0003` for Ctrl-C) rather than `inputFile: "-"`.
 
 ## Confirmation
 

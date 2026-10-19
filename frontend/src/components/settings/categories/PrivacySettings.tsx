@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { SettingsSection } from '../../ui/SettingsSection';
+import { BrowserDataSetting } from './BrowserDataSetting';
 import { SettingRow, SettingsPage } from '../SettingRow';
 import { ImmediateToggle } from '../SettingsControls';
 import type { SettingsPersistence } from '../useSettingsPersistence';
@@ -84,6 +85,9 @@ export function PrivacySettings({ persistence }: { persistence: SettingsPersiste
         >
           <ImmediateToggle label="Allow product analytics" value={analytics.enabled === true} onSave={saveAnalytics} />
         </SettingRow>
+      </SettingsSection>
+      <SettingsSection title="Browser">
+        <BrowserDataSetting />
       </SettingsSection>
     </SettingsPage>
   );

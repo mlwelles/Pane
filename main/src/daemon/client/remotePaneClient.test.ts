@@ -1,18 +1,24 @@
+import net from 'net';
+import * as tunnelModule from './portTunnel';
+import type { SocketRead } from '../../services/listeningSockets';
 import http, { type IncomingMessage, type ServerResponse } from 'http';
 import { EventEmitter } from 'events';
 import { hostname as getOsHostname } from 'os';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultRemoteDaemonConfig, type RemoteDaemonConfig } from '../../../../shared/types/remoteDaemon';
 import type { PaneEventSink } from '../../core/eventSink';
 import { RemotePaneClient, RemotePaneClientController } from './remotePaneClient';
 import { boundary, decodeBoundary, type JsonValue } from '../../../../shared/validation/boundaryDecoder';
-import type { ListeningPortsSnapshot } from '../../../../shared/types/listeningPorts';
+import { decodeListeningPortsSnapshot, type PortDiscoveryMode, type ListeningPort, type ListeningPortsSnapshot } from '../../../../shared/types/listeningPorts';
 import { hashRemoteDaemonToken } from '../auth';
 import { PaneCommandRegistry } from '../commandRegistry';
 import { PaneRemoteHttpApiServer } from '../httpApiServer';
 
 interface TestRemoteServer {
   baseUrl: string;
+  /** Answer this channel the way a host without the command does. */
+  refuseChannel(channel: string): void;
+  truncateInvoke(): void;
   close(): Promise<void>;
   closeEventStream(): void;
   emitDaemonEvent(payload: JsonValue): void;
@@ -29,11 +35,13 @@ interface TestRemoteServer {
 
 interface RemoteConfigSnapshot {
   remoteDaemon: RemoteDaemonConfig;
+  portDiscoveryMode?: PortDiscoveryMode;
 }
 
 interface ConfigManagerStub extends EventEmitter {
   getConfig(): RemoteConfigSnapshot;
   setRemoteConfig(remoteDaemon: RemoteDaemonConfig): void;
+  setPortDiscoveryMode(mode: PortDiscoveryMode): void;
 }
 
 const activeServers: TestRemoteServer[] = [];
@@ -67,6 +75,39 @@ describe('RemotePaneClient', () => {
       channel: 'sessions:get-all',
       args: ['session-1'],
     }));
+  });
+
+  it('routes a truncated mutation response to recovery and never replays it', async () => {
+    const server = await createTestRemoteServer();
+    activeServers.push(server);
+    const states: string[] = [];
+    const client = new RemotePaneClient({ id: 'truncated', label: 'host', baseUrl: server.baseUrl, token: '', transport: 'http+sse' }, {
+      onConnectionStateChange: status => states.push(status),
+    });
+    await client.connect();
+    server.truncateInvoke();
+    await expect(client.invoke('panels:input', ['panel', 'hello'])).rejects.toThrow('Delivery unknown');
+    expect(states.at(-1)).toBe('reconnecting');
+    await client.disconnect();
+  });
+
+  it('waits for restoration before connected and ignores restoration after disconnect', async () => {
+    const server = await createTestRemoteServer();
+    activeServers.push(server);
+    const states: string[] = [];
+    let finish!: () => void;
+    const restored = new Promise<void>(resolve => { finish = resolve; });
+    const client = new RemotePaneClient({ id: 'restore', label: 'host', baseUrl: server.baseUrl, token: '', transport: 'http+sse' }, {
+      onConnectionStateChange: status => states.push(status),
+      onResyncRequired: () => restored,
+    });
+    const connecting = client.connect();
+    await waitFor(() => states.includes('restoring'));
+    expect(states).not.toContain('connected');
+    await client.disconnect();
+    finish();
+    await connecting;
+    expect(states).not.toContain('connected');
   });
 
   it('falls back to a stored Tailscale IP when macOS cannot resolve a ts.net host', async () => {
@@ -223,7 +264,7 @@ describe('RemotePaneClient', () => {
     await client.disconnect();
   });
 
-  it('retries stale remote event streams five times before surfacing a hard error', async () => {
+  it('retries stale remote event streams until the outage deadline', async () => {
     const server = await createTestRemoteServer();
     activeServers.push(server);
     const connectionStates: Array<{ status: string; errorMessage: string | null | undefined }> = [];
@@ -238,7 +279,7 @@ describe('RemotePaneClient', () => {
       heartbeatStaleTimeoutMs: 20,
       reconnectInitialDelayMs: 5,
       reconnectMaxDelayMs: 20,
-      reconnectErrorThreshold: 5,
+      reconnectDurationMs: 160,
       onConnectionStateChange(status, errorMessage) {
         connectionStates.push({ status, errorMessage });
       },
@@ -251,10 +292,10 @@ describe('RemotePaneClient', () => {
 
     const firstErrorIndex = connectionStates.findIndex((state) => state.status === 'error');
     expect(firstErrorIndex).toBeGreaterThan(-1);
-    expect(server.getEventRequestCount()).toBe(6);
+    expect(server.getEventRequestCount()).toBeGreaterThan(6);
     expect(connectionStates.slice(0, firstErrorIndex).filter((state) => state.status === 'reconnecting').length)
       .toBeGreaterThanOrEqual(5);
-    expect(connectionStates[firstErrorIndex].errorMessage).toBe('Remote daemon not ready yet');
+    expect(connectionStates[firstErrorIndex].errorMessage).toContain('Could not reconnect');
 
     await client.disconnect();
   });
@@ -329,6 +370,35 @@ describe('RemotePaneClient', () => {
 });
 
 describe('RemotePaneClientController', () => {
+  it('requires every current renderer to acknowledge restoration before green', async () => {
+    const server = await createTestRemoteServer();
+    activeServers.push(server);
+    const config = createDefaultRemoteDaemonConfig();
+    config.client = { mode: 'remote', activeProfileId: 'ack', profiles: [
+      { id: 'ack', label: 'host', baseUrl: server.baseUrl, token: 'test-token', transport: 'http+sse' },
+    ] };
+    const controller = new RemotePaneClientController();
+    let restoreId = 0;
+    controller.initialize({
+      configManager: createConfigManagerStub(config),
+      rendererIds: () => [10, 11],
+      rendererEventSink: { send(channel, payload) {
+        if (channel === 'remote-daemon:resync-required') {
+          restoreId = decodeBoundary(payload, boundary.object({ restoreId: boundary.number })).restoreId;
+        }
+      } },
+    });
+    await waitFor(() => restoreId > 0);
+    expect(controller.getConnectionState().status).toBe('restoring');
+    controller.acknowledgeRestore(10, restoreId);
+    controller.acknowledgeRestore(99, restoreId);
+    controller.acknowledgeRestore(11, restoreId - 1);
+    expect(controller.getConnectionState().status).toBe('restoring');
+    controller.acknowledgeRestore(11, restoreId);
+    await waitFor(() => controller.getConnectionState().status === 'connected');
+    await controller.switchToLocalMode();
+  });
+
   it('syncs into remote mode and suppresses local daemon renderer events', async () => {
     const server = await createTestRemoteServer();
     activeServers.push(server);
@@ -398,6 +468,30 @@ describe('RemotePaneClientController', () => {
     expect(controller.getConnectionState()).toMatchObject({ activeProfileId: 'tailnet-my-mac', activeBaseUrl: server.baseUrl });
     await controller.invoke('sessions:get-all', [], async () => undefined);
     expect(server.getLastInvokeAuth()).toBeUndefined();
+    await controller.switchToLocalMode();
+  });
+
+  it('says which host to update when the host does not have a command', async () => {
+    const server = await createTestRemoteServer();
+    activeServers.push(server);
+    server.refuseChannel('orchestration-sessions:reorder');
+    const remoteConfig = createDefaultRemoteDaemonConfig();
+    remoteConfig.client = {
+      profiles: [{ id: 'profile-mini', label: 'Mac Mini', baseUrl: server.baseUrl, token: 'secret-token', transport: 'http+sse' }],
+      activeProfileId: 'profile-mini',
+      mode: 'remote',
+    };
+    const controller = new RemotePaneClientController();
+    controller.initialize({ configManager: createConfigManagerStub(remoteConfig), rendererEventSink: { send() {} } });
+    await waitFor(() => controller.getConnectionState().status === 'connected');
+
+    const refusal = controller.invoke('orchestration-sessions:reorder', [{ sessionIds: [] }], async () => undefined);
+
+    await expect(refusal).rejects.toMatchObject({
+      code: 'ERR_HOST_OUTDATED',
+      message: expect.stringContaining('Mac Mini runs an older Pane'),
+      next: 'Update Pane on Mac Mini (run `runpane update` there), then try again.',
+    });
     await controller.switchToLocalMode();
   });
 
@@ -574,16 +668,52 @@ describe('RemotePaneClientController', () => {
 
 describe('RemotePaneClientController links to host ports', () => {
   const cleanups: Array<() => Promise<void> | void> = [];
+  const realCreateServer = net.createServer;
+  const realCreateTunnel = tunnelModule.createPortTunnel;
+  let servers: net.Server[] = [];
+  let readOccupancy: () => Promise<SocketRead>;
+  beforeEach(() => {
+    servers = [];
+    vi.spyOn(net, 'createServer').mockImplementation((...args: Parameters<typeof net.createServer>) => {
+      const server = realCreateServer(...args);
+      servers.push(server);
+      return server;
+    });
+    readOccupancy = async () => ({ complete: true, sockets: servers.flatMap(server => {
+      // SAFETY: these test servers bind only TCP endpoints.
+      const address = server.address() as net.AddressInfo | null;
+      return !address ? [] : [{ port: address.port, address: address.address,
+        family: address.family === 'IPv4' ? 'ipv4' as const : 'ipv6' as const, pid: process.pid, process: 'node' }];
+    }) });
+    vi.spyOn(tunnelModule, 'createPortTunnel').mockImplementation((openStream, options) =>
+      realCreateTunnel(openStream, { ...options, platform: 'linux', readOccupancy: () => readOccupancy() }));
+    vi.spyOn(net, 'connect').mockImplementation(() => {
+      const socket = new net.Socket();
+      queueMicrotask(() => socket.emit('error', new Error('isolated availability result')));
+      return socket;
+    });
+  });
   afterEach(async () => {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+    vi.restoreAllMocks();
   });
 
   /** A real host API that lists `ports` and can announce a new list, with a controller connected to it. */
-  async function connectToHost(options: { listsPorts: boolean; ports: number[] }) {
+  async function connectToHost(options: { listsPorts: boolean; ports: number[]; localMode?: PortDiscoveryMode; remoteMode?: PortDiscoveryMode; staleDecoration?: boolean }) {
     const registry = new PaneCommandRegistry();
     const snapshotOf = (ports: number[]): ListeningPortsSnapshot => ({
       host: 'studio',
-      ports: ports.map(port => ({ port, pid: 1, process: 'node', group: 'other', kind: 'web' })),
+      discoveryMode: options.remoteMode,
+      ports: ports.map(port => {
+        const row: ListeningPort = { port, pid: 1, process: 'node', group: 'other',
+          kind: options.remoteMode === 'passive' ? 'tcp' : 'web', phoneUrl: 'https://phone.example/' };
+        if (options.remoteMode === 'passive') row.probeStatus = 'unchecked';
+        if (options.staleDecoration) {
+          row.localPort = 1;
+          row.forwardingError = { code: 'STALE', message: 'host decoration', next: 'ignored' };
+        }
+        return row;
+      }),
     });
     if (options.listsPorts) registry.register('ports:list', () => snapshotOf(options.ports));
     const hostConfig = createDefaultRemoteDaemonConfig();
@@ -603,14 +733,18 @@ describe('RemotePaneClientController links to host ports', () => {
     };
     const controller = new RemotePaneClientController();
     const rendererEvents: string[] = [];
+    const configManager = createConfigManagerStub(clientConfig);
+    configManager.setPortDiscoveryMode(options.localMode ?? 'active');
     controller.initialize({
-      configManager: createConfigManagerStub(clientConfig),
+      configManager,
       rendererEventSink: { send: channel => { rendererEvents.push(channel); } },
     });
     cleanups.push(() => controller.switchToLocalMode().then(() => undefined));
     await waitFor(() => controller.getConnectionState().status === 'connected', 3_000);
     return {
       controller,
+      configManager,
+      host,
       rendererEvents,
       announce: (ports: number[]) => host.getEventSink().send('ports:changed', snapshotOf(ports)),
     };
@@ -642,6 +776,118 @@ describe('RemotePaneClientController links to host ports', () => {
     expect(controller.toLocalUrl('https://example.com/docs')).toBe('https://example.com/docs');
   });
 
+  it.each([
+    ['active', 'active'], ['active', 'passive'], ['passive', 'active'], ['passive', 'passive'],
+  ] as const)('uses local %s allocation with remote %s metadata', async (localMode, remoteMode) => {
+    const port = await takenPort();
+    const { controller } = await connectToHost({ listsPorts: true, ports: [port], localMode, remoteMode, staleDecoration: true });
+    const result = decodeListeningPortsSnapshot(await controller.invoke('ports:list', [], async () => undefined));
+    expect(result?.discoveryMode).toBe(remoteMode);
+    expect(result?.ports[0]).toMatchObject({ port, phoneUrl: 'https://phone.example/' });
+    expect(result?.ports[0].localPort).toBeDefined();
+    expect(result?.ports[0].localPort).not.toBe(1);
+    expect(result?.ports[0].forwardingError).toBeUndefined();
+    expect(result?.ports[0].probeStatus).toBe(remoteMode === 'passive' ? 'unchecked' : undefined);
+    if (localMode === 'passive') expect(net.connect).not.toHaveBeenCalled();
+    else expect(net.connect).toHaveBeenCalled();
+  });
+
+  it('publishes individual errors, retries missing forwards, and clears stale host decoration', async () => {
+    const workingReader = readOccupancy;
+    readOccupancy = async () => ({ complete: false, sockets: [], reason: 'controlled read failure' });
+    const { controller } = await connectToHost({ listsPorts: true, ports: [31003], localMode: 'passive', staleDecoration: true });
+    const failed = decodeListeningPortsSnapshot(await controller.invoke('ports:list', [], async () => undefined));
+    expect(failed?.ports[0].localPort).toBeUndefined();
+    expect(failed?.ports[0].forwardingError?.code).toBe('PORT_FORWARDING_UNAVAILABLE');
+    readOccupancy = workingReader;
+    const retried = decodeListeningPortsSnapshot(await controller.invoke('ports:list', [], async () => undefined));
+    expect(retried?.ports[0].localPort).toBeDefined();
+    expect(retried?.ports[0].forwardingError).toBeUndefined();
+    expect(net.connect).not.toHaveBeenCalled();
+  });
+
+  it('keeps successful local decoration beside a failed port and retries only the missing forward', async () => {
+    const workingReader = readOccupancy;
+    readOccupancy = async () => {
+      const table = await workingReader();
+      return new Set(table.sockets.map(row => row.port)).size > 1
+        ? { complete: false, sockets: [], reason: 'controlled second-port failure' } : table;
+    };
+    const { controller } = await connectToHost({ listsPorts: true, ports: [31009, 31010], localMode: 'passive' });
+    const failed = decodeListeningPortsSnapshot(await controller.invoke('ports:list', [], async () => undefined));
+    const established = failed?.ports[0].localPort;
+    expect(established).toBeDefined();
+    expect(failed?.ports[0].forwardingError).toBeUndefined();
+    expect(failed?.ports[1].localPort).toBeUndefined();
+    expect(failed?.ports[1].forwardingError?.code).toBe('PORT_FORWARDING_UNAVAILABLE');
+    readOccupancy = workingReader;
+    const retried = decodeListeningPortsSnapshot(await controller.invoke('ports:list', [], async () => undefined));
+    expect(retried?.ports[0].localPort).toBe(established);
+    expect(retried?.ports[1].localPort).toBeDefined();
+    expect(retried?.ports[1].forwardingError).toBeUndefined();
+    expect(net.connect).not.toHaveBeenCalled();
+  });
+
+  it('applies a local mode change synchronously even when the remote profile is unchanged', async () => {
+    const port = await takenPort();
+    const { controller, configManager } = await connectToHost({ listsPorts: true, ports: [] });
+    configManager.setPortDiscoveryMode('passive');
+    vi.mocked(net.connect).mockClear();
+    const failed = await controller.invoke('ports:list', [], async () => undefined);
+    expect(decodeListeningPortsSnapshot(failed)?.ports).toEqual([]);
+    expect(net.connect).not.toHaveBeenCalled();
+    expect(tunnelModule.createPortTunnel).toHaveBeenCalledTimes(1);
+    expect(controller.toLocalUrl(`http://localhost:${port}/`)).toBeNull();
+  });
+
+  it('keeps queued syncs and a new connection on the latest local mode', async () => {
+    const workingReader = readOccupancy;
+    let release!: (table: SocketRead) => void;
+    let started = false;
+    readOccupancy = () => {
+      started = true;
+      return new Promise<SocketRead>(resolve => { release = resolve; });
+    };
+    const { controller, configManager, announce } = await connectToHost({ listsPorts: true, ports: [31005], localMode: 'passive', remoteMode: 'active' });
+    await waitFor(() => started);
+    announce([31005]);
+    const pending = controller.invoke('ports:list', [], async () => undefined);
+    configManager.setPortDiscoveryMode('active');
+    configManager.setPortDiscoveryMode('passive');
+    readOccupancy = workingReader;
+    release({ complete: true, sockets: [] });
+    const result = decodeListeningPortsSnapshot(await pending);
+    expect(result?.ports[0].localPort).toBeDefined();
+    expect(net.connect).not.toHaveBeenCalled();
+    await controller.switchToLocalMode();
+    await controller.syncToConfig();
+    await waitFor(() => controller.getConnectionState().status === 'connected');
+    const reconnected = decodeListeningPortsSnapshot(await controller.invoke('ports:list', [], async () => undefined));
+    expect(reconnected?.ports[0].localPort).toBeDefined();
+    expect(net.connect).not.toHaveBeenCalled();
+    expect(vi.mocked(tunnelModule.createPortTunnel).mock.calls.map(call => call[1]?.mode)).toEqual(['passive', 'passive']);
+  });
+
+  it('discards a queued old-host allocation after disconnect', async () => {
+    const workingReader = readOccupancy;
+    let release!: (table: SocketRead) => void;
+    let started = false;
+    readOccupancy = () => {
+      started = true;
+      return new Promise<SocketRead>(resolve => { release = resolve; });
+    };
+    const { controller } = await connectToHost({ listsPorts: true, ports: [31006], localMode: 'passive' });
+    await waitFor(() => started);
+    const pending = controller.invoke('ports:list', [], async () => undefined);
+    await controller.switchToLocalMode();
+    readOccupancy = workingReader;
+    release({ complete: true, sockets: [] });
+    const result = decodeListeningPortsSnapshot(await pending);
+    expect(result?.ports).toEqual([]);
+    expect(servers.every(server => !server.listening)).toBe(true);
+    expect(net.connect).not.toHaveBeenCalled();
+  });
+
   it('opens loopback links unchanged for a host too old to list ports', async () => {
     const port = await takenPort();
     const { controller } = await connectToHost({ listsPorts: false, ports: [] });
@@ -661,6 +907,8 @@ async function createTestRemoteServer(host = '127.0.0.1', basePath = ''): Promis
   let eventRequestCount = 0;
   let eventsReady = true;
   let emitReadyEvent = true;
+  const refusedChannels = new Set<string>();
+  let truncateInvoke = false;
   const normalizedBasePath = normalizeTestBasePath(basePath);
   const invokePath = `${normalizedBasePath}/invoke`;
   const eventsPath = `${normalizedBasePath}/events`;
@@ -675,7 +923,20 @@ async function createTestRemoteServer(host = '127.0.0.1', basePath = ''): Promis
         channel: boundary.string,
         args: boundary.array(boundary.json),
       }));
+      if (refusedChannels.has(parsed.channel)) {
+        response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({
+          ok: false,
+          error: {
+            code: 'ERR_UNKNOWN_CHANNEL',
+            message: `No Pane daemon command registered for channel "${parsed.channel}". This Pane does not have that command, usually because it is older than the runpane CLI or app that asked. Nothing was changed.`,
+            next: 'Update Pane with `runpane update`, then restart it.',
+          },
+        }));
+        return;
+      }
       response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      if (truncateInvoke) { response.end('{"ok":'); return; }
       response.end(JSON.stringify({
         ok: true,
         result: parsed,
@@ -732,6 +993,10 @@ async function createTestRemoteServer(host = '127.0.0.1', basePath = ''): Promis
 
   return {
     baseUrl: `http://${host.includes(':') ? `[${host}]` : host}:${address.port}${normalizedBasePath}`,
+    truncateInvoke() { truncateInvoke = true; },
+    refuseChannel(channel: string) {
+      refusedChannels.add(channel);
+    },
     closeEventStream() {
       if (streamResponse && !streamResponse.destroyed) {
         streamResponse.destroy();
@@ -796,9 +1061,15 @@ function normalizeTestBasePath(basePath: string): string {
 function createConfigManagerStub(initialConfig: RemoteDaemonConfig): ConfigManagerStub {
   class Stub extends EventEmitter implements ConfigManagerStub {
     private remoteDaemon = initialConfig;
+    private portDiscoveryMode: PortDiscoveryMode = 'active';
 
     getConfig(): RemoteConfigSnapshot {
-      return { remoteDaemon: this.remoteDaemon };
+      return { remoteDaemon: this.remoteDaemon, portDiscoveryMode: this.portDiscoveryMode };
+    }
+
+    setPortDiscoveryMode(mode: PortDiscoveryMode): void {
+      this.portDiscoveryMode = mode;
+      this.emit('config-updated', this.getConfig());
     }
 
     setRemoteConfig(remoteDaemon: RemoteDaemonConfig): void {

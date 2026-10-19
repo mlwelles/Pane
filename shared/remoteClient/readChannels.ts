@@ -1,0 +1,53 @@
+// Retry only reviewed reads. A command name or runtime ID cannot prove that
+// replaying it is safe after the host applied it but its response was lost.
+export const REMOTE_READ_CHANNELS = new Set([
+  'runpane:update:progress',
+  'config:get',
+  'config:get-session-preferences',
+  'ui-state:get-expanded',
+  'ui-state:get-navigation-memory',
+  'ui-state:get-session-workspace-layout',
+  'ui-state:get-pane-layout',
+  'sessions:get-all',
+  'sessions:get-all-with-projects',
+  'sessions:get-output',
+  'sessions:get-conversation',
+  'sessions:get-conversation-messages',
+  'sessions:get-json-messages',
+  'panels:get-layout',
+  'panels:get-conversation-messages',
+  'panels:get-json-messages',
+  'panels:get-prompts',
+  'orchestration-sessions:list',
+  'orchestration-sessions:get',
+  'orchestration-sessions:overview',
+  'orchestration-sessions:runtimes',
+  'projects:get-all',
+  'projects:get-running-script',
+  'terminal:getAltScreenState',
+  'terminal:getScrollbackClean',
+  'sessions:get',
+  'panels:list',
+  'panels:getActive',
+  'panels:agent-statuses',
+  'panels:checkInitialized',
+  'panels:get-output',
+  'ports:list',
+  'projects:list-branches',
+  'projects:detect-branch',
+  'remote:pwa-affordances',
+  'mobile:push-status',
+  'runpane:workspace:state',
+  'runpane:workspaces:machines',
+  'permission:getPending',
+  'sessions:get-archived-with-projects',
+  'terminal:getState',
+]);
+
+
+/** Idempotent viewer bookkeeping required to restore a connected workspace. */
+export const REMOTE_RESTORE_CHANNELS = new Set([
+  'terminal:resize', 'panels:resize-terminal', 'terminal:setVisibility',
+  'terminal:ack', 'terminal:resetFlowControl', 'sessions:mark-viewed',
+  'panels:set-active', 'terminal:reply',
+]);

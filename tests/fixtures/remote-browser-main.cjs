@@ -64,7 +64,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('preview-test:host-http', async () => {
     const url = `http://127.0.0.1:${address.port}/health`;
-    await session.fromPartition('persist:project-test-pane').cookies.set({ url, name: 'project-session', value: 'available' });
+    await session.fromPartition('persist:pane-browser').cookies.set({ url, name: 'shared-session', value: 'available' });
     await panelManager.updatePanel(panel.id, { state: { customState: { currentUrl: url } } });
     const updated = panelManager.getPanel(panel.id);
     await window.webContents.executeJavaScript(`window.dispatchEvent(new CustomEvent('test-panel-update', { detail: ${JSON.stringify(updated)} }))`);
@@ -83,6 +83,9 @@ app.whenReady().then(async () => {
     await preparationReady;
     return prepareRemoteBrowserFiles(panelId);
   });
+  ipcMain.handle('preview-test:connection-state', () => remotePaneClientController.getConnectionState());
+  // The loopback host is reachable on its own port, as a port tunnelled to the same number.
+  ipcMain.handle('ports:list', () => ({ host: 'test-host', ports: [{ port: address.port, pid: 1, process: 'node', group: 'other', kind: 'web', localPort: address.port }] }));
   ipcMain.handle('browser-panel:register-webview', () => ({ success: true }));
   ipcMain.handle('browser-panel:close-devtools', () => ({ success: true }));
   ipcMain.handle('panels:update', async (_event, ...args) => {

@@ -3,7 +3,7 @@ name: Build & Release
 on:
   push:
     branches: [release]
-    tags: ['v*']
+    tags: ['v*', '!v*-mlwelles.*']
   workflow_dispatch:
     inputs:
       publish:
@@ -132,7 +132,7 @@ jobs:
 
   checksums:
     if: github.ref_type == 'tag' || inputs.publish == true
-    needs: [publish-release]
+    needs: [publish-release, publish-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -152,13 +152,22 @@ jobs:
         cd assets
         sha256sum * > ../SHA256SUMS.txt
         cat ../SHA256SUMS.txt
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib
+        artifacts = [{"name": p.name, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                     for p in sorted(pathlib.Path('.').iterdir()) if p.is_file()]
+        pathlib.Path('../continuity.json').write_text(json.dumps({
+            "protocol": 1, "version": os.environ['RELEASE_TAG'].removeprefix('v'),
+            "artifacts": artifacts,
+        }, indent=2) + '\n')
+        PY
 
     - name: Upload SHA256SUMS.txt to release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         VERSION="${RELEASE_TAG#v}"
-        gh release upload "v${VERSION}" SHA256SUMS.txt \
+        gh release upload "v${VERSION}" SHA256SUMS.txt continuity.json \
           --repo "${{ github.repository }}" --clobber
 
   validate-runpane-packages:

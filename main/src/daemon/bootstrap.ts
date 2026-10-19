@@ -53,6 +53,7 @@ import { syncRemoteTransportForMode } from './remoteTransportStartup';
 import { panelManager } from '../services/panelManager';
 import { terminalPanelManager } from '../services/terminalPanelManager';
 import { createListeningPortMonitor } from '../services/listeningPorts';
+import { bindPortDiscoveryMode, readPortDiscoveryMode } from '../services/portDiscoveryMode';
 import type { ListeningPortsSnapshot } from '../../../shared/types/listeningPorts';
 import { PhonePreviewHost } from './phonePreviews';
 import { createPreviewFiles } from './previewProxy';
@@ -62,7 +63,6 @@ import { NamedLockService } from '../services/namedLockService';
 import { NamedLockStore } from '../services/namedLockStore';
 import { WorkspaceStateReader } from '../services/workspaceStateReader';
 import { WorkspaceCursorStore } from '../services/workspaceCursorStore';
-import { extractWorkspaceHeldInput } from '../services/workspaceHeldInput';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
 
 interface PaneDaemonHostOptions {
@@ -265,6 +265,7 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
   });
 
   const workspaceJournal = new WorkspaceJournal({
+    filePath: path.join(getAppDirectory(), 'workspace-journal.json'),
     resolvePane: (paneId) => {
       const session = sessionManager.getSession(paneId);
       if (!session) return undefined;
@@ -292,7 +293,8 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
         agentType: snapshot?.agentType ?? customState.agentType,
         panelTitle: panel.title,
         lastActivityAt: snapshot?.lastActivityTime,
-        heldInput: snapshot?.screenText ? extractWorkspaceHeldInput(snapshot.screenText) : undefined,
+        // Typed cells only, so a dim or grey prompt suggestion is not held input.
+        screen: { screenText: snapshot?.screenText, typedText: terminalPanelManager.getInputScreenText(panelId) },
       };
     },
     resolveSessionMembership: sessionId => orchestrationSessionManager.workspaceMembership(sessionId),
@@ -355,6 +357,7 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
     spotlightManager,
     workspaceJournal,
     workspaceStateReader,
+    sessionPrMonitor,
     workspaceCursorStore,
     namedLockService,
   };
@@ -366,6 +369,7 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
 
   const commandRegistry = registerIpcHandlers(services);
   const listeningPortMonitor = createListeningPortMonitor({
+    mode: readPortDiscoveryMode(configManager.getConfig().portDiscoveryMode),
     // Terminal panels and agent CLIs (Claude, Codex) both run PTYs inside a Pane.
     terminalPanes: () => [terminalPanelManager, ...CliToolRegistry.getInstance().getAllManagers()].flatMap(manager =>
       [...manager.getSessionPids()].flatMap(([sessionId, pids]) => {
@@ -378,6 +382,8 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
       void phonePreviews.update(snapshot);
     },
   });
+  const stopPortDiscoveryModeBinding = bindPortDiscoveryMode(configManager, listeningPortMonitor);
+  configManager.startWatching();
   // Every listed port is forwarded to signed-in clients, Pane's own included.
   const isForwardedPort = (port: number) => listeningPortMonitor.snapshot().ports.some(listed => listed.port === port);
   // On by default only for the desktop Pane that owns ~/.pane; other data dirs opt in through config.
@@ -501,13 +507,14 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
       // Before terminals stop: their exits during shutdown must not release locks.
       namedLockService.dispose();
       resourceMonitorService.stop();
+      stopPortDiscoveryModeBinding();
+      configManager.stopWatching();
       listeningPortMonitor.stop();
       await spotlightManager.disableAll();
       await sessionManager.cleanup();
       await runCommandManager.stopAllRunCommands();
       gitStatusManager.stopPolling();
       sessionPrMonitor.stop();
-      configManager.stopWatching();
       await cliManagerFactory.shutdown();
       await taskQueue.close();
       workspaceJournal.dispose();

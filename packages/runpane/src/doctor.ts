@@ -192,10 +192,7 @@ interface DoctorReport {
   nextCommands: string[];
 }
 
-type DoctorWatchDefaults = Omit<
-  typeof RUNPANE_CONTRACT.defaults.watch,
-  'format' | 'agentsOnly' | 'includeHeldInputPresence'
-> & { kinds: 'all' };
+type DoctorWatchDefaults = typeof RUNPANE_CONTRACT.defaults.watch;
 
 interface RemoteDaemonServiceDoctorCheck {
   paneDir: string;
@@ -927,14 +924,14 @@ function resolveDaemonRecoveryCommand(endpoint: PaneDaemonEndpoint, message: str
 }
 
 export function watchDefaults(): DoctorWatchDefaults {
-  const { heartbeatSeconds, idleAfterMs, settleMs, blockedSettleMs, minIntervalMs, idleBackoff } = RUNPANE_CONTRACT.defaults.watch;
-  return { heartbeatSeconds, idleAfterMs, settleMs, blockedSettleMs, minIntervalMs, idleBackoff, kinds: 'all' };
+  return RUNPANE_CONTRACT.defaults.watch;
 }
 
 export function formatWatchDefaults(defaults: DoctorWatchDefaults): string {
-  return `Watch defaults (--follow): heartbeat ${defaults.heartbeatSeconds}s, idle-after ${defaults.idleAfterMs}ms, `
-    + `settle ${defaults.settleMs}ms, blocked-settle ${defaults.blockedSettleMs}ms, min-interval ${defaults.minIntervalMs}ms, `
-    + `idle-backoff ${defaults.idleBackoff ? 'on' : 'off'}, kinds ${defaults.kinds}`;
+  const follow = defaults.follow;
+  return `Watch defaults (--follow): heartbeat ${follow.heartbeat}, idle-after ${follow.idleAfter}, `
+    + `ready-settle ${follow.readySettle}, blocked-settle ${follow.blockedSettle}, min-interval ${follow.minInterval}, `
+    + `expire-after ${follow.expireAfter}, idle-backoff ${follow.idleBackoff ? 'on' : 'off'}, kinds ${follow.kinds.join(',')}`;
 }
 
 function renderDoctorText(report: DoctorReport): void {

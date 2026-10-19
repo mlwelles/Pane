@@ -1,3 +1,4 @@
+import { acknowledgeUpdateQuiescence } from './services/updateShutdown';
 // Answer --version before any import below logs or touches the database.
 import './versionQuery';
 // Load ReadableStream polyfill before any other imports
@@ -125,6 +126,8 @@ import { startHeadlessPaneProcess } from './daemon/startHeadless';
 import { runRemoteSetupCli } from './daemon/setupRemoteHostCli';
 import { PowerSaveManager } from './services/powerSaveManager';
 import { warmShellPath } from './utils/shellPath';
+import { routeWebviewPopups } from './services/webviewPopups';
+import { hardenWebviewPreferences } from './services/webviewPreferences';
 import { APP_MENU_ACTION_CHANNEL, attachEditContextMenu, installApplicationMenu, type AppMenuAction } from './services/nativeMenus';
 import { fitBoundsToWorkAreas, parseSavedWindowState, trackWindowState, WINDOW_STATE_KEY } from './utils/windowState';
 
@@ -566,12 +569,9 @@ async function createWindow() {
     }
   });
 
-  // Security hook: strip preload and enforce sandbox on any webview tags
+  // Security and opacity hook for every webview tag, including the docs dialog
   mainWindow.webContents.on('will-attach-webview', (_event, webPreferences, _params) => {
-    delete webPreferences.preload;
-    webPreferences.nodeIntegration = false;
-    webPreferences.contextIsolation = true;
-    webPreferences.sandbox = true;
+    hardenWebviewPreferences(webPreferences);
   });
 
   // Set up popup interception on webviews IMMEDIATELY when they attach (before any page loads).
@@ -579,54 +579,10 @@ async function createWindow() {
   // The context map (panelId/sessionId) is populated later by the browser-panel:register-webview IPC.
   mainWindow.webContents.on('did-attach-webview', (_event, wvContents: WebContents) => {
     attachEditContextMenu(wvContents);
-    wvContents.setWindowOpenHandler(({ url, disposition }) => {
-      // Auth popups (Firebase signInWithPopup, OAuth providers, etc.) use window.open()
-      // with explicit features (width, height, toolbar=no), which Chromium reports as
-      // disposition 'new-window'. Let these open as real BrowserWindows so the
-      // postMessage channel between popup and opener remains intact.
-      if (disposition === 'new-window') {
-        if (!webviewContextMap.has(wvContents.id)) {
-          console.warn('[BrowserPanel] Auth popup allowed for unregistered webview (pre-dom-ready), wcId:', wvContents.id);
-        }
-        return {
-          action: 'allow',
-          overrideBrowserWindowOptions: {
-            autoHideMenuBar: true,
-            webPreferences: {
-              contextIsolation: true,
-              sandbox: true,
-            },
-          },
-        };
-      }
-
-      // Regular navigations (target="_blank" links, etc.) → open as new browser panel tab
-      const ctx = webviewContextMap.get(wvContents.id);
-      if (ctx) {
-        mainWindow?.webContents.send('browser-panel:popup-requested', {
-          url,
-          sourceSessionId: ctx.sessionId,
-          sourcePanelId: ctx.panelId,
-        });
-      } else {
-        // Context not yet registered (popup fired before dom-ready).
-        // Fall back to opening in the system browser so the popup isn't silently lost.
-        shell.openExternal(url);
-      }
-      return { action: 'deny' };
-    });
-
-    // Track and manage auth popup windows created by { action: 'allow' }.
-    // Clean up when the parent webview is destroyed so popups don't orphan.
-    wvContents.on('did-create-window', (popupWindow) => {
-      // If the parent webview is destroyed (e.g., panel closed), close the popup too.
-      // This is a one-shot listener; safe even if the popup closes first because
-      // popupWindow.isDestroyed() is checked before calling close().
-      wvContents.once('destroyed', () => {
-        if (!popupWindow.isDestroyed()) {
-          popupWindow.close();
-        }
-      });
+    routeWebviewPopups(wvContents, {
+      contextOf: id => webviewContextMap.get(id),
+      openBrowserTab: request => mainWindow?.webContents.send('browser-panel:popup-requested', request),
+      openExternal: url => void shell.openExternal(url),
     });
 
     wvContents.setBackgroundThrottling(true);
@@ -1316,7 +1272,7 @@ if (launchRemoteSetup) {
       app.exit(0);
       return;
     }
-    if (app.isPackaged && !app.isDefaultProtocolClient(PANE_LINK_SCHEME)) {
+    if (process.env.PANE_DISABLE_OS_INTEGRATION !== '1' && app.isPackaged && !app.isDefaultProtocolClient(PANE_LINK_SCHEME)) {
       app.setAsDefaultProtocolClient(PANE_LINK_SCHEME);
     }
 
@@ -1325,8 +1281,8 @@ if (launchRemoteSetup) {
     // after the window opens reads the cache instead of blocking on the shell.
     void warmShellPath();
     await initializeServices();
-    syncAutoStartOnBoot(app, configManager.getConfig().autoStartOnBoot !== false);
-    setTimeout(() => syncPaneMcpForApp({
+    if (process.env.PANE_DISABLE_OS_INTEGRATION !== '1') syncAutoStartOnBoot(app, configManager.getConfig().autoStartOnBoot !== false);
+    if (process.env.PANE_DISABLE_OS_INTEGRATION !== '1') setTimeout(() => syncPaneMcpForApp({
       isPackaged: app.isPackaged,
       config: configManager.getConfig(),
       getProjects: () => databaseService.getAllProjects(),
@@ -1480,10 +1436,8 @@ if (launchRemoteSetup) {
       if (activeProject?.path) {
         const ctx = sessionManager.getProjectContextByProjectId(activeProject.id);
         if (ctx) {
-          const mainBranch = await worktreeManager.getProjectMainBranch(activeProject.path, ctx.commandRunner).catch(() => 'HEAD');
-          worktreePoolManager.createReserve(
+          worktreeManager.seedReserve(
             activeProject.path,
-            mainBranch,
             activeProject.worktree_folder ?? undefined,
             ctx.pathResolver,
             ctx.commandRunner
@@ -1682,6 +1636,8 @@ if (launchRemoteSetup) {
       paneDaemonHost = null;
       console.log('[Main] Daemon host services stopped');
     }
+
+    acknowledgeUpdateQuiescence();
 
     // Track app closed event with session duration.
     // Send directly via HTTP instead of IPC — the renderer may already be

@@ -46,10 +46,15 @@ interface DiscoveryDependencies {
   savedSecrets?: ReadonlyMap<string, string>;
   /** List this machine first, as described by its own listener (for a phone asking a host). */
   self?: { url: string; description: WorkspaceMachineDescription };
+  /**
+   * Also list other people's machines that keep this login out, as `refused`, so the app can say
+   * why. Off for phones, whose installed app may not know that state.
+   */
+  includeRefused?: boolean;
 }
 
 const OS_NAMES = new Map<string, TailnetMachine['os']>([['macos', 'macOS'], ['windows', 'Windows'], ['linux', 'Linux']]);
-const STATE_ORDER: TailnetMachineState[] = ['available', 'password-required', 'outdated', 'unreachable', 'offline'];
+const STATE_ORDER: TailnetMachineState[] = ['available', 'password-required', 'outdated', 'refused', 'unreachable', 'offline'];
 
 const peerSchema = boundary.object({
   DNSName: boundary.string,
@@ -139,9 +144,10 @@ function readTailnetPeers(output: string | null): TailnetPeers {
 
 /**
  * The machines this one can connect to without a code, from the current tailnet: every desktop
- * machine on my own Tailscale login, and other people's machines only when they let me in.
+ * machine on my own Tailscale login, and other people's machines only when they let me in (or,
+ * with `includeRefused`, marked `refused` when they don't).
  */
-export async function discoverTailnetMachines({ readStatus, probe, savedSecrets, self }: DiscoveryDependencies): Promise<TailnetMachineList> {
+export async function discoverTailnetMachines({ readStatus, probe, savedSecrets, self, includeRefused = false }: DiscoveryDependencies): Promise<TailnetMachineList> {
   const tailnet = readTailnetPeers(await readStatus());
   if (!tailnet.ok) return tailnet;
   const { peers, domain } = tailnet;
@@ -167,9 +173,13 @@ export async function discoverTailnetMachines({ readStatus, probe, savedSecrets,
       case 'password-required':
         return [{ ...base, state: 'password-required' }];
       case 'outdated':
-        return isMine ? [{ ...base, state: 'outdated' }] : [];
+        // An older Pane accepts only its owner's login.
+        if (isMine) return [{ ...base, state: 'outdated' }];
+        return includeRefused ? [{ ...base, state: 'refused' }] : [];
+      case 'refused':
+        return includeRefused ? [{ ...base, state: 'refused' }] : [];
       default:
-        // Someone else's machine that keeps me out stays hidden; so does one with no Pane listening.
+        // Someone else's machine with no Pane listening stays hidden.
         return isMine ? [{ ...base, state: 'unreachable' }] : [];
     }
   });

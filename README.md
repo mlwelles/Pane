@@ -137,6 +137,14 @@ Each of these is a small thing. Together they compound fast.
 
 ---
 
+## Port discovery
+
+Pane checks local listeners to fill the browser's Ports list. By default, **Active** sends an HTTP `HEAD` request to identify web servers and checks TCP connections when choosing local ports for remote forwarding. In **Settings > General > Port discovery**, choose **Passive** to list listeners without those automatic connections. The change takes effect immediately for this Pane instance and survives a restart. An in-progress request that already reached a service cannot be recalled; opening a listed port still contacts that service.
+
+Passive is available on macOS and Linux. On Windows, FreeBSD, or another unsupported or unidentified operating system, Settings disables Passive and explains why. A headless instance can set `"portDiscoveryMode": "passive"` in its `config.json`; an invalid value is rejected. An unsupported instance with Passive already saved stays probe-free. If it acts as a desktop client, local forwarding reports unavailable. Each host and desktop client has its own setting: set both to Passive when a remote desktop must avoid automatic connections at either end. See [remote port discovery and forwarding](docs/SELF_HOSTED_REMOTE_DAEMON.md#port-discovery-on-each-machine) for unchecked ports, phone previews, forwarding failures and limits.
+
+---
+
 ## SSH hosts
 
 Pane lists every host in your SSH config (`~/.ssh/config`, or `C:\Users\<you>\.ssh\config` on Windows, plus the files it `Include`s) under **SSH hosts** in the sidebar. Click one and a terminal tab opens with `ssh <host>`, using your own `ssh`, keys and agent. It needs no project, and Pane never reads or copies your keys. Edit the config and the list follows. See [SSH hosts](docs/SSH_HOSTS.md).
@@ -208,7 +216,7 @@ The CLI setup command prints the same connection code and, for SSH mode, the for
 
 For agents reaching your own machines from the CLI, see [Pane Workspaces](#pane-workspaces) below.
 
-Integration keys (voice dictation, iPhone notifications) set on one host reach your other hosts through the devices you paired. See [Shared integration keys](docs/SHARED_CREDENTIALS.md).
+Integration keys (voice dictation, iPhone notifications) set on one host reach your other hosts through your devices that have them saved. See [Shared integration keys](docs/SHARED_CREDENTIALS.md).
 
 ---
 
@@ -235,7 +243,9 @@ See [Workspaces setup, trust, and troubleshooting](docs/RUNPANE_WORKSPACES.md) f
 
 “Continue this on my Windows machine with Codex.” `runpane handoff` starts a fresh agent in a new Pane on the other machine (or a new tab in your Pane on this one), using your pushed branch and a note about the task. The note carries the goal, decisions, verified state, and next steps. Live processes and agent session memory stay on the original machine.
 
-Run from the repository you're handing off. On the destination, clone the same GitHub repository if needed and add that checkout to Pane. Install and sign in to the receiving agent there. Keep Pane running there. Use the npm CLI. On the destination, choose a repository outside WSL; WSL receivers are not supported.
+To move a whole Session instead, right-click it and choose **Move to host…**: its agent hands it off, and a Session with the same name, goal and agent appears on the other machine, ready to read the note. See [Move a Session to another machine](docs/SESSIONS.md#move-a-session-to-another-machine).
+
+To hand off a Pane's task, run from the repository you're handing off. On the destination, clone the same GitHub repository if needed and add that checkout to Pane. Install and sign in to the receiving agent there. Keep Pane running there. Use the npm CLI. On the destination, choose a repository outside WSL; WSL receivers are not supported.
 
 From a Bash or Zsh terminal (for example, on your Mac):
 
@@ -265,6 +275,8 @@ Use it for the work that spans panes:
 Add this repo, create three worktree panes for the next features, start Codex in each one, and keep a separate review tab ready for every PR.
 ```
 
+Already working in other agent tools? Say "migrate to Pane" and Pane Chat finds your Claude Code, Codex, OpenCode, Cursor and Conductor sessions (or anything similar), opens each one in a Pane tab with its own agent's resume, and checks that it continues where it left off. On a fresh install with no repositories, Pane Chat offers this once by itself. See [Bring your existing sessions into Pane](docs/SESSIONS.md#bring-your-existing-sessions-into-pane).
+
 Pane Chat keeps the human discussion at the orchestrator level, captures work as tickets or briefs, then hands authorized implementation to Claude, Codex, or Cursor agents in Panes through RunPane.
 
 The prompt stays small because Pane ships its skills and installs them into the Pane data directory at startup, whenever the bundled copy has changed:
@@ -274,7 +286,7 @@ The prompt stays small because Pane ships its skills and installs them into the 
 - `skills/pane-chat/skills/`: the bundled skills, also installed in `.claude/skills/` and `.codex/skills/`
 - `.claude/agents/` and `.codex/agents/`: helper subagents (explorer, cold-reader, qa-and-verify, reviewer)
 
-The bundle lives in `main/src/services/paneChatBundle/`. It is built on Agent Farm's raw profile (`prepare-pr`, `create-ticket`, `tdd`, `quick-verify`, `babysit-pr`, `investigate`, and others), general primitives such as `orchestrate-sessions`, `verify-app`, `options`, and `brief`, and two Pane-specific skills, `runpane` and `pane-work`. Pane generates the `pane-orchestrator` entry point at install time. Nothing is downloaded at runtime.
+The bundle lives in `main/src/services/paneChatBundle/`. It is built on Agent Farm's raw profile (`prepare-pr`, `create-ticket`, `tdd`, `quick-verify`, `babysit-pr`, `investigate`, and others), general primitives such as `orchestrate-sessions`, `verify-app`, `options`, and `brief`, and three Pane-specific skills, `runpane`, `pane-work`, and `migrate-to-pane`. Pane generates the `pane-orchestrator` entry point at install time. Nothing is downloaded at runtime.
 
 The top-right toggle switches Pane Chat between Claude, Codex, and Cursor and persists the default orchestrator agent in Pane settings. All three use the same Pane-specific contract and the same bundled skills.
 
@@ -335,17 +347,33 @@ Other tools build custom chat UIs that only work with agents they've explicitly 
 | `⌘B` / `Ctrl+B` | Toggle sidebar |
 
 For terminal editing keys, select **Settings → Shortcuts → Terminal keyboard
-preset → Readline-friendly**. While terminal input has focus, Pane passes keys
-such as Ctrl+A/K/W/V and Meta+B/F to the running program, including in full-screen
-agents. Snippet shortcuts and the `@` terminal picker stop intercepting input.
+preset → Readline-friendly**. While terminal input has focus, Pane reserves
+standard Emacs and Readline editing keys, including Ctrl+A/K/W/V, Ctrl+X and
+Escape prefixes, Meta+B/F, and Control/Meta numeric arguments. Control+Shift
+letters often encode the same terminal bytes as Control letters, so they are
+reserved too, except the platform's terminal clipboard shortcuts. This applies
+in full-screen agents and Mission Control; Escape stays in the terminal there.
 On macOS, Option sends terminal Meta keys instead of special characters.
 
-Use Command+Shift+P on macOS or Ctrl+Shift+P on Windows/Linux to open Pane's
-command palette from a terminal. Record a replacement under **Open command
-palette from terminal**, or restore the default there. Terminal copy/paste stays
-Command+C/V on macOS and Ctrl+Shift+C/V on Windows/Linux. If both **Enable Pane keyboard shortcuts**
-and **Keep Command Palette shortcut enabled** are off, use the mouse to return to Pane. Select **Standard** to restore
-Pane's usual terminal shortcuts; it remains the default.
+Other Pane shortcuts remain available. On macOS, these include Command+K to
+clear scrollback, Command+F to search, and Command+Option snippets and
+navigation. The `@` terminal picker also remains available. Custom terminal
+bindings outside the standard editing set can still conflict with Pane. Select
+**Standard** to restore Pane's usual terminal shortcuts; it remains the default.
+
+By default, use Command+Shift+P on macOS or Super+Shift+P on Windows/Linux to
+open Pane's command palette from a Readline-friendly terminal. Some desktops
+intercept Super shortcuts before Pane receives them; record a replacement under
+**Open command palette from terminal** if needed. A saved command-palette
+shortcut that conflicts with terminal editing remains saved but cannot open the
+palette; Settings explains the conflict and offers **Restore default**. Standard
+mode retains its usual Ctrl+Shift+P shortcut on Windows/Linux. Terminal
+copy/paste stays Command+C/V on macOS and Ctrl+Shift+C/V on Windows/Linux. If
+both **Enable Pane keyboard shortcuts** and **Keep Command Palette shortcut
+enabled** are off, use the mouse to open the palette.
+
+The reserved keys follow the [GNU Emacs key bindings](https://www.gnu.org/software/emacs/manual/html_node/emacs/Key-Bindings.html)
+and [GNU Readline defaults](https://www.gnu.org/software/bash/manual/html_node/Bindable-Readline-Commands.html).
 
 ---
 

@@ -83,21 +83,18 @@
       "--from",
       "earliest",
       "--follow",
-      "--format",
-      "lines",
       "--heartbeat",
-      "60",
+      "60s",
       "--idle-after",
       "600000",
-      "--settle",
+      "--ready-settle",
       "180000",
       "--blocked-settle",
       "30000",
       "--min-interval",
       "600000",
-      "--idle-backoff",
-      "--all-managed",
-      "--agents-only",
+      "--expire-after",
+      "10800000",
       "--exclude-pane",
       "pane-old",
       "--kinds",
@@ -512,27 +509,23 @@
     [
       "watch",
       "--follow",
-      "--quiet",
       "--json",
       "--pane-dir",
       "/tmp/pane"
     ],
     [
       "watch",
-      "--follow",
-      "--no-control-lines",
-      "--all-managed"
+      "--follow"
     ],
     [
       "watch",
       "--session",
       "__orchestration_session_1b4e28ba-2fa1-11d2-883f-0016d3cca427__",
       "--follow",
-      "--quiet",
       "--json",
       "--kinds",
       "agent.ready,agent.blocked,pane.associated,pane.detached,pr.conflicted,pr.checks,pr.merged",
-      "--settle",
+      "--ready-settle",
       "180000"
     ],
     [
@@ -666,6 +659,27 @@
       "--summary-file=/tmp/report.md",
       "--pane-dir",
       "/tmp/pane"
+    ],
+    [
+      "panels",
+      "resume",
+      "--all-stopped",
+      "--wait-ready",
+      "--concurrency",
+      "2",
+      "--yes",
+      "--json"
+    ],
+    [
+      "panels",
+      "resume",
+      "--panel",
+      "panel-1",
+      "--wait-ready",
+      "--ready-timeout-ms",
+      "45000",
+      "--yes",
+      "--json"
     ],
     [
       "panels",
@@ -832,6 +846,99 @@
       "--interrupt",
       "--yes",
       "--json"
+    ],
+    [
+      "watch",
+      "--as",
+      "orch",
+      "--until-event",
+      "--json",
+      "--kinds",
+      "agent.report,agent.blocked,panel.exited,pane.gone",
+      "--timeout-ms",
+      "600000"
+    ],
+    [
+      "pr",
+      "watch",
+      "--pane",
+      "worker",
+      "--url",
+      "https://github.com/acme/app/pull/7"
+    ],
+    [
+      "pr",
+      "unwatch",
+      "--pane",
+      "worker",
+      "--url",
+      "https://github.com/acme/app/pull/7"
+    ],
+    [
+      "pr",
+      "list",
+      "--pane",
+      "worker"
+    ],
+    [
+      "watch",
+      "--follow",
+      "--ready-settle",
+      "5s",
+      "--expire-after",
+      "0"
+    ],
+    [
+      "watch",
+      "--until-event",
+      "--timeout-ms",
+      "30s"
+    ],
+    [
+      "watch",
+      "--timeout-ms",
+      "off"
+    ],
+    [
+      "watch",
+      "--since",
+      "42",
+      "--epoch",
+      "test-epoch",
+      "--until-event",
+      "--json"
+    ],
+    [
+      "watch",
+      "--follow",
+      "--ready-settle",
+      "5s",
+      "--expire-after",
+      "off"
+    ],
+    [
+      "watch",
+      "--follow",
+      "--ready-settle",
+      "5s",
+      "--blocked-settle",
+      "2s",
+      "--min-interval",
+      "1m",
+      "--idle-after",
+      "20m",
+      "--expire-after",
+      "off",
+      "--heartbeat",
+      "30s"
+    ],
+    [
+      "watch",
+      "--follow",
+      "--since",
+      "42",
+      "--epoch",
+      "test-epoch"
     ]
   ],
   "help": {

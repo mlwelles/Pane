@@ -20,6 +20,7 @@ import { isPaneDaemonEventChannel } from './server';
 import {
   createDefaultRemoteDaemonConfig,
   getRemoteDaemonHostConfigValidationError,
+  NATIVE_APP_WEBSOCKET_ORIGIN,
   type RemoteDaemonConnectedClient,
   type RemoteDaemonConfig,
   type RemoteDaemonEventEnvelope,
@@ -444,7 +445,7 @@ export class PaneRemoteHttpApiServer {
       this.handlePortStreamUpgrade(request, socket, head, Number(portMatch[1]), url);
       return;
     }
-    if (this.workspace || url.pathname !== VOICE_DEEPGRAM_STREAM_PATH) {
+    if (url.pathname !== VOICE_DEEPGRAM_STREAM_PATH) {
       socket.destroy();
       return;
     }
@@ -695,9 +696,7 @@ export class PaneRemoteHttpApiServer {
     // Discovery probes peers as this computer's owner, so only that same identity may
     // request its view. A paired client or another tailnet user must use their own computer.
     if (invokeRequest.channel === 'runpane:workspaces:machines') {
-      const login = decodeOptionalBoundary(request.headers['tailscale-user-login'], boundary.string);
-      const owner = this.workspace?.access()?.ownerLogin;
-      if (!owner || login === undefined || login.trim().toLowerCase() !== owner.toLowerCase()) {
+      if (!this.workspaceOwnerLogin(request)) {
         this.writeJson(response, 403, {
           ok: false,
           error: {
@@ -866,8 +865,10 @@ export class PaneRemoteHttpApiServer {
       return { statusCode: 404, error: { message: 'Not found', code: 'ERR_REMOTE_DAEMON_HTTP_NOT_FOUND' } };
     }
     // Serve signs every request from the owner's devices, including ones a web page sends from
-    // the owner's browser; only Pane and the runpane CLI, which send no Origin, may use workspaces.
-    if (request.headers.origin !== undefined || request.method === 'OPTIONS') {
+    // the owner's browser; only Pane and the runpane CLI, which send no Origin, and the native
+    // app, whose WebSockets send an Origin no browser can, may use workspaces.
+    const origin = request.headers.origin;
+    if ((origin !== undefined && origin !== NATIVE_APP_WEBSOCKET_ORIGIN) || request.method === 'OPTIONS') {
       return {
         statusCode: 403,
         error: { message: 'Workspaces answer the runpane CLI, not browsers.', code: 'ERR_WORKSPACE_BROWSER_REFUSED' },
@@ -1063,6 +1064,13 @@ export class PaneRemoteHttpApiServer {
     }));
   }
 
+  /** The request's Tailscale login when it is this workspace's owner, else null. */
+  private workspaceOwnerLogin(request: IncomingMessage): string | null {
+    const login = decodeOptionalBoundary(request.headers['tailscale-user-login'], boundary.string)?.trim().toLowerCase();
+    const owner = this.workspace?.access()?.ownerLogin;
+    return owner && login === owner.toLowerCase() ? login : null;
+  }
+
   private getInvokeArgsForRequest(
     invokeRequest: RemoteInvokeRequest,
     auth: Extract<RemoteRequestAuthResult, { ok: true }>,
@@ -1070,6 +1078,18 @@ export class PaneRemoteHttpApiServer {
   ): JsonValue[] {
     const args = [...invokeRequest.args];
     const sharesKeys = invokeRequest.channel.startsWith('credentials:shared:');
+    if (sharesKeys && this.workspace) {
+      // Keys belong to the owner: a teammate this workspace lets in may neither read nor replace them.
+      const owner = this.workspaceOwnerLogin(request);
+      if (!owner) {
+        throw new RemoteDaemonBadRequestError(
+          'ERR_SHARED_CREDENTIALS_OWNER_REQUIRED',
+          'Only this computer\'s owner can share keys with it. Sign in to Tailscale as the owner, or set the key on this computer.',
+          403,
+        );
+      }
+      return [args[0] ?? null, { clientId: `tailnet:${owner}` }];
+    }
     if (invokeRequest.channel.startsWith('mobile:push-') || sharesKeys) {
       if (!auth.client) {
         throw new RemoteDaemonBadRequestError(

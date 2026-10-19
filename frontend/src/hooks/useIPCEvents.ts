@@ -12,6 +12,7 @@ import { restoreHostNavigation, withHostNavigationWritesPaused } from '../utils/
 import { API } from '../utils/api';
 import { rememberPaneLayout } from '../utils/paneLayoutMemory';
 import { getActiveRemoteHostId } from '../../../shared/types/remoteDaemon';
+import { restoreRemoteTerminals, restoreRemoteWorkspace } from '../utils/remoteRestoration';
 import { devLog } from '../utils/console';
 import { claimCreatedPane, markAppReady } from '../utils/journeyTimings';
 import type { Session, SessionOutput, GitStatus } from '../types/session';
@@ -36,11 +37,11 @@ async function reloadRemoteRuntimeState(loadSessions: (sessions: Session[]) => v
     usePanelStore.setState({ panels: {}, activePanels: {}, layouts: {}, focusedGroupIds: {}, activationRequests: {},
       agentStatus: {}, agentStatusSession: {}, agentStatusReason: {}, agentStatusSnapshotVersion: 0, activityStatus: {}, lastActivityAt: {}, unviewedCompletedActivity: {} });
     useSessionWorkspaceLayoutStore.getState().reset();
-    // Main keeps expanded repositories, collapsed Sessions and open Archived groups per host; load them before the new host's lists arrive.
+    // Main keeps expanded repositories, opened Sessions and open Archived groups per host; load them before the new host's lists arrive.
     const uiState = await window.electronAPI.uiState.getExpanded();
     if (!ownsRuntime()) return;
     useNavigationStore.getState().resetExpandedProjectsForHost(uiState.success ? uiState.data?.expandedProjects ?? [] : []);
-    useNavigationStore.getState().hydrateCollapsedSessions(uiState.success ? uiState.data?.collapsedSessions ?? [] : []);
+    useNavigationStore.getState().hydrateExpandedSessions(uiState.success ? uiState.data?.expandedSessions ?? [] : []);
     useNavigationStore.getState().hydrateExpandedArchivedProjects(uiState.success ? uiState.data?.expandedArchivedProjects ?? [] : []);
   }
   // Repository ids are per host, so another host's repository view is meaningless.
@@ -54,6 +55,7 @@ async function reloadRemoteRuntimeState(loadSessions: (sessions: Session[]) => v
 
   const sessionsResponse = await API.sessions.getAll();
   if (!ownsRuntime()) return;
+  if (!sessionsResponse.success || !sessionsResponse.data) throw new Error(sessionsResponse.error || 'Could not restore Sessions');
   if (sessionsResponse.success && sessionsResponse.data) {
     const sessionsWithJsonMessages = sessionsResponse.data.map((session: Session) => ({
       ...session,
@@ -91,7 +93,8 @@ async function reloadRemoteRuntimeState(loadSessions: (sessions: Session[]) => v
   window.dispatchEvent(new Event('project-changed'));
   window.dispatchEvent(new Event('project-sessions-refresh'));
   // Sessions belong to the host too; adopt the new host's selection.
-  window.dispatchEvent(new CustomEvent('orchestration-sessions-changed', { detail: { kind: 'runtime-resync', selectionChanged: true } }));
+  await useOrchestrationSessionStore.getState().refresh({ adoptServerSelection: true, throwOnError: true });
+  if (ownsRuntime()) await restoreRemoteWorkspace();
 }
 
 async function resyncRemoteRuntimeState(loadSessions: (sessions: Session[]) => void, hostChanged: boolean, ownsRuntime: () => boolean): Promise<void> {
@@ -528,7 +531,7 @@ export function useIPCEvents() {
       unsubscribeFunctions.push(unsubscribeSpotlightTamper);
     }
 
-    const unsubscribeRemoteResync = window.electronAPI.events.onRemoteDaemonResyncRequested?.(({ hostChanged }) => {
+    const unsubscribeRemoteResync = window.electronAPI.events.onRemoteDaemonResyncRequested?.(({ hostChanged, restoreId }) => {
       const generation = ++runtimeGeneration;
       const ownsRuntime = () => !disposed && generation === runtimeGeneration;
       // Destroy outgoing guests before async resync. Hosts can share panel IDs,
@@ -540,8 +543,13 @@ export function useIPCEvents() {
       void (async () => {
         try {
           await resyncRemoteRuntimeState(loadSessions, hostChanged, ownsRuntime);
+          if (ownsRuntime()) await restoreRemoteTerminals();
+          if (ownsRuntime() && restoreId !== undefined) await window.electronAPI.remoteDaemon.restoreComplete(restoreId);
         } catch (error) {
-          if (ownsRuntime()) console.error('[useIPCEvents] Failed to resync renderer state after remote reconnect:', error);
+          if (ownsRuntime()) {
+            console.error('[useIPCEvents] Failed to resync renderer state after remote reconnect:', error);
+            if (restoreId !== undefined) await window.electronAPI.remoteDaemon.restoreComplete(restoreId, 'Workspace restoration failed').catch(() => undefined);
+          }
         }
       })();
     });

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { ChevronRight, ChevronDown, File, Folder, RefreshCw, Plus, Trash2, FolderPlus, Search, X, Eye, Copy, FolderOpen, Pencil, Clipboard, ClipboardPaste, CopyPlus } from 'lucide-react';
+import { ChevronRight, ChevronDown, File, FileCode, Folder, RefreshCw, Plus, Trash2, FolderPlus, Search, X, Eye, Copy, FolderOpen, Pencil, Clipboard, ClipboardPaste, CopyPlus } from 'lucide-react';
 import { useTree } from '@headless-tree/react';
 import { asyncDataLoaderFeature, selectionFeature, hotkeysCoreFeature, expandAllFeature } from '@headless-tree/core';
 import type { ItemInstance } from '@headless-tree/core';
@@ -8,10 +8,10 @@ import { ExplorerPanelState } from '../../../../../shared/types/panels';
 import { isMac, isWindows } from '../../../utils/platformUtils';
 import { formatKeyDisplay } from '../../../utils/hotkeyUtils';
 import { TerminalPopover, PopoverButton } from '../../terminal/TerminalPopover';
-import { areKeyboardShortcutsEnabled, useConfigStore } from '../../../stores/configStore';
+import { areKeyboardShortcutsEnabled, htmlFileOpenModeOf, useConfigStore } from '../../../stores/configStore';
 import { LiveRegion } from '../../ui/LiveRegion';
 import { boundary, decodeBoundary } from '../../../../../shared/validation/boundaryDecoder';
-import { isHtmlFile } from './htmlFile';
+import { explorerOpenAction, isHtmlFile } from './htmlFile';
 import { previewHtmlFileInBrowser } from './previewHtmlFile';
 import { editorPanelState, openFileInEditor } from '../../../services/openFileInEditor';
 import { usePanelStore } from '../../../stores/panelStore';
@@ -32,7 +32,8 @@ function containsEventTarget(container: Node, target: EventTarget | null): boole
 
 interface HeadlessFileTreeProps {
   sessionId: string;
-  onFileSelect: (file: FileItem | null) => void;
+  /** `click` is set for a person's click or Enter on a row, with the click event's `detail`. */
+  onFileSelect: (file: FileItem | null, click?: { clickCount: number }) => void;
   /** Double-click: open the file pinned (VS Code semantics). */
   onFileOpen?: (file: FileItem) => void;
   onFileCreateSelect?: (filePath: string) => void;
@@ -42,11 +43,14 @@ interface HeadlessFileTreeProps {
   initialShowSearch?: boolean;
   onTreeStateChange?: (state: { expandedDirs: string[]; searchQuery: string; showSearch: boolean }) => void;
   onHtmlPreview: (filePath: string) => void;
+  /** The context menu's "Open as file": the HTML file's editable source, whatever the setting. */
+  onHtmlOpenAsFile: (file: FileItem) => void;
   /** Window-level shortcuts (⌘F, rename, delete, clipboard) only while the tree is the visible panel. */
   shortcutsActive?: boolean;
 }
 
-function HeadlessFileTree({
+/** @public Mounted directly by tests/fixtures/file-tree-selection.tsx. */
+export function HeadlessFileTree({
   sessionId,
   onFileSelect,
   onFileOpen,
@@ -57,6 +61,7 @@ function HeadlessFileTree({
   initialShowSearch,
   onTreeStateChange,
   onHtmlPreview,
+  onHtmlOpenAsFile,
   shortcutsActive = true,
 }: HeadlessFileTreeProps) {
   // Cache stores loaded directory contents. Key = dirPath, Value = FileItem[].
@@ -891,7 +896,7 @@ function HeadlessFileTree({
                 type="button"
                 disabled={file.isDirectory}
                 className="flex min-w-0 flex-1 items-center px-2 py-1 text-left disabled:cursor-default"
-                onClick={() => onFileSelect(file)}
+                onClick={(e) => onFileSelect(file, { clickCount: e.detail })}
                 onDoubleClick={() => onFileOpen?.(file)}
               >
                 {file.isDirectory ? (
@@ -909,7 +914,7 @@ function HeadlessFileTree({
               {!file.isDirectory && isHtmlFile(file.path) && (
                 <button
                   type="button"
-                  onClick={() => onHtmlPreview(file.path)}
+                  onClick={(e) => { if (e.detail <= 1) onHtmlPreview(file.path); }}
                   className="p-1 mr-1 hover:bg-surface-hover rounded text-text-tertiary hover:text-text-primary"
                   title={`Preview ${file.name}`}
                   aria-label={`Preview ${file.name}`}
@@ -963,8 +968,8 @@ function HeadlessFileTree({
                 if (element) itemElementRefs.current.set(data.path, element);
                 else itemElementRefs.current.delete(data.path);
               }}
-              className={`flex items-center px-2 py-1 hover:bg-surface-hover cursor-default group ${
-                isItemSelected ? 'bg-interactive' : ''
+              className={`flex items-center px-2 py-1 cursor-default group ${
+                isItemSelected ? 'bg-interactive' : 'hover:bg-surface-hover'
               } ${
                 isOpenFile && !isItemSelected ? 'bg-surface-hover/60' : ''
               } ${
@@ -994,18 +999,15 @@ function HeadlessFileTree({
               }}
               onClick={(e) => {
                 e.stopPropagation();
-                if (e.metaKey || e.ctrlKey) {
-                  item.toggleSelect();
-                } else if (e.shiftKey) {
-                  item.selectUpTo(false);
-                } else {
-                  item.select();
-                }
-                if (isFolder) {
-                  if (isExpanded) item.collapse();
-                  else item.expand();
-                } else {
-                  onFileSelect(data);
+                // headless-tree writes the selection: plain click replaces it,
+                // cmd/ctrl toggles, shift ranges from the last plain click. It
+                // also expands or collapses a folder on a plain click.
+                treeItemProps.onClick?.(e);
+                // Opening a file moves the active editor path, whose effect above
+                // resets the selection, so only a plain click opens.
+                if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+                if (!isFolder) {
+                  onFileSelect(data, { clickCount: e.detail });
                 }
               }}
               onKeyDown={(e) => {
@@ -1015,7 +1017,7 @@ function HeadlessFileTree({
                     if (isExpanded) item.collapse();
                     else item.expand();
                   } else {
-                    onFileSelect(data);
+                    onFileSelect(data, { clickCount: 0 });
                   }
                 }
               }}
@@ -1026,23 +1028,23 @@ function HeadlessFileTree({
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                if (!item.isSelected()) item.select();
+                if (!item.isSelected()) tree.setSelectedItems([item.getId()]);
                 setContextMenu({ x: e.clientX, y: e.clientY, file: data });
               }}
             >
               {isFolder ? (
                 <>
                   {isExpanded ? (
-                    <ChevronDown className="w-4 h-4 mr-1 text-text-tertiary" />
+                    <ChevronDown className={`w-4 h-4 mr-1 ${isItemSelected ? 'text-text-on-interactive' : 'text-text-tertiary'}`} />
                   ) : (
-                    <ChevronRight className="w-4 h-4 mr-1 text-text-tertiary" />
+                    <ChevronRight className={`w-4 h-4 mr-1 ${isItemSelected ? 'text-text-on-interactive' : 'text-text-tertiary'}`} />
                   )}
-                  <Folder className="w-4 h-4 mr-2 text-interactive" />
+                  <Folder className={`w-4 h-4 mr-2 ${isItemSelected ? 'text-text-on-interactive' : 'text-interactive'}`} />
                 </>
               ) : (
                 <>
                   <div className="w-4 h-4 mr-1" />
-                  <File className="w-4 h-4 mr-2 text-text-tertiary" />
+                  <File className={`w-4 h-4 mr-2 ${isItemSelected ? 'text-text-on-interactive' : 'text-text-tertiary'}`} />
                 </>
               )}
               {renamingPath === data.path ? (
@@ -1071,7 +1073,7 @@ function HeadlessFileTree({
                   className="flex-1 min-w-0 px-1 py-0.5 bg-surface-primary border border-interactive rounded text-sm text-text-primary focus:outline-none"
                 />
               ) : (
-                <span className="flex-1 text-sm truncate text-text-primary">{data.name}</span>
+                <span className={`flex-1 text-sm truncate ${isItemSelected ? 'text-text-on-interactive' : 'text-text-primary'}`}>{data.name}</span>
               )}
               {isFolder && (
                 <button
@@ -1091,7 +1093,7 @@ function HeadlessFileTree({
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
-                    onHtmlPreview(data.path);
+                    if (e.detail <= 1) onHtmlPreview(data.path);
                   }}
                   className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-1 hover:bg-surface-hover rounded text-text-tertiary hover:text-text-primary"
                   title={`Preview ${data.name}`}
@@ -1120,6 +1122,23 @@ function HeadlessFileTree({
         y={contextMenu?.y ?? 0}
         onClose={() => setContextMenu(null)}
       >
+        {contextMenu?.file && !contextMenu.file.isDirectory && isHtmlFile(contextMenu.file.path) && (
+          <>
+            <PopoverButton onClick={() => { if (contextMenu.file) { onHtmlPreview(contextMenu.file.path); setContextMenu(null); } }}>
+              <span className="flex items-center gap-2">
+                <Eye className="w-4 h-4" />
+                Open preview in browser
+              </span>
+            </PopoverButton>
+            <PopoverButton onClick={() => { if (contextMenu.file) { onHtmlOpenAsFile(contextMenu.file); setContextMenu(null); } }}>
+              <span className="flex items-center gap-2">
+                <FileCode className="w-4 h-4" />
+                Open as file
+              </span>
+            </PopoverButton>
+            <div className="my-1 border-t border-border-primary" />
+          </>
+        )}
         <PopoverButton onClick={() => openCreateDialog('file', contextMenu?.file ?? null)}>
           <span className="flex items-center gap-2">
             <Plus className="w-4 h-4" />
@@ -1246,11 +1265,6 @@ export function FileEditor({ sessionId, initialState, onStateChange, shortcutsAc
     }
   }, [sessionId]);
 
-  const handleFileSelect = useCallback((file: FileItem | null) => { void openFile(file, false); }, [openFile]);
-  const handleFileOpen = useCallback((file: FileItem) => {
-    void openFile(file, true);
-  }, [openFile]);
-
   const previewHtmlFile = useCallback(async (filePath: string) => {
     setError(null);
     try {
@@ -1259,6 +1273,24 @@ export function FileEditor({ sessionId, initialState, onStateChange, shortcutsAc
       setError(previewError instanceof Error ? previewError.message : 'Failed to preview HTML file');
     }
   }, [sessionId]);
+
+  // A person's clicks follow the "Open HTML files" setting; other selections
+  // (a new or renamed file) open the editor.
+  const htmlFileOpenMode = useConfigStore((state) => htmlFileOpenModeOf(state.config));
+  const openFromExplorer = useCallback((file: FileItem, gesture: { clickCount: number; doubleClick: boolean }) => {
+    const action = explorerOpenAction(file.path, htmlFileOpenMode, gesture);
+    if (action === 'preview') void previewHtmlFile(file.path);
+    else if (action === 'editor') void openFile(file, gesture.doubleClick);
+  }, [htmlFileOpenMode, openFile, previewHtmlFile]);
+
+  const handleFileSelect = useCallback((file: FileItem | null, click?: { clickCount: number }) => {
+    if (file && !file.isDirectory && click) openFromExplorer(file, { clickCount: click.clickCount, doubleClick: false });
+    else void openFile(file, false);
+  }, [openFile, openFromExplorer]);
+  const handleFileOpen = useCallback((file: FileItem) => {
+    openFromExplorer(file, { clickCount: 2, doubleClick: true });
+  }, [openFromExplorer]);
+  const openHtmlAsFile = useCallback((file: FileItem) => { void openFile(file, true); }, [openFile]);
 
   const handleTreeStateChange = useCallback((treeState: { expandedDirs: string[]; searchQuery: string; showSearch: boolean }) => {
     onStateChange?.(treeState);
@@ -1285,6 +1317,7 @@ export function FileEditor({ sessionId, initialState, onStateChange, shortcutsAc
           initialShowSearch={initialState?.showSearch}
           onTreeStateChange={handleTreeStateChange}
           onHtmlPreview={previewHtmlFile}
+          onHtmlOpenAsFile={openHtmlAsFile}
           shortcutsActive={shortcutsActive}
         />
       </div>

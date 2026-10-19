@@ -273,10 +273,27 @@ working while a review is pending.
 
 A worker's `runpane report` is its hand-back, like a background subagent's
 result. Watch for it by adding `agent.report` to `--kinds`; watchers that
-don't list it never receive it. Each REPORT line
+don't list it never receive it, except a Session watch. A report arrives from
+any tab, a shell tab or a wrapper launch whose agent isn't detected yet
+included. Each REPORT line
 (`REPORT <pane> pane <pane-id> panel <panel-id> ready pr#747 fc5dce9`, or
 `... blocked: <question>`) arrives at once, skipping the `--min-interval`
 batch.
+
+To wait for a report outside the Session watch (a Pane with no Session, or a
+harness that wakes only when a process exits, such as a background Bash task),
+run this as a background task. It exits with the event's line; act on it, then
+run it again. The named cursor means nothing is missed between runs:
+
+```bash
+runpane watch --pane <pane-id> --as <your-name> --until-event --json --kinds agent.report,agent.blocked,panel.exited,pane.gone
+```
+
+Run `--follow` through a monitor that delivers each output line to the agent; merely backgrounding it is insufficient when the harness only notifies on process exit.
+
+Never pipe `runpane watch --follow` into `grep -m1` or `head` to wait:
+`--follow` streams until quiet expiry; `--until-event` ends on news. The worker's `runpane report` output says
+whether anyone received it (`Delivered to 1 waiting watcher.`).
 
 - Treat a REPORT as the completion signal. Read the whole report (state, PR,
   head, summary up to 16,000 characters, `summaryPath`, question) with
@@ -318,3 +335,65 @@ PR state GitHub can't confirm (`pr-status-unknown`), and gives every other
 kept Pane a `skipped.code` with the next step. Adopted worktrees are kept unless
 you add `--remove-worktree`. Local branches are always kept. Never add
 `--force` to discard work without the user's approval.
+
+### Watching a PR from any Pane
+
+```bash
+runpane pr watch --pane <pane-id> --url https://github.com/owner/repo/pull/123 --head <full-sha> --json
+runpane watch --pane <pane-id> --since <generation-returned-above> --epoch <epoch-returned-above> --until-event --json --kinds pr.checks,pr.conflicted,pr.head,pr.review,pr.comment,pr.closed,pr.merged,pr.stopped,github.unavailable,github.recovered
+runpane pr list --pane <pane-id> --json
+runpane pr unwatch --pane <pane-id> --url https://github.com/owner/repo/pull/123 --json
+```
+
+Inside a Pane, registration defaults to its `PANE_SESSION_ID`. Registration
+returns `generation` and `epoch`; use both for the first wait, including events
+that arrived between registration and arming. An identical active registration
+retry returns its original generation, including after daemon restart, so a
+lost response cannot skip an unread event. A new head pin or unwatch/re-register
+starts a new registration. Process every returned NDJSON
+event, then persist its `gen` and `epoch`. Rearm with `--since <gen> --epoch
+<epoch>`; use `--limit 1` for one event per invocation. Never reuse the initial
+registration generation after delivering an event, and never combine `--as`
+with `--since` or `--epoch`. A named cursor is a separate daemon-managed mode.
+
+Ordinary daemon restarts preserve the epoch and unread retained events. On
+`_reset` or `_dropped`, resynchronize current GitHub state before accepting
+success, then persist the control record's `generation` and `epoch`. Ignore
+`replay`/`baseline` records as new events. Retention is bounded; a journal reset
+cannot recover lost history. A consumer crash before saving its cursor can
+replay an event, so actions must be idempotent. Registration uses the full
+host/repository/number identity. It pins success to `--head`, or the first
+observed head; a new head emits `pr.head` and needs a fresh registration before
+success can be reported. Read existing discussions before arming. A wake
+means inspect the change; it never authorizes merging.
+
+The daemon batches up to 25 fingerprints per host every two minutes (plus up
+to ten seconds of jitter), reads details on changes and at a 30-minute
+backstop, and keeps 10% of GitHub quota for interactive work. It uses `gh auth
+token` for cached authentication and direct GraphQL for reads. Session PR
+branch discovery still uses Pane's existing `gh pr list` lookup.
+
+Failures emit immediately, even while other checks run. Success requires a
+complete, nonempty set of checks on the pinned head and all required checks
+passing (all checks when none are marked required). BLOCKED/UNKNOWN merge
+status conservatively withholds success, including when reviews are missing.
+Feedback from every account is included: agents and people can share a login.
+Checks passing is a signal to inspect the PR, not proof of complete readiness;
+optional failures can still produce a separate failure event. Merge/close,
+eight non-rate-limit failures, or ten comment-only updates stop registration;
+archiving/deleting the Pane removes it. Rate limits pause instead of consuming
+the failure budget. Outages and recovery are journal events.
+
+Fingerprints include individual check outcomes and thread resolution state, so
+equal aggregate counts do not hide swaps or edits. When the fingerprint window
+is truncated (over 100 checks/discussion items or multiple comments in a review
+thread), the daemon reads details each round. Detail reads page through up to
+2,000 checks and retain the latest 100 comments, reviews, threads, and comments
+per thread. Truncated discussions emit `pr.review` with an incomplete-feedback
+reason and withhold success; read the full discussion on GitHub.
+
+Baselines and events are replaced atomically before readers wake. This prevents
+a process crash from advancing a baseline without its event. Delivery remains
+bounded by journal retention and cursor acknowledgments; replay after a consumer
+crash before acknowledgment is possible. This is not an exactly-once or
+power-loss durability guarantee.

@@ -1,3 +1,4 @@
+import { stageUpdateRuntime } from '../../../packages/runpane/src/updateRuntime';
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -48,6 +49,23 @@ describe('installRunpaneShim', () => {
     delete env.PANE_DIR;
     const result = spawnSync(state.shimPath, ['--version'], { encoding: 'utf8', env });
     expect(result.stdout.trim()).toBe(`pane-runpane ${appDirectory} --version`);
+  });
+
+  it('keeps an explicitly updated managed CLI when the older Pane starts again', () => {
+    install();
+    const cliRoot = path.join(appDirectory, 'bin', 'cli', 'requested');
+    fs.mkdirSync(cliRoot, { recursive: true });
+    const entrypoint = path.join(cliRoot, 'cli.cjs');
+    const runtime = stageUpdateRuntime(process.execPath, path.join(cliRoot, 'runtime'));
+    fs.writeFileSync(entrypoint, "console.log('requested-cli-version');\n");
+    fs.writeFileSync(path.join(appDirectory, 'bin', 'runpane-override.json'), JSON.stringify({ version: '9.9.9', entrypoint, runtime }));
+    const state = installRunpaneShim({ appDirectory, bundledCliPath, execPath: process.execPath });
+    expect(state).not.toBeNull();
+    const result = process.platform === 'win32'
+      ? spawnSync('cmd.exe', ['/d', '/s', '/c', `""${state!.shimPath}" --version"`], { encoding: 'utf8', windowsVerbatimArguments: true })
+      : spawnSync(state!.shimPath, ['--version'], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toBe('requested-cli-version');
   });
 
   it('rewrites only when content changes', () => {

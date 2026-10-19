@@ -1,12 +1,14 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { ArrowLeft, ArrowRight, RotateCw, Loader2, ChevronDown, Copy, Check } from 'lucide-react';
+import { ArrowLeft, ArrowRight, RotateCw, Loader2, ChevronDown, Copy, Check, FileCode } from 'lucide-react';
 import type { ToolPanel, BrowserPanelState } from '../../../../../shared/types/panels';
 import { cn } from '../../../utils/cn';
 import { panelApi } from '../../../services/panelApi';
 import { usePanelStore } from '../../../stores/panelStore';
-import { useSessionStore } from '../../../stores/sessionStore';
 import { useResizable } from '../../../hooks/useResizable';
-import { normalizeUrl } from './browserUrl';
+import { normalizeUrl, WEBVIEW_ALLOW_POPUPS, webviewPartition } from './browserUrl';
+import { BROWSER_NAVIGATE_EVENT, isSavedUrlRequest, navigateRequestAction, webviewSrcFor, worktreeFileOf, type BrowserNavigateRequest } from './browserNavigation';
+import { useSessionStore } from '../../../stores/sessionStore';
+import { openFileInEditor } from '../../../services/openFileInEditor';
 import { hasFileProtocol, localTargetOf, loopbackPortOf, remapLoopbackPort, type LocalTarget } from '../../../../../shared/utils/browserUrl';
 import { useListeningPorts } from '../../../hooks/useListeningPorts';
 import { useConfigStore } from '../../../stores/configStore';
@@ -32,7 +34,9 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
   const [devToolsOpen, setDevToolsOpen] = useState(false);
   const [fileSession, setFileSession] = useState<{ panelId: string; partition: string | null } | null>(null);
   const [copied, setCopied] = useState(false);
-  const ports = useListeningPorts();
+  const [portsRefreshKey, setPortsRefreshKey] = useState(0);
+  const ports = useListeningPorts(portsRefreshKey);
+  const retryPorts = () => setPortsRefreshKey(key => key + 1);
   // Null until the config loads: until then this desktop may be remote.
   const remoteMode = useConfigStore((state) => (state.config ? state.config.remoteDaemon?.client.mode === 'remote' : null));
   const isRemoteMode = remoteMode === true;
@@ -58,10 +62,17 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
   }, [remoteMode, ports]);
   const toHostUrl = useCallback((localUrl: string) => remapLoopbackPort(localUrl, localToHost), [localToHost]);
   const toHostUrlRef = useRef(toHostUrl);
+  // Navigation reads the current mapping without depending on it: a ports or
+  // remote-mode update recomputes where a URL loads but never navigates the tab.
+  const targetOfRef = useRef(targetOf);
   useEffect(() => {
     toHostUrlRef.current = toHostUrl;
-  }, [toHostUrl]);
+    targetOfRef.current = targetOf;
+  }, [toHostUrl, targetOf]);
   const target = targetOf(url);
+  const [webviewSrc, setWebviewSrc] = useState<{ url: string; src: string } | null>(null);
+  const nextWebviewSrc = webviewSrcFor(url, target, webviewSrc);
+  if (nextWebviewSrc !== webviewSrc) setWebviewSrc(nextWebviewSrc);
   const tunnelHost = isRemoteMode && target.kind === 'load' && loopbackPortOf(url) !== null && !ports?.unsupportedHost
     ? ports?.host
     : undefined;
@@ -77,14 +88,29 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
   const persistTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const panelIdRef = useRef(panel.id);
   const remoteFileRef = useRef<boolean | null>(null);
+  // The host URL of the page the guest is showing, from its last navigation.
   const lastNavigationUrlRef = useRef(currentUrlFromPanelState);
+  const [shownUrl, setShownUrl] = useState(currentUrlFromPanelState);
+  const worktreePath = useSessionStore((state) => (
+    state.sessions.find(session => session.id === panel.sessionId)
+    ?? (state.activeMainRepoSession?.id === panel.sessionId ? state.activeMainRepoSession : undefined)
+  )?.worktreePath);
+  const sourceFile = worktreeFileOf(shownUrl, worktreePath);
   const sourceUrlRef = useRef('');
+  // A URL this tab asked the guest to load whose navigation hasn't landed yet.
+  const pendingLoadRef = useRef<string | null>(null);
+  // Pages this tab saved whose panel update hasn't come back yet.
+  const pendingEchoesRef = useRef(new Set<string>());
+  const savedUrlRef = useRef(currentUrlFromPanelState);
+  useEffect(() => {
+    savedUrlRef.current = currentUrlFromPanelState;
+  }, [currentUrlFromPanelState]);
 
   // Ask main before mounting a file webview: remote host paths must never be
   // loaded from this computer, even briefly while connection state is fetched.
   useEffect(() => {
     if (!isFileUrl && !isHostFileUrl) {
-      // A host-authored HTTP panel uses ordinary project cookies and writes.
+      // A host-authored HTTP panel uses the shared login store and ordinary writes.
       // Client-only links away from a file keep the host's file entry grant.
       remoteFileRef.current = false;
       setFileSession(null);
@@ -111,13 +137,6 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
 
   const addPanel = usePanelStore((state) => state.addPanel);
   const setActivePanelInStore = usePanelStore((state) => state.setActivePanel);
-
-  // Look up the project ID for this session so all browser panels in the same project
-  // share a single partition (cookies, localStorage, auth state persist across sessions).
-  const projectId = useSessionStore((state) => {
-    const session = state.sessions.find(s => s.id === panel.sessionId);
-    return session?.projectId;
-  });
 
   // Resizable DevTools column
   const { width: devToolsWidth, startResize: startDevToolsResize } = useResizable({
@@ -163,6 +182,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
     // the access boundary instead of replacing it with a link/directory URL.
     if (remoteFileRef.current !== false) return;
     persistTimeoutRef.current = setTimeout(() => {
+      if (newUrl !== savedUrlRef.current) pendingEchoesRef.current.add(newUrl);
       window.electron?.invoke('panels:update', panelIdRef.current, {
         state: { customState: { currentUrl: newUrl } }
       });
@@ -184,11 +204,11 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
     setUrlError('');
     setIsLoading(true);
     const webview = webviewRef.current;
-    if (webview && sourceUrlRef.current === normalized && lastNavigationUrlRef.current !== normalized) {
+    if (webview && sourceUrlRef.current === normalized && lastNavigationUrlRef.current !== normalized && pendingLoadRef.current !== normalized) {
       // Following a link changes the guest URL without changing its src attribute.
       // An explicit return to that src still needs a navigation request.
       try {
-        const normalizedTarget = targetOf(normalized);
+        const normalizedTarget = targetOfRef.current(normalized);
         if (normalizedTarget.kind === 'load') {
           void webview.loadURL(normalizedTarget.url).catch(() => setUrlError('Unable to load this page'));
         }
@@ -196,11 +216,12 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
         // Before dom-ready, the initial src load is already targeting this URL.
       }
     }
+    if (lastNavigationUrlRef.current !== normalized) pendingLoadRef.current = normalized;
     sourceUrlRef.current = normalized;
     setUrl(normalized);
     setInputUrl(normalized);
     persistState(normalized);
-  }, [persistState, targetOf]);
+  }, [persistState]);
 
   useEffect(() => {
     // A navigation's debounced persistence is an echo, not a new load request.
@@ -208,7 +229,11 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
     // A host changing its file entry to HTTP also changes the guest's session,
     // even if the client already followed a link to that exact HTTP page.
     const endsRemoteFileSession = Boolean(fileSession?.partition) && !isHostFileUrl;
-    if (!currentUrlFromPanelState || (currentUrlFromPanelState === lastNavigationUrlRef.current && !endsRemoteFileSession)) return;
+    const requested = isSavedUrlRequest(currentUrlFromPanelState, {
+      shownUrl: lastNavigationUrlRef.current,
+      pendingEchoes: pendingEchoesRef.current,
+    });
+    if (!currentUrlFromPanelState || (!requested && !endsRemoteFileSession)) return;
     navigateTo(currentUrlFromPanelState);
   }, [currentUrlFromPanelState, isHostFileUrl, fileSession?.partition, navigateTo]);
 
@@ -316,6 +341,12 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
     }, (error: Error) => console.error('[BrowserPanel] Failed to copy URL:', error));
   };
 
+  const handleViewSource = () => {
+    if (!sourceFile) return;
+    openFileInEditor({ sessionId: panel.sessionId, filePath: sourceFile, pin: true })
+      .catch((error: Error) => setUrlError(error.message || 'Unable to open this file'));
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     navigateTo(inputUrl);
@@ -336,8 +367,10 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
 
     const onDidNavigate = () => {
       const currentUrl = toHostUrlRef.current(webview.getURL());
+      pendingLoadRef.current = null;
       if (currentUrl && currentUrl !== 'about:blank') {
         lastNavigationUrlRef.current = currentUrl;
+        setShownUrl(currentUrl);
         setInputUrl(currentUrl);
         persistState(currentUrl);
       }
@@ -353,6 +386,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
       setUrlError(`Unable to load this page: ${event.errorDescription}`);
     };
     const onDidStopLoading = () => {
+      pendingLoadRef.current = null;
       setIsLoading(false);
       setCanGoBack(webview.canGoBack());
       setCanGoForward(webview.canGoForward());
@@ -405,29 +439,22 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
     return () => window.removeEventListener('browser-panel:popup-requested', handler);
   }, [panel.id, panel.sessionId, addPanel, setActivePanelInStore]);
 
-  // Listen for browser-panel:navigate CustomEvents (e.g., from SelectionPopover "Open in Browser")
-  // Uses stopImmediatePropagation so only the first browser panel for a session handles the event,
-  // preventing duplicate navigation when multiple browser panels exist.
-  // Also auto-focuses this browser panel so the user sees the navigated page immediately.
+  // Navigate requests (terminal links, "Open in Browser") name the tab they target;
+  // only that tab acts, and it takes focus so the person sees the page.
   useEffect(() => {
     const handler = (e: Event) => {
-      // SAFETY: The registered DOM/custom-event source establishes this target and detail shape.
-      const customEvent = e as CustomEvent<{ url: string; sessionId: string }>;
-      if (customEvent.detail.sessionId === panel.sessionId) {
-        e.stopImmediatePropagation();
-        if (customEvent.detail.url === url) {
-          webviewRef.current?.reload();
-        } else {
-          navigateTo(customEvent.detail.url);
-        }
-        // Auto-focus this browser panel
-        setActivePanelInStore(panel.sessionId, panel.id);
-        panelApi.setActivePanel(panel.sessionId, panel.id).catch(() => {});
-      }
+      // SAFETY: requestBrowserNavigation is the only sender of this event.
+      const request = (e as CustomEvent<BrowserNavigateRequest>).detail;
+      const action = navigateRequestAction(request, { panelId: panel.id, sessionId: panel.sessionId, shownUrl: lastNavigationUrlRef.current });
+      if (action === 'ignore') return;
+      if (action === 'reload') webviewRef.current?.reload();
+      else navigateTo(request.url);
+      setActivePanelInStore(panel.sessionId, panel.id);
+      panelApi.setActivePanel(panel.sessionId, panel.id).catch(() => {});
     };
-    window.addEventListener('browser-panel:navigate', handler);
-    return () => window.removeEventListener('browser-panel:navigate', handler);
-  }, [panel.sessionId, panel.id, setActivePanelInStore, navigateTo, url]);
+    window.addEventListener(BROWSER_NAVIGATE_EVENT, handler);
+    return () => window.removeEventListener(BROWSER_NAVIGATE_EVENT, handler);
+  }, [panel.sessionId, panel.id, setActivePanelInStore, navigateTo]);
 
   // Hide/show DevTools overlay when switching between panel tabs.
   // Close the WebContentsView when inactive so it doesn't cover other panels,
@@ -548,6 +575,20 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
         >
           {copied ? <Check className="w-3.5 h-3.5 text-status-success" /> : <Copy className="w-3.5 h-3.5" />}
         </button>
+        {sourceFile && (
+          <button
+            type="button"
+            onClick={handleViewSource}
+            className={cn(
+              'flex flex-shrink-0 items-center gap-1 rounded border border-border-primary px-2 py-1 text-xs text-text-secondary',
+              'transition-colors hover:bg-surface-hover hover:text-text-primary'
+            )}
+            title={`Open ${sourceFile} in the editor`}
+          >
+            <FileCode className="h-3 w-3" />
+            View source
+          </button>
+        )}
         {url && (
           <Dropdown
             className="flex-shrink-0"
@@ -560,6 +601,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
                 snapshot={ports}
                 currentPort={loopbackPortOf(inputUrl)}
                 canOpen={onHost}
+                onRetry={retryPorts}
                 onOpen={port => {
                   close();
                   openPort(port);
@@ -605,7 +647,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
                 : 'Open a web port here, or enter a URL above.'}
             </p>
             <div className="mt-2">
-              <PortsList snapshot={ports} canOpen={onHost} onOpen={openPort} />
+              <PortsList snapshot={ports} canOpen={onHost} onOpen={openPort} onRetry={retryPorts} />
             </div>
           </div>
         </div>
@@ -629,12 +671,12 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
               </p>
             </div>
           )}
-          {target.kind === 'load' && ((!isFileUrl && !isHostFileUrl) || fileSession?.panelId === panel.id) && <webview
+          {nextWebviewSrc && ((!isFileUrl && !isHostFileUrl) || fileSession?.panelId === panel.id) && <webview
             key={fileSession?.partition ?? 'local'}
             ref={webviewRef}
-            src={target.url}
-            partition={fileSession?.partition ?? `persist:project-${projectId ?? panel.sessionId}`}
-            allowpopups
+            src={nextWebviewSrc.src}
+            partition={webviewPartition(fileSession)}
+            {...WEBVIEW_ALLOW_POPUPS}
             className="flex-1 border-0"
             style={{ display: 'inline-flex' }}
           />}

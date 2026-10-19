@@ -67,7 +67,8 @@ Agent status (working, idle, blocked) is derived in
 
 `FileEditorView.tsx` routes editor tabs from the Files inspector, terminal links,
 and `runpane panels open --file` using `shared/utils/filePreview.ts`. Supported
-formats open read-only; ordinary code and text retain the editor and auto-save.
+formats open read-only; ordinary code and text, HTML included, retain the editor
+and auto-save.
 Images, PDFs, fonts, video and audio load through `pane-media`, registered in
 `main/src/services/mediaPreview.ts`. A revocable URL grants access to one file;
 each request rechecks the existing worktree/symlink boundary through
@@ -79,10 +80,17 @@ route with the same boundary check and byte ranges. Archive and SQLite listings
 copies the file to a temporary folder on that desktop and opens the copy;
 "Reveal in folder" appears only on the host.
 
-Markdown, HTML, CSV/TSV and structured text fetch at most 1 MiB. Markdown renders
-with a source toggle. HTML displays as read-only source, so markup, links and
-resource references remain inert; use `panels open --url` for an intentional
-live browser tab.
+HTML is not a preview format. Clicking an `.html`/`.htm` file in the Explorer,
+or its Eye button, opens it rendered in a browser tab: the tab already showing
+that file, or else a new one (a tab showing anything else is never retargeted).
+The "Open HTML files" setting (Settings → General) switches Explorer clicks to
+editable source, and an HTML file's right-click menu offers both "Open preview
+in browser" and "Open as file". A browser tab showing a worktree file offers
+"View source", and an HTML editor tab offers "Preview", which works like a click. `panels open --file` always
+opens the source; `--url file://...` renders.
+
+Markdown, CSV/TSV and structured text fetch at most 1 MiB. Markdown renders
+with a source toggle.
 Tables display at most 500 data rows and 100 columns. JSON/JSONL are formatted;
 YAML/TOML retain source formatting in read-only Monaco with folding. Fonts use
 a temporary FontFace specimen. Decode failures offer system open/reveal actions.
@@ -112,8 +120,11 @@ Preview components never enter the editable auto-save path, even on errors.
 - `config.json` holds app settings (`main/src/services/configManager.ts`,
   types in `main/src/types/config.ts`).
 - Worktrees go in `<repo>/worktrees/` unless the project sets another folder
-  (`worktreeManager.ts`). `worktreePoolManager.ts` keeps empty reserve
-  worktrees on `_reserve/<hex>` branches so new panes open fast.
+  (`worktreeManager.ts`). A worktree on a remote-tracking base fetches that
+  branch first (`worktreeBaseRefresh.ts`: capped at about 10 s, shared by
+  concurrent creates, never fails the create). `worktreePoolManager.ts` keeps
+  empty reserve worktrees on `_reserve/<hex>` branches so new panes open fast;
+  a reserve is only claimed while its base ref still points at its commit.
 - Archive cleanup intents live in SQLite's `archive_cleanup_jobs`, atomically
   committed with the session archive flag. `ArchiveCleanupManager` resumes only
   those intents, validates physical directory/Git identity, and serializes work

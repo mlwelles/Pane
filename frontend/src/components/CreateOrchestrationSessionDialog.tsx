@@ -148,7 +148,7 @@ export function OrchestrationSessionForm({ isOpen, onClose, onCreate, header, on
         launchCommand,
         profile,
         customResume,
-        runtime: wslDistribution ? 'wsl' : 'windows',
+        runtime: wslDistribution ? 'wsl' : undefined,
         wslDistribution: wslDistribution || undefined,
         isPinned: startPinned,
       });

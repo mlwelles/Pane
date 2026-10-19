@@ -84,13 +84,14 @@ export async function runAgentsStart(parsed: ParsedArgs): Promise<number> {
     print(parsed, queued, `Created ${queued.name ?? queued.paneId}: ${queued.link}\n${item.setupQueue.message}\n${queued.next}`);
     return 0;
   }
-  if (!item || !item.ok || !item.sessionId || !item.panelId) {
+  // An item can be created yet not ok (agent not ready, prompt unverified); only a missing panel is a failure to start.
+  if (!item || 'error' in item || !item.sessionId || !item.panelId) {
     const reason = item && 'error' in item ? item.error.message : 'Pane did not report a created panel.';
     throw new Error(`Could not start the agent: ${reason}`);
   }
   const newPaneId = item.sessionId;
   const ready = item.readiness?.ok ?? false;
-  const promptDelivered = item.initialInput?.delivered ?? false;
+  const promptDelivered = isPromptDelivered(item.initialInput);
   const result = {
     ok: ready && promptDelivered,
     paneId: newPaneId,
@@ -122,7 +123,7 @@ async function startAgentInPane(parsed: ParsedArgs, paneId: string): Promise<num
     throw new Error(`Could not open the agent as a tab in Pane ${paneId}: ${reason} Nothing else was changed. Check the Pane id with \`runpane panes list --json\`; if the work's branch has no Pane yet, start it with --repo and --name instead.`);
   }
   const ready = created.readiness?.ok ?? false;
-  const promptDelivered = created.initialInput?.delivered ?? false;
+  const promptDelivered = isPromptDelivered(created.initialInput);
   const result = {
     ok: ready && promptDelivered,
     paneId,
@@ -221,4 +222,9 @@ async function resolveAgentPanel(parsed: ParsedArgs): Promise<{ paneId: string; 
 
 function print<Result>(parsed: ParsedArgs, result: Result, text: string): void {
   console.log(parsed.json ? JSON.stringify(result, null, 2) : text);
+}
+
+/** A task prompt counts as delivered when Pane verified it, or sent it to an agent it cannot verify (Cursor, OpenCode). */
+function isPromptDelivered(input: { submitted: boolean; verifiedSubmitted?: boolean; verification?: string } | undefined): boolean {
+  return Boolean(input && (input.verifiedSubmitted === true || (input.verification === 'unverifiable' && input.submitted)));
 }

@@ -1,4 +1,4 @@
-import { customCommandResumeSchema, type CustomCommandResume } from '../../../shared/types/customCommandResume';
+import { customCommandResumeSchema, effectiveCustomResume, type CustomCommandResume } from '../../../shared/types/customCommandResume';
 /**
  * Session management for Pane.
  * Note: "Sessions" are called "Panes" in the UI. Internally they remain
@@ -1498,7 +1498,7 @@ export class SessionManager extends EventEmitter {
             const customState: TerminalPanelState = { ...terminalCustomState(state.customState), ...termState };
             const agentType = customState.agentType ?? resolveAgentTypeFromCommand(customState.initialCommand);
 
-            if (!isCliAgentType(agentType) && !customState.customResume) {
+            if (!isCliAgentType(agentType) && !effectiveCustomResume(customState)) {
               continue;
             }
             customState.agentType = agentType;

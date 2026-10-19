@@ -3,6 +3,7 @@ import type { Terminal } from '@xterm/xterm';
 import type { LinkProviderConfig } from '../linkProviders/types';
 import { registerAllLinkProviders } from '../linkProviders';
 import { panelApi } from '../../../services/panelApi';
+import { requestBrowserNavigation } from '../../panels/browser/browserNavigation';
 import { openFileInEditor } from '../../../services/openFileInEditor';
 import { usePanelStore } from '../../../stores/panelStore';
 import { useConfigStore } from '../../../stores/configStore';
@@ -253,9 +254,7 @@ export function useTerminalLinks(terminal: Terminal | null, config: UseTerminalL
     setActivePanelInStore(config.sessionId, browserPanel.id);
     await panelApi.setActivePanel(config.sessionId, browserPanel.id);
 
-    window.dispatchEvent(new CustomEvent('browser-panel:navigate', {
-      detail: { url, sessionId: config.sessionId },
-    }));
+    requestBrowserNavigation({ url, sessionId: config.sessionId, panelId: browserPanel.id });
   }, [config.sessionId, addPanel, setActivePanelInStore, updatePanelState]);
 
   const closeTooltip = useCallback(() => {

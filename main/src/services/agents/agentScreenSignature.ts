@@ -33,6 +33,8 @@ function isRule(line: string | undefined): boolean {
 interface ClaudeComposerBox {
   composer: AgentComposerState;
   closed: boolean;
+  /** The held lines, joined by newlines; empty when the composer holds nothing. */
+  heldText: string;
   /** Rows of the prompt line and any held lines below it. */
   rows: { start: number; end: number };
 }
@@ -50,6 +52,7 @@ function findClaudeComposerBox(lines: readonly string[]): ClaudeComposerBox | un
     return {
       composer: { isPresent: true, hasUndeliveredText: held.some(line => line.length > 0) },
       closed: closingRule >= 0,
+      heldText: held.filter(line => line.length > 0).join('\n'),
       rows: { start: index, end },
     };
   }
@@ -73,23 +76,39 @@ function detectClaudeComposer(text: string, layers: ComposerScreenLayers): Agent
   return withGhostText(box.composer, ghostTextOnRows(layers.ghostText, box.rows.start, box.rows.end));
 }
 
-function detectCodexComposer(text: string, layers: ComposerScreenLayers): AgentComposerState {
-  if (CODEX_LOADING_HEADER.test(text)) return NO_COMPOSER;
+interface CodexPrompt {
+  row: number;
+  /** The prompt line's text, or '' when it is empty or shows the placeholder. */
+  heldText: string;
+}
 
-  const lines = screenLines(layers.typedText ?? text);
+// Codex's composer is its bottom `›` prompt line.
+function findCodexPrompt(lines: readonly string[]): CodexPrompt | undefined {
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const match = lines[index].match(/^[›❯]\s*(.*)$/u);
     if (!match) continue;
 
     const content = match[1].trim();
     const isPlaceholder = /^ask codex to do anything[.!]?$/iu.test(content);
+    return { row: index, heldText: isPlaceholder ? '' : content };
+  }
+  return undefined;
+}
+
+const CODEX_PASTED_CONTENT = /\[Pasted Content[^\]]*\]/iu;
+
+function detectCodexComposer(text: string, layers: ComposerScreenLayers): AgentComposerState {
+  if (CODEX_LOADING_HEADER.test(text)) return NO_COMPOSER;
+
+  const prompt = findCodexPrompt(screenLines(layers.typedText ?? text));
+  if (prompt) {
     return withGhostText({
       isPresent: true,
-      hasUndeliveredText: content.length > 0 && !isPlaceholder,
-    }, ghostTextOnRows(layers.ghostText, index, index + 1));
+      hasUndeliveredText: prompt.heldText.length > 0,
+    }, ghostTextOnRows(layers.ghostText, prompt.row, prompt.row + 1));
   }
 
-  const hasPastedContent = /\[Pasted Content[^\]]*\]/iu.test(text);
+  const hasPastedContent = CODEX_PASTED_CONTENT.test(text);
   return {
     isPresent: hasPastedContent,
     hasUndeliveredText: hasPastedContent,
@@ -105,6 +124,24 @@ export function detectAgentComposer(
   if (agentType === 'claude') return detectClaudeComposer(text, layers);
   if (agentType === 'codex') return detectCodexComposer(text, layers);
   return NO_COMPOSER;
+}
+
+/**
+ * The text held in a known agent's composer, read the way detectAgentComposer
+ * reads it (typed cells only when the layers are given), or undefined when
+ * hasUndeliveredText would be false.
+ */
+export function readAgentComposerText(
+  text: string,
+  agentType: CliAgentType | undefined,
+  layers: ComposerScreenLayers = {},
+): string | undefined {
+  const lines = screenLines(layers.typedText ?? text);
+  if (agentType === 'claude') return findClaudeComposerBox(lines)?.heldText || undefined;
+  if (agentType !== 'codex' || CODEX_LOADING_HEADER.test(text)) return undefined;
+  const prompt = findCodexPrompt(lines);
+  if (prompt) return prompt.heldText || undefined;
+  return text.match(CODEX_PASTED_CONTENT)?.[0];
 }
 
 // Claude 2.1 lists queued messages above its composer with a `ctrl+x ctrl+s to

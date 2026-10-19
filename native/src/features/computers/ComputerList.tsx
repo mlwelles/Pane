@@ -18,6 +18,7 @@ const STATE_TEXT = {
   available: 'Ready',
   'password-required': 'Needs password',
   outdated: 'Older Pane',
+  refused: 'Owner only',
   unreachable: 'Pane not open',
   offline: 'Offline',
 } satisfies Record<TailnetMachine['state'], string>;
@@ -54,7 +55,7 @@ export function ComputerList({ directory, header, onConnected, connected: isConn
 
   const renderItem = ({ item: machine }: { item: TailnetMachine }) => {
     const connected = isConnected && active?.tailnetMachine === machine.name && active.tailnetDomain === domain;
-    const connectable = machine.state !== 'offline' && machine.state !== 'unreachable';
+    const connectable = machine.state !== 'offline' && machine.state !== 'unreachable' && machine.state !== 'refused';
     const pending = connect.isPending && connect.variables?.machine.name === machine.name;
     // Ask for the password when the computer says it needs one, or rejected the last one.
     const askPassword = password?.name === machine.name

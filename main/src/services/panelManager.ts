@@ -80,7 +80,11 @@ class PanelManager {
     });
   }
   
-  async createPanel(request: CreatePanelRequest): Promise<ToolPanel> {
+  /**
+   * `hostFileGrant` is set only by host code that has already checked a file
+   * entry URL itself (`panels:open-html-file`); requests never carry it.
+   */
+  async createPanel(request: CreatePanelRequest, options: { hostFileGrant?: boolean } = {}): Promise<ToolPanel> {
     return await withLock(`panel-creation-${request.sessionId}`, async () => {
       // When user manually creates a panel, remove it from the closed panel types list
       // This allows auto-creation to work again in the future if they close it again and create a new session
@@ -107,7 +111,7 @@ class PanelManager {
         hasBeenViewed: false,
         customState
       };
-      assertHostBrowserFileNavigation(request.type, state);
+      if (!options.hostFileGrant) assertHostBrowserFileNavigation(request.type, state);
       
       // Create metadata (merge with any provided overrides)
       const metadata: ToolPanelMetadata = {

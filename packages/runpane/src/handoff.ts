@@ -5,7 +5,8 @@ import path from 'node:path';
 import { boundary, decodeBoundary } from './boundaryDecoder';
 import type { ParsedArgs, RunpaneAgent } from './commands';
 import { PaneDaemonClientError, resolvePaneDirectory, invokeDaemon, invokeRemoteDaemon } from './daemonClient';
-import { buildPaneCreateRequest, buildPanelCreateRequest, paneCreateResultSchema, panelCreateResultSchema, paneListResultSchema, repoListResultSchema } from './localControl';
+import { buildPaneCreateRequest, buildPanelCreateRequest, paneCreateResultSchema, panelCreateResultSchema, paneListResultSchema, repoListResultSchema, runpaneSessionListResultSchema, runpaneSessionResultSchema } from './localControl';
+import { RunpaneError } from './errors';
 import { RUNPANE_CONTRACT } from './generated/contract';
 import { readTailnet, resolveMachine, workspaceTarget, type TailnetMachine } from './workspace';
 
@@ -221,7 +222,7 @@ function tryGit(args: string[], cwd: string): string | null {
 
 function readGitState(cwd: string): GitState {
   const root = tryGit(['rev-parse', '--show-toplevel'], cwd);
-  if (!root) throw new Error('runpane handoff runs inside the git repository being handed off.');
+  if (!root) throw new Error('runpane handoff runs inside the git repository being handed off, or in a Session\'s terminal to hand off the Session. Nothing was sent.');
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
   if (branch === 'HEAD') throw new Error('HEAD is detached. Check out a branch before handing off.');
   const remote = tryGit(['config', `branch.${branch}.remote`], root) ?? 'origin';
@@ -427,13 +428,19 @@ interface HandoffResult {
   dryRun: boolean;
   destination: HandoffDestination & { name?: string; os?: Destination['os'] };
   note?: { path: string; sections: number; bytes: number };
-  git: { repository: string; branch: string; head: string; remote: string; pushed: boolean; dirty: number };
+  /** Absent on the Session route, which carries no git state. */
+  git?: { repository: string; branch: string; head: string; remote: string; pushed: boolean; dirty: number };
   warnings: string[];
   repo?: { id: number; name: string; path: string; environment: string };
   notePath?: string;
   pane?: { id: string; panelId?: string; name?: string; worktreePath?: string };
-  /** Where the receiver runs and why: a tab in the sender's Pane (same checkout) or its own new Pane. */
-  receiver?: { route: 'tab' | 'new-pane'; reason: string };
+  /** The Session the Session route created (no id on a dry run). */
+  session?: { id?: string; name: string; machine: string };
+  /**
+   * Where the receiver runs and why: a tab in the sender's Pane (same checkout), its own new Pane,
+   * or, from a Session's folder, a new Session on another machine.
+   */
+  receiver?: { route: 'tab' | 'new-pane' | 'session'; reason: string };
   reportBack?: string;
 }
 
@@ -486,6 +493,13 @@ export async function runHandoff(parsed: ParsedArgs): Promise<number> {
     say(step('note', `${noteInfo.sections} sections, ${formatBytes(noteInfo.bytes)}`));
   } else if (!parsed.dryRun) {
     throw new Error('runpane handoff needs --note-file <path>. Write it from: runpane handoff --template > ~/handoff.md');
+  }
+
+  // A Session's terminal sets PANE_ORCHESTRATION_SESSION_ID and a git ceiling, so its folder is
+  // never a checkout. Anywhere inside git, even in a Session terminal, keeps the Pane route below.
+  const sessionId = process.env.PANE_ORCHESTRATION_SESSION_ID;
+  if (sessionId && !tryGit(['rev-parse', '--show-toplevel'], cwd)) {
+    return handOffSession({ parsed, sessionId, destination, machines, self, origin: origin(null), noteText, noteInfo, warnings, say });
   }
 
   let state = withoutNote(readGitState(cwd), parsed.handoffNoteFile);
@@ -636,6 +650,114 @@ export async function runHandoff(parsed: ParsedArgs): Promise<number> {
   say(`Check on it: ${check}`);
   if (parsed.json) console.log(JSON.stringify(result, null, 2));
   return 0;
+}
+
+interface SessionHandoff {
+  parsed: ParsedArgs;
+  sessionId: string;
+  destination: HandoffDestination;
+  machines: TailnetMachine[];
+  self: string;
+  origin: NoteOrigin;
+  noteText?: string;
+  noteInfo?: HandoffResult['note'];
+  warnings: string[];
+  say(line: string): void;
+}
+
+/**
+ * The Session route. From a Session's folder there is no git to move, so the receiver is a new
+ * Session on another machine with the sender's name, goal and agent, and the note as its context
+ * and next action. Nothing is pushed or copied but the note, and the sender Session stays as it is.
+ * Like every Session, the receiver waits for its first message.
+ */
+async function handOffSession({ parsed, sessionId, destination, machines, self, origin, noteText, noteInfo, warnings, say }: SessionHandoff): Promise<number> {
+  const target = destination.machine ? machines.find((machine) => machine.name === destination.machine) : undefined;
+  if (!target) {
+    throw new RunpaneError(
+      'ERR_HANDOFF_SESSION_SAME_MACHINE',
+      `A Session hands off to another machine, and the destination is ${self}, the machine this Session is on. Nothing was sent.`,
+      `Name another of your machines: runpane handoff "${destination.agent} on <machine>" --note-file <note>. List them with: runpane workspace list`,
+    );
+  }
+  const { session: source } = await invokeDaemon('runpane:sessions:get', [{ sessionId }], runpaneSessionResultSchema, { paneDir: parsed.paneDir });
+  const remote = workspaceTarget(target);
+  const listed = await invokeRemoteDaemon(remote, 'runpane:sessions:list', [], runpaneSessionListResultSchema);
+  const name = nextFreeName(source.name, listed.sessions.map((session) => session.name));
+  if (parsed.handoffPush) warnings.push('--push does nothing from a Session: its folder is not a git checkout, so nothing was committed or pushed.');
+  const result: HandoffResult = {
+    ok: true,
+    dryRun: parsed.dryRun,
+    destination: { ...destination, name: target.name },
+    note: noteInfo,
+    warnings,
+    receiver: { route: 'session', reason: `A Session's folder has no branch to move, so the receiver is a new Session on ${target.name}.` },
+    session: { name, machine: target.name },
+  };
+  say(step('session', `"${source.name}" becomes "${name}" on ${target.name}`));
+  for (const warning of warnings) say(`  ! ${warning}`);
+  if (parsed.dryRun) {
+    say('Dry run: nothing was sent.');
+    if (parsed.json) console.log(JSON.stringify(result, null, 2));
+    return 0;
+  }
+
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
+  const slug = `handoff-${source.name}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 48).replace(/-+$/, '');
+  const stamped = stampNote(noteText ?? '', origin, sessionReceiverInstructions(origin, source.name, target.name));
+  const written = await invokeRemoteDaemon(remote, 'runpane:machine:write', [{ path: `~/.pane/handoffs/${stamp}-${slug}-${randomUUID()}.md`, content: stamped, encoding: 'utf8' }], writeResultSchema);
+  const notePath = written.path;
+  result.notePath = notePath;
+  say(step('note sent', notePath));
+
+  const launchCommand = agentCommand(destination, 'sh');
+  let created: ReturnType<typeof runpaneSessionResultSchema.decode>;
+  try {
+    created = await invokeRemoteDaemon(remote, 'runpane:sessions:create', [{
+      name,
+      agent: destination.agent,
+      goal: source.goal,
+      context: `Handed off from Session "${source.name}" on ${self}, which stays there. The sending agent's handoff note is at ${notePath} on this machine: read it first, including its "Receiver instructions".`,
+      nextAction: `Read the handoff note at ${notePath} and continue from it.`,
+      launchCommand,
+    }], runpaneSessionResultSchema, REPORT_TIMEOUT_MS);
+  } catch (error) {
+    throw new RunpaneError(
+      'ERR_HANDOFF_SESSION_CREATE',
+      `runpane sessions create failed on ${target.name}: ${error instanceof Error ? error.message : String(error)}. The note was sent to ${notePath}; no Session was confirmed.`,
+      `Check runpane workspace ${target.name} sessions list before retrying, so you don't create a duplicate Session.`,
+    );
+  }
+  result.session = { id: created.session.id, name: created.session.name, machine: target.name };
+  result.reportBack = origin.originPanel ? `${self} panel ${origin.originPanel}` : undefined;
+  say(step('created', `Session "${created.session.name}" on ${target.name}`));
+  say(`It waits for your first message: switch Pane to ${target.name}, open "${created.session.name}", and send "continue".`);
+  if (parsed.json) console.log(JSON.stringify(result, null, 2));
+  return 0;
+}
+
+/** Pane's numbering for a taken Session name: "<name> 2", "<name> 3", compared without case. */
+function nextFreeName(name: string, taken: readonly string[]): string {
+  const normalize = (value: string): string => value.trim().toLocaleLowerCase();
+  const names = new Set(taken.map(normalize));
+  let candidate = name;
+  for (let suffix = 2; names.has(normalize(candidate)); suffix += 1) candidate = `${name} ${suffix}`;
+  return candidate;
+}
+
+function sessionReceiverInstructions(origin: NoteOrigin, sender: string, receiverMachine: string): string {
+  const reportTarget = origin.originPanel
+    ? `runpane workspace ${origin.originMachine} panels submit --panel ${origin.originPanel} --text "<one line: what you finished, and anything blocked>" --yes`
+    : 'tell the person here, since the sender left no panel to report to';
+  return [
+    '## Receiver instructions',
+    '',
+    '<!-- Added by runpane handoff. -->',
+    `1. You are a new Session on ${receiverMachine}, continuing Session "${sender}" from ${origin.originMachine}. Only this note was sent: the sender's conversation, Session folder and Panes stay on ${origin.originMachine}.`,
+    `2. Read this whole note. To read a file it names from the sender's machine, run \`runpane workspace ${origin.originMachine} read <path>\`.`,
+    '3. Continue from "Next steps".',
+    `4. When you finish or get blocked, report back to the sender: ${reportTarget}`,
+  ].join('\n');
 }
 
 interface Receiver {

@@ -221,6 +221,7 @@ test('the server lists daemon and diagnostic commands but not installer commands
   assert.equal(tools.find((tool) => tool.name === 'repos_add').annotations.readOnlyHint, false);
   const watch = tools.find((tool) => tool.name === 'watch');
   assert.ok(!('follow' in watch.inputSchema.properties), 'watch must not offer --follow over MCP');
+  assert.ok(!('untilEvent' in watch.inputSchema.properties), 'watch must not offer --until-event over MCP');
 });
 
 test('a tool call returns the CLI JSON from the daemon', async () => {
@@ -613,7 +614,7 @@ test('agent tasks start, check on, and message an agent in one call each', async
         items: [{
           ok: true, index: 0, name: 'fix-login', pinned: true, sessionId: 'pane-7', panelId: 'panel-8', worktreePath: '/work/app-fix-login',
           readiness: { ok: true, condition: 'ready', matched: true, timedOut: false, elapsedMs: 900, state: { initialized: true } },
-          initialInput: { delivered: true, submitted: true, inputBytes: 17 },
+          initialInput: { delivered: true, submitted: true, inputBytes: 17, verifiedSubmitted: true, delivery: { state: 'taken', evidence: 'transcript' } },
         }],
       },
       'runpane:panels:list': { ok: true, paneId: 'pane-7', panels: [
@@ -681,6 +682,81 @@ test('panels_input presses named keys, so a model can answer a menu without raw 
         assert.match(unknown.content[0].text, /Unknown key "pagedown"\. Use enter, escape/);
       }, { args: [] });
       assert.deepEqual(requests.map((request) => request.args[0]), [{ panelId: 'panel-8', input: '\u001b[B\r' }]);
+    });
+  } finally {
+    fs.rmSync(paneDir, { recursive: true, force: true });
+  }
+});
+
+test('panels_resume restarts a stopped panel through the daemon and keeps the --yes rule', async () => {
+  const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runpane-mcp-'));
+  const panel = { id: 'panel-8', panelId: 'panel-8', paneId: 'pane-1', type: 'terminal', title: 'Claude Code', active: false, initialized: true, running: true, agentType: 'claude' };
+  try {
+    await withStubDaemon(paneDir, {
+      'runpane:panels:resume': (args) => ({
+        ok: true,
+        panelId: args[0].panelId,
+        paneId: 'pane-1',
+        action: 'resumed',
+        message: "Relaunched the panel's agent, resuming conversation panel-8.",
+        agentType: 'claude',
+        agentSessionId: 'panel-8',
+        panel,
+        nextCommand: 'runpane panels wait --panel panel-8 --for ready --timeout-ms 30000 --json',
+      }),
+    }, async (requests) => {
+      await withMcpClient(async (client) => {
+        const tool = (await client.listTools()).tools.find((item) => item.name === 'panels_resume');
+        assert.ok(tool, 'panels_resume is served in the panels toolset');
+        assert.equal(tool.annotations.destructiveHint, false);
+        assert.equal(tool.annotations.idempotentHint, true);
+        const refused = await client.callTool({ name: 'panels_resume', arguments: { panel: 'panel-8', paneDir } });
+        assert.equal(refused.isError, true);
+        const resumed = await client.callTool({ name: 'panels_resume', arguments: { panel: 'panel-8', waitReady: true, yes: true, paneDir } });
+        assert.equal(resumed.isError, undefined, resumed.content[0].text);
+        assertMatchesAdvertisedSchema(tool, resumed.structuredContent);
+        assert.equal(resumed.structuredContent.action, 'resumed');
+      }, { args: ['--toolsets', 'panels'] });
+      assert.deepEqual(requests.map((request) => request.args[0]), [{ panelId: 'panel-8', waitReady: true }]);
+    });
+  } finally {
+    fs.rmSync(paneDir, { recursive: true, force: true });
+  }
+});
+
+test('panels_resume resumes every stopped agent panel of a Session or of every Pane', async () => {
+  const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runpane-mcp-'));
+  const bulk = (args) => ({
+    ok: !args[0].sessionId,
+    scope: args[0].sessionId ? { kind: 'session', sessionId: '__orchestration_session_s1__', sessionName: 'Release' } : { kind: 'all-stopped' },
+    resumed: 2,
+    alreadyRunning: 1,
+    failed: 0,
+    notReady: args[0].sessionId ? 1 : 0,
+    concurrency: args[0].concurrency ?? 3,
+    items: [
+      { ok: true, panelId: 'panel-1', paneId: 'pane-1', paneName: 'one', action: 'resumed', readiness: { ok: true, condition: 'ready', matched: true, timedOut: false, elapsedMs: 900, state: { initialized: true, running: true } } },
+      { ok: false, panelId: 'panel-2', paneId: 'pane-2', paneName: 'two', action: 'resumed', readiness: { ok: false, condition: 'ready', matched: false, timedOut: false, elapsedMs: 400, state: { initialized: true, running: true }, blocked: { kind: 'agent-prompt', message: 'The terminal is waiting at an interactive prompt.' } } },
+    ],
+  });
+  try {
+    await withStubDaemon(paneDir, { 'runpane:panels:resume-many': bulk }, async (requests) => {
+      await withMcpClient(async (client) => {
+        const tool = (await client.listTools()).tools.find((item) => item.name === 'panels_resume');
+        assert.ok(!tool.inputSchema.required?.includes('panel'), 'panel is optional once --session and --all-stopped exist');
+        // A panel stuck at a prompt makes the bulk result not ok: an error whose text is the full JSON.
+        const bySession = await client.callTool({ name: 'panels_resume', arguments: { session: 'Release', waitReady: true, concurrency: '2', yes: true, paneDir } });
+        assert.equal(bySession.isError, true);
+        assert.equal(JSON.parse(bySession.content[0].text).items[1].readiness.blocked.kind, 'agent-prompt');
+        const all = await client.callTool({ name: 'panels_resume', arguments: { allStopped: true, yes: true, paneDir } });
+        assert.equal(all.isError, undefined, all.content[0].text);
+        assertMatchesAdvertisedSchema(tool, all.structuredContent);
+        assert.equal(all.structuredContent.scope.kind, 'all-stopped');
+      }, { args: ['--toolsets', 'panels'] });
+      assert.deepEqual(requests.map((request) => request.args[0]), [
+        { sessionId: 'Release', waitReady: true, concurrency: 2 },
+        { allStopped: true },
+      ]);
     });
   } finally {
     fs.rmSync(paneDir, { recursive: true, force: true });

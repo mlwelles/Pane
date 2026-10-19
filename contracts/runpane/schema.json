@@ -122,49 +122,92 @@
         "watch": {
           "type": "object",
           "required": [
-            "format",
-            "heartbeatSeconds",
-            "idleAfterMs",
-            "settleMs",
-            "blockedSettleMs",
-            "minIntervalMs",
-            "idleBackoff",
-            "agentsOnly",
-            "includeHeldInputPresence"
+            "follow",
+            "untilEvent"
           ],
+          "additionalProperties": false,
           "properties": {
-            "format": {
-              "enum": [
-                "lines",
-                "json"
-              ]
+            "follow": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "summary",
+                "kinds",
+                "readySettle",
+                "blockedSettle",
+                "minInterval",
+                "idleAfter",
+                "idleBackoff",
+                "expireAfter",
+                "heartbeat",
+                "includeShells",
+                "heldInputDetection"
+              ],
+              "properties": {
+                "summary": {
+                  "type": "string"
+                },
+                "kinds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "readySettle": {
+                  "type": "string",
+                  "pattern": "^(off|[0-9]+(ms|s|m|h))$"
+                },
+                "blockedSettle": {
+                  "type": "string",
+                  "pattern": "^(off|[0-9]+(ms|s|m|h))$"
+                },
+                "minInterval": {
+                  "type": "string",
+                  "pattern": "^(off|[0-9]+(ms|s|m|h))$"
+                },
+                "idleAfter": {
+                  "type": "string",
+                  "pattern": "^(off|[0-9]+(ms|s|m|h))$"
+                },
+                "idleBackoff": {
+                  "type": "boolean"
+                },
+                "expireAfter": {
+                  "type": "string",
+                  "pattern": "^(off|[0-9]+(ms|s|m|h))$"
+                },
+                "heartbeat": {
+                  "type": "string",
+                  "pattern": "^(off|[0-9]+(ms|s|m|h))$"
+                },
+                "includeShells": {
+                  "type": "boolean"
+                },
+                "heldInputDetection": {
+                  "type": "boolean"
+                }
+              }
             },
-            "heartbeatSeconds": {
-              "type": "number"
-            },
-            "idleAfterMs": {
-              "type": "number"
-            },
-            "settleMs": {
-              "type": "number"
-            },
-            "blockedSettleMs": {
-              "type": "number"
-            },
-            "minIntervalMs": {
-              "type": "number"
-            },
-            "idleBackoff": {
-              "type": "boolean"
-            },
-            "agentsOnly": {
-              "type": "boolean"
-            },
-            "includeHeldInputPresence": {
-              "type": "boolean"
+            "untilEvent": {
+              "type": "object",
+              "required": [
+                "summary",
+                "kinds"
+              ],
+              "properties": {
+                "summary": {
+                  "type": "string"
+                },
+                "kinds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false
             }
-          },
-          "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false
@@ -482,6 +525,7 @@
         "panels submit",
         "panels submit-composer",
         "panels wait",
+        "panels resume",
         "panels last-message",
         "agent-context",
         "mcp",
@@ -646,6 +690,9 @@
         "panels wait": {
           "$ref": "#/$defs/helpLines"
         },
+        "panels resume": {
+          "$ref": "#/$defs/helpLines"
+        },
         "panels last-message": {
           "$ref": "#/$defs/helpLines"
         },
@@ -770,6 +817,15 @@
           "$ref": "#/$defs/helpLines"
         },
         "sessions unpin": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "pr watch": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "pr unwatch": {
+          "$ref": "#/$defs/helpLines"
+        },
+        "pr list": {
           "$ref": "#/$defs/helpLines"
         }
       },

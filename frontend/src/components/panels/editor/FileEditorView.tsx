@@ -18,6 +18,8 @@ import { restoreEditorPosition, trackEditorPosition, type PositionTracker } from
 import { FileEditorHeader } from './FileEditorHeader';
 import { MediaFilePreview, FilePreviewNotice } from './MediaFilePreview';
 import { DocumentFilePreview } from './DocumentFilePreview';
+import { isHtmlFile } from './htmlFile';
+import { previewHtmlFileInBrowser } from './previewHtmlFile';
 
 const Editor = lazy(() => import('@monaco-editor/react'));
 
@@ -290,6 +292,11 @@ export function FileEditorView({
         viewMode={canToggleMode ? viewMode : undefined}
         onViewModeChange={canToggleMode ? (mode) => dispatch({ type: 'view-mode', mode }) : undefined}
         showSaveState={!isReadOnlyPreview}
+        onPreviewInBrowser={isHtmlFile(selectedFile.path) ? () => {
+          previewHtmlFileInBrowser(sessionId, selectedFile.path).catch((previewError: Error) => {
+            dispatch({ type: 'error', message: previewError.message || 'Failed to preview HTML file' });
+          });
+        } : undefined}
       />
       {error && (
         <div role="alert" className="px-4 py-2 bg-status-error/20 text-status-error text-sm">

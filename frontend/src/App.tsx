@@ -1,3 +1,4 @@
+import { RemoteConnectionBanner } from './components/RemoteConnectionBanner';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useIPCEvents } from './hooks/useIPCEvents';
 import { useNotifications } from './hooks/useNotifications';
@@ -826,6 +827,7 @@ function App() {
         <div className={isSettingsOpen ? 'hidden' : 'contents'}>
           <WindowTitleBar projects={projects} sidebarWidth={sidebarWidth} sidebarCollapsed={sidebarCollapsed} controlsSlotRef={setTitleBarControlsSlot} />
         </div>
+        <RemoteConnectionBanner onSettings={() => openSettings({ category: 'remote-access' })} />
         <div className="pane-main-layout flex flex-1 min-h-0">
         <MainProcessLogger />
         {isSettingsOpen && (

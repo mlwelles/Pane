@@ -159,11 +159,42 @@ it is known, Pane:
 - restates the panel's current status, so watchers that ignored the panel so far
   see it from now on.
 
+Readiness and a starting message key off the identified agent, however it was
+identified:
+
+- `--wait-ready` (and `panels wait --for ready`) on a launched command matches
+  only once the panel has an agent and that agent's own ready rule passes:
+  Claude's composer, Codex's configured footer, the existing rules for the
+  others. A wrapper's first output byte never counts. A command that shows no
+  supported agent times out with `readiness.reason.code: no-agent-detected`;
+  one that exits back to Pane's shell fails at once with `command-exited`
+  (where the foreground process is known). A plain shell with no launch
+  command is ready once it exists.
+- Prompts before the agent appears come back as `blocked` with their text:
+  Agent Farm's `Trust this repository workspace? [y/N]`, and any `[y/N]` or
+  similar last-line question a wrapper or shell asks, even when `--agent` was
+  declared. Pane never answers them.
+- With `--wait-ready`, runpane owns the starting message: it claims the
+  message at create, waits for readiness, stages the text and presses the
+  detected agent's submit key separately (Ctrl+Enter for Codex), and verifies
+  it like `panels submit`. Without `--wait-ready`, the terminal manager holds
+  the message until the agent is identified and idle at its composer, then
+  stages and submits it the same way. If no agent appears within 30 seconds
+  (a blocking prompt restarts that wait), it records `initialInputError` and
+  never types the message into the shell or the wrapper.
+- `[TerminalPanelManager] Starting message …` and `[Runpane] Starting message …`
+  log lines mark each write and its outcome, with the agent, detection source,
+  byte count, submit key and any `PANE_AGENT_SESSION_ID` the wrapper printed.
+  They never include the message text.
+
 `launchMode: 'wrapped'` means the command is launched exactly as given.
 `resolveCliLaunchCommand` never adds `--session-id`, resume flags or a prompt
 argument to it. On restart, Pane runs the wrapper again, and the wrapper handles
-its own resume. For the same reason, `--resume` is rejected for wrapper
-commands.
+its own resume. The exceptions are a panel with an explicit custom command resume
+config and a recognized `agent-farm run|agent` command, which relaunch through
+their resume template (see
+[Resuming custom launchers](SESSIONS.md#resuming-custom-launchers)). For the same
+reason, `--resume` is rejected for wrapper commands.
 
 Direct OpenCode launches use Pane's durable session id and readiness-gated input.
 Native selector insertion accepts literal direct commands and simple assignment or

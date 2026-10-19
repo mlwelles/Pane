@@ -3,6 +3,7 @@ import type { CoreServices } from '../core/services';
 import type { TaskQueue } from '../services/taskQueue';
 import type { AnalyticsManager } from '../services/analyticsManager';
 import type { SpotlightManager } from '../services/spotlightManager';
+import type { SessionPrMonitor } from '../services/sessionPrMonitor';
 import type { WorkspaceJournal } from '../services/workspaceJournal';
 import type { WorkspaceStateReader } from '../services/workspaceStateReader';
 import type { WorkspaceCursorStore } from '../services/workspaceCursorStore';
@@ -14,6 +15,7 @@ export interface DaemonHostServices extends CoreServices {
   analyticsManager?: AnalyticsManager;
   spotlightManager: SpotlightManager;
   workspaceJournal?: WorkspaceJournal;
+  sessionPrMonitor?: SessionPrMonitor;
   workspaceStateReader?: WorkspaceStateReader;
   workspaceCursorStore?: WorkspaceCursorStore;
   namedLockService?: NamedLockService;

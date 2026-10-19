@@ -73,7 +73,7 @@ export interface OrchestrationActivity {
 }
 
 export interface OrchestrationSessionRecord {
-  /** Omitted in older stores; migrated to the host runtime on read. */
+  /** Omitted means the native host. 'windows' is a legacy alias for native and is dropped on read. */
   runtime?: 'windows' | 'wsl';
   wslDistribution?: string;
   /** Durable recovery anchor for an in-place conversation transfer. */
@@ -118,6 +118,12 @@ export interface OrchestrationSessionRecord {
 export interface OrchestrationSessionStoreData {
   version: typeof ORCHESTRATION_SESSION_STORE_VERSION;
   selectedSessionId?: string;
+  /**
+   * The order people arranged Sessions in, oldest first when absent. Sessions it does not name
+   * (new ones, or any written by a Pane that predates ordering) follow it by creation time.
+   * Optional so the store stays at version 1: an older Pane ignores it and drops it on its next write.
+   */
+  order?: string[];
   sessions: OrchestrationSessionRecord[];
 }
 
@@ -181,6 +187,7 @@ export interface OrchestrationSessionOverview {
 }
 
 export interface OrchestrationSessionCreateInput {
+  /** Omit for the native host. 'windows' is accepted as a legacy alias for native. */
   runtime?: 'windows' | 'wsl';
   wslDistribution?: string;
   name: string;

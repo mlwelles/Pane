@@ -141,6 +141,7 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
       worktreePath: '/repo/worktrees/pane',
       baseCommit: 'base-commit',
       baseBranch: 'origin/main',
+      base: { ref: 'origin/main', commit: 'base-commit', refresh: 'skipped' },
     });
   });
 
@@ -250,8 +251,8 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
   it('renames a claimed reserve branch to the exact requested name', async () => {
     const runner = commandRunner(async command => {
       if (command === 'git check-ref-format --branch agents/w5a') return { stdout: 'agents/w5a\n', stderr: '' };
-      if (command === 'git fetch' || command.startsWith('git worktree add -b ')) return { stdout: '', stderr: '' };
-      if (command === 'git rev-parse --verify --end-of-options origin/main') {
+      if (command.startsWith('git worktree add -b ')) return { stdout: '', stderr: '' };
+      if (command === 'git rev-parse --verify --end-of-options origin/main^{commit}') {
         return { stdout: 'base-commit\n', stderr: '' };
       }
       if (command.startsWith('git worktree move ') || command.startsWith('git branch -m ')) return { stdout: '', stderr: '' };

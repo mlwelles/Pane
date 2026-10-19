@@ -8,6 +8,7 @@ import { invokeDaemon, PaneDaemonClientError } from './daemonClient';
 import { RUNPANE_CONTRACT } from './generated/contract';
 import { hasCadenceValueFlag, type ParsedArgs, type RunpaneAgent } from './commands';
 import type { BoundarySchema, JsonValue } from './boundaryDecoder';
+import { parseSessionCreatePayload, parseSessionUpdatePayload } from './sessionPayload';
 import { describeReport, effectiveWatchHeartbeatMs, formatNonEntry, formatWaitResult, type WatchFormat } from './watchLines';
 
 interface OrchestrationLink {
@@ -86,38 +87,6 @@ interface RunpaneSessionResult {
 
 interface SessionSelectorValue {
   sessionId: string;
-}
-
-interface SessionCreatePayload {
-  runtime?: 'windows' | 'wsl';
-  wslDistribution?: string;
-  name: string;
-  isPinned?: boolean;
-  agent?: OrchestrationAgent;
-  goal?: string;
-  context?: string;
-  decisions?: string[];
-  blockers?: string[];
-  nextAction?: string;
-  evidence?: OrchestrationLink[];
-  outputs?: OrchestrationLink[];
-}
-
-interface SessionUpdatePayload {
-  name?: string;
-  archived?: boolean;
-  isPinned?: boolean;
-  agent?: OrchestrationAgent;
-  goal?: string;
-  context?: string;
-  decisions?: string[];
-  blockers?: string[];
-  nextAction?: string;
-  evidence?: OrchestrationLink[];
-  outputs?: OrchestrationLink[];
-  report?: OrchestrationReport | null;
-  expectedRevision?: number;
-  source?: 'user' | 'agent';
 }
 
 interface OrchestrationPanelOverview {
@@ -313,6 +282,15 @@ interface PaneCreateSuccessItem {
   warnings?: PromptWarning[];
   /** Set when setup waits for a slot; the agent starts after setup, so there is no panel yet. */
   setupQueue?: { position: number; message: string };
+  /** The base a worktree Pane started from; `notice` says when it could not be refreshed from the remote. */
+  base?: PaneBase;
+}
+
+interface PaneBase {
+  ref: string;
+  commit?: string;
+  refresh: 'fetched' | 'recent' | 'skipped' | 'failed';
+  notice?: string;
 }
 
 interface PaneCreateFailureItem {
@@ -599,6 +577,8 @@ interface ReportResult {
   panelId: string;
   report: AgentReport;
   sessionIds: string[];
+  /** Watches waiting when the report was journaled; absent from older daemons. */
+  liveWatchers?: number;
 }
 
 type PanelLastMessageResult =
@@ -628,20 +608,63 @@ interface PanelSummary {
   title: string;
   active: boolean;
   initialized?: boolean;
+  running?: boolean;
   agentType?: string;
   agentDetection?: 'declared' | 'command' | 'process' | 'screen';
   launchCommand?: string;
   isCliPanel?: boolean;
+  dock?: boolean;
   position?: number;
   createdAt?: string;
   lastActiveAt?: string;
   report?: AgentReport;
+  /** Saved agent session ID that reopens this panel. */
+  resumeId?: string;
+  /** Which rule resumes with resumeId: derived Agent Farm, the panel's configured command, or built-in agent capture. */
+  resumeSource?: 'agent-farm' | 'configured' | 'agent';
 }
 
 interface PanelListResult {
   ok: true;
   paneId: string;
   panels: PanelSummary[];
+}
+
+interface PanelResumeManyResult {
+  ok: boolean;
+  scope: { kind: 'session' | 'all-stopped'; sessionId?: string; sessionName?: string };
+  resumed: number;
+  alreadyRunning: number;
+  failed: number;
+  notReady: number;
+  concurrency: number;
+  items: Array<{
+    ok: boolean;
+    panelId: string;
+    paneId: string;
+    paneName: string;
+    panelTitle?: string;
+    agentType?: string;
+    action?: 'resumed' | 'already-running';
+    message?: string;
+    agentSessionId?: string;
+    readiness?: PanelReadiness;
+    error?: string;
+  }>;
+  nextCommand?: string;
+}
+
+interface PanelResumeResult {
+  ok: boolean;
+  panelId: string;
+  paneId: string;
+  action: 'resumed' | 'already-running';
+  message: string;
+  agentType?: string;
+  agentSessionId?: string;
+  panel: PanelSummary;
+  readiness?: PanelReadiness;
+  nextCommand: string;
 }
 
 interface PanelCreateRequest {
@@ -713,6 +736,7 @@ interface PanelInputResult {
 
 interface PanelStateSummary {
   initialized: boolean;
+  running?: boolean;
   isAlternateScreen?: boolean;
   activityStatus?: 'active' | 'idle';
   isCliReady?: boolean;
@@ -734,6 +758,12 @@ interface PanelBlockedState {
   suggestedCommand?: string;
 }
 
+/** Why a `ready` wait on a launched command did not match. */
+interface PanelReadinessReason {
+  code: 'no-agent-detected' | 'agent-not-ready' | 'command-exited';
+  message: string;
+}
+
 interface PanelReadiness {
   ok: boolean;
   condition: string;
@@ -742,6 +772,7 @@ interface PanelReadiness {
   elapsedMs: number;
   state: PanelStateSummary;
   blocked?: PanelBlockedState;
+  reason?: PanelReadinessReason;
   nextCommand?: string;
 }
 
@@ -800,6 +831,7 @@ interface PanelSubmitComposerResult {
 interface PanelWaitResult extends PanelReadiness {
   panelId: string;
   paneId?: string;
+  stopped?: true;
   screen: {
     source: PanelScreenResult['source'];
     text: string;
@@ -833,18 +865,27 @@ type WorkspaceEntryKind =
   | 'pane.created'
   | 'pane.gone'
   | 'panel.exited'
+  | 'panel.stopped'
   | 'agent.report'
   | 'pane.associated'
   | 'pane.detached'
   | 'pr.conflicted'
   | 'pr.checks'
-  | 'pr.merged';
+  | 'pr.merged'
+  | 'pr.closed'
+  | 'pr.head'
+  | 'pr.review'
+  | 'pr.comment'
+  | 'pr.stopped'
+  | 'github.unavailable'
+  | 'github.recovered';
 
 interface WorkspacePanelSummary {
   panelId: string;
   title: string;
   agentType?: string;
   agentState?: 'blocked' | 'working' | 'idle' | 'unknown';
+  running?: boolean;
 }
 
 interface WorkspaceEntry {
@@ -869,6 +910,7 @@ interface WorkspaceEntry {
   heldInput?: string;
   heldInputPresent?: boolean;
   exitCode?: number;
+  running?: boolean;
   baseline?: true;
   replay?: true;
   changedWhileAway?: boolean;
@@ -889,6 +931,7 @@ interface WorkspaceStateResult {
 }
 
 interface WorkspaceWaitResult extends WorkspaceStateResult {
+  activityGeneration?: number;
   timedOut: boolean;
   dropped?: number;
   reset?: { reason: 'first-use' | 'epoch-changed' | 'cursor-truncated' | 'unknown-consumer' };
@@ -974,6 +1017,7 @@ const panelBlockedSchema: BoundarySchema<PanelBlockedState> = boundary.object({
 });
 const panelStateSchema: BoundarySchema<PanelStateSummary> = boundary.object({
   initialized: boundary.boolean,
+  running: boundary.optional(boundary.boolean),
   isAlternateScreen: boundary.optional(boundary.boolean),
   activityStatus: boundary.optional(boundary.enumeration('active', 'idle')),
   isCliReady: boundary.optional(boundary.boolean),
@@ -981,6 +1025,10 @@ const panelStateSchema: BoundarySchema<PanelStateSummary> = boundary.object({
   agentType: boundary.optional(agentSchema),
   lastActivity: boundary.optional(boundary.string),
 });
+const panelReadinessReasonSchema: BoundarySchema<PanelReadinessReason | undefined> = boundary.optional(boundary.object({
+  code: boundary.enumeration('no-agent-detected', 'agent-not-ready', 'command-exited'),
+  message: boundary.string,
+}));
 const panelReadinessSchema: BoundarySchema<PanelReadiness> = boundary.object({
   ok: boundary.boolean,
   condition: boundary.string,
@@ -989,6 +1037,7 @@ const panelReadinessSchema: BoundarySchema<PanelReadiness> = boundary.object({
   elapsedMs: boundary.number,
   state: panelStateSchema,
   blocked: boundary.optional(panelBlockedSchema),
+  reason: panelReadinessReasonSchema,
   nextCommand: boundary.optional(boundary.string),
 });
 const verificationSchema = boundary.optional(boundary.enumeration('observed', 'unverifiable'));
@@ -1058,6 +1107,7 @@ const reportResultSchema: BoundarySchema<ReportResult> = boundary.object({
   panelId: boundary.string,
   report: agentReportSchema,
   sessionIds: boundary.array(boundary.string),
+  liveWatchers: boundary.optional(boundary.number),
 });
 const panelLastMessageResultSchema: BoundarySchema<PanelLastMessageResult> = boundary.union(
   boundary.object({
@@ -1089,14 +1139,18 @@ const panelSummarySchema: BoundarySchema<PanelSummary> = boundary.object({
   title: boundary.string,
   active: boundary.boolean,
   initialized: boundary.optional(boundary.boolean),
+  running: boundary.optional(boundary.boolean),
   agentType: boundary.optional(boundary.string),
   agentDetection: boundary.optional(boundary.enumeration('declared', 'command', 'process', 'screen')),
   launchCommand: boundary.optional(boundary.string),
   isCliPanel: boundary.optional(boundary.boolean),
+  dock: boundary.optional(boundary.boolean),
   position: boundary.optional(boundary.number),
   createdAt: boundary.optional(boundary.string),
   lastActiveAt: boundary.optional(boundary.string),
   report: boundary.optional(agentReportSchema),
+  resumeId: boundary.optional(boundary.string),
+  resumeSource: boundary.optional(boundary.enumeration('agent-farm', 'configured', 'agent')),
 });
 
 export const repoListResultSchema: BoundarySchema<RepoListResult> = boundary.object({
@@ -1175,12 +1229,12 @@ const orchestrationSessionRecordSchema: BoundarySchema<OrchestrationSessionRecor
   createdAt: boundary.nonEmptyString,
   updatedAt: boundary.nonEmptyString,
 });
-const runpaneSessionListResultSchema: BoundarySchema<RunpaneSessionListResult> = boundary.object({
+export const runpaneSessionListResultSchema: BoundarySchema<RunpaneSessionListResult> = boundary.object({
   ok: boundary.literal(true),
   sessions: boundary.array(orchestrationSessionRecordSchema),
   selectedSessionId: boundary.optional(boundary.nonEmptyString),
 });
-const runpaneSessionResultSchema: BoundarySchema<RunpaneSessionResult> = boundary.object({
+export const runpaneSessionResultSchema: BoundarySchema<RunpaneSessionResult> = boundary.object({
   ok: boundary.literal(true),
   session: orchestrationSessionRecordSchema,
   panelId: boundary.optional(boundary.nonEmptyString),
@@ -1397,6 +1451,12 @@ export const paneCreateResultSchema: BoundarySchema<PaneCreateResult> = boundary
         position: boundary.number,
         message: boundary.string,
       })),
+      base: boundary.optional(boundary.object({
+        ref: boundary.string,
+        commit: boundary.optional(boundary.string),
+        refresh: boundary.enumeration('fetched', 'recent', 'skipped', 'failed'),
+        notice: boundary.optional(boundary.string),
+      })),
     }),
     boundary.object({
       ok: boundary.literal(false),
@@ -1527,6 +1587,45 @@ export const panelListResultSchema: BoundarySchema<PanelListResult> = boundary.o
   paneId: boundary.string,
   panels: boundary.array(panelSummarySchema),
 });
+const panelResumeManyResultSchema: BoundarySchema<PanelResumeManyResult> = boundary.object({
+  ok: boundary.boolean,
+  scope: boundary.object({
+    kind: boundary.enumeration('session', 'all-stopped'),
+    sessionId: boundary.optional(boundary.string),
+    sessionName: boundary.optional(boundary.string),
+  }),
+  resumed: boundary.number,
+  alreadyRunning: boundary.number,
+  failed: boundary.number,
+  notReady: boundary.number,
+  concurrency: boundary.number,
+  items: boundary.array(boundary.object({
+    ok: boundary.boolean,
+    panelId: boundary.string,
+    paneId: boundary.string,
+    paneName: boundary.string,
+    panelTitle: boundary.optional(boundary.string),
+    agentType: boundary.optional(boundary.string),
+    action: boundary.optional(boundary.enumeration('resumed', 'already-running')),
+    message: boundary.optional(boundary.string),
+    agentSessionId: boundary.optional(boundary.string),
+    readiness: boundary.optional(panelReadinessSchema),
+    error: boundary.optional(boundary.string),
+  })),
+  nextCommand: boundary.optional(boundary.string),
+});
+const panelResumeResultSchema: BoundarySchema<PanelResumeResult> = boundary.object({
+  ok: boundary.boolean,
+  panelId: boundary.string,
+  paneId: boundary.string,
+  action: boundary.enumeration('resumed', 'already-running'),
+  message: boundary.string,
+  agentType: boundary.optional(boundary.string),
+  agentSessionId: boundary.optional(boundary.string),
+  panel: panelSummarySchema,
+  readiness: boundary.optional(panelReadinessSchema),
+  nextCommand: boundary.string,
+});
 export const panelCreateResultSchema: BoundarySchema<PanelCreateResult> = boundary.object({
   ok: boundary.boolean,
   generation: boundary.optional(boundary.number),
@@ -1626,6 +1725,8 @@ const panelWaitResultSchema: BoundarySchema<PanelWaitResult> = boundary.object({
   elapsedMs: boundary.number,
   state: panelStateSchema,
   blocked: boundary.optional(panelBlockedSchema),
+  reason: panelReadinessReasonSchema,
+  stopped: boundary.optional(boundary.literal(true)),
   nextCommand: boundary.optional(boundary.string),
   panelId: boundary.string,
   paneId: boundary.optional(boundary.string),
@@ -1660,11 +1761,19 @@ const workspaceEntryKindSchema = boundary.enumeration(
   'pane.created',
   'pane.gone',
   'panel.exited',
+  'panel.stopped',
   'pane.associated',
   'pane.detached',
   'pr.conflicted',
   'pr.checks',
   'pr.merged',
+  'pr.closed',
+  'pr.head',
+  'pr.review',
+  'pr.comment',
+  'pr.stopped',
+  'github.unavailable',
+  'github.recovered',
   'agent.report',
 );
 const agentStateSchema = boundary.enumeration('blocked', 'working', 'idle', 'unknown');
@@ -1673,6 +1782,7 @@ const workspacePanelSummarySchema: BoundarySchema<WorkspacePanelSummary> = bound
   title: boundary.string,
   agentType: boundary.optional(boundary.string),
   agentState: boundary.optional(agentStateSchema),
+  running: boundary.optional(boundary.boolean),
 });
 const workspaceEntrySchema: BoundarySchema<WorkspaceEntry> = boundary.object({
   gen: boundary.number,
@@ -1696,6 +1806,7 @@ const workspaceEntrySchema: BoundarySchema<WorkspaceEntry> = boundary.object({
   heldInput: boundary.optional(boundary.string),
   heldInputPresent: boundary.optional(boundary.boolean),
   exitCode: boundary.optional(boundary.number),
+  running: boundary.optional(boundary.boolean),
   baseline: boundary.optional(boundary.literal(true)),
   replay: boundary.optional(boundary.literal(true)),
   changedWhileAway: boundary.optional(boundary.boolean),
@@ -1714,6 +1825,7 @@ export const workspaceStateResultSchema: BoundarySchema<WorkspaceStateResult> = 
   entries: boundary.array(workspaceEntrySchema),
 });
 const workspaceWaitResultSchema: BoundarySchema<WorkspaceWaitResult> = boundary.object({
+  activityGeneration: boundary.optional(boundary.number),
   ok: boundary.literal(true),
   epoch: boundary.string,
   generation: boundary.number,
@@ -2045,46 +2157,6 @@ function sessionSelectorFromParsed(parsed: ParsedArgs): SessionSelectorValue {
   return { sessionId };
 }
 
-function parseSessionCreatePayload(value: JsonValue): SessionCreatePayload {
-  return decodeBoundary(value, boundary.object({
-    runtime: boundary.optional(boundary.enumeration('windows', 'wsl')),
-    wslDistribution: boundary.optional(boundary.nonEmptyString),
-    name: boundary.nonEmptyString,
-    isPinned: boundary.optional(boundary.boolean),
-    agent: boundary.optional(boundary.enumeration('codex', 'claude', 'cursor')),
-  launchCommand: boundary.optional(boundary.string),
-  profile: boundary.optional(boundary.string),
-    goal: boundary.optional(boundary.string),
-    context: boundary.optional(boundary.string),
-    decisions: boundary.optional(boundary.array(boundary.string)),
-    blockers: boundary.optional(boundary.array(boundary.string)),
-    nextAction: boundary.optional(boundary.string),
-    evidence: boundary.optional(boundary.array(orchestrationLinkSchema)),
-    outputs: boundary.optional(boundary.array(orchestrationLinkSchema)),
-  }));
-}
-
-function parseSessionUpdatePayload(value: JsonValue): SessionUpdatePayload {
-  return decodeBoundary(value, boundary.object({
-    name: boundary.optional(boundary.string),
-    archived: boundary.optional(boundary.boolean),
-    isPinned: boundary.optional(boundary.boolean),
-    agent: boundary.optional(boundary.enumeration('codex', 'claude', 'cursor')),
-  launchCommand: boundary.optional(boundary.string),
-  profile: boundary.optional(boundary.string),
-    goal: boundary.optional(boundary.string),
-    context: boundary.optional(boundary.string),
-    decisions: boundary.optional(boundary.array(boundary.string)),
-    blockers: boundary.optional(boundary.array(boundary.string)),
-    nextAction: boundary.optional(boundary.string),
-    evidence: boundary.optional(boundary.array(orchestrationLinkSchema)),
-    outputs: boundary.optional(boundary.array(orchestrationLinkSchema)),
-    report: boundary.optional(boundary.nullable(orchestrationReportSchema)),
-    expectedRevision: boundary.optional(boundary.number),
-    source: boundary.optional(boundary.enumeration('user', 'agent')),
-  }));
-}
-
 function printSessionResult(result: RunpaneSessionResult, json: boolean, action: string): number {
   if (json) {
     printJson(result);
@@ -2128,37 +2200,59 @@ export async function runWorkspaceState(parsed: ParsedArgs): Promise<number> {
   return 0;
 }
 
+export async function runPrWatchCommand(parsed: ParsedArgs): Promise<number> {
+  const action = parsed.command.split(' ')[1];
+  const paneId = parsed.paneId ?? process.env.PANE_SESSION_ID;
+  if (action !== 'list' && (!paneId || !parsed.url)) throw new Error('Pass --pane <id> and --url <PR URL> (inside a Pane, --pane defaults to this Pane).');
+  const result = await invokeDaemon(`runpane:pr:${action}`, [{ paneId, url: parsed.url, head: parsed.reportHead }], boundary.jsonObject, { paneDir: parsed.paneDir });
+  printJson(result);
+  return 0;
+}
+
 export async function runWatch(parsed: ParsedArgs): Promise<number> {
   if (parsed.watchAs && parsed.watchSince !== undefined) {
     throw new Error('runpane watch accepts either --as or --since, not both.');
   }
-  const defaults = RUNPANE_CONTRACT.defaults.watch;
+  const defaults = RUNPANE_CONTRACT.defaults.watch.follow;
   const format: WatchFormat = parsed.watchFormat ?? (parsed.json ? 'json' : 'lines');
+  // --until-event takes --follow's scope defaults; it only stops after the first event.
+  const keepsWaiting = parsed.follow || parsed.untilEvent;
   const heartbeatMs = effectiveWatchHeartbeatMs(
-    parsed.heartbeatSeconds ?? (parsed.follow ? defaults.heartbeatSeconds : 0),
+    parsed.heartbeatSeconds ?? 0,
   );
-  const idleAfterMs = parsed.idleAfterMs ?? (parsed.follow ? defaults.idleAfterMs : 0);
+  const idleAfterMs = parsed.idleAfterMs ?? 0;
   const effectiveAgentsOnly = parsed.includeShells
     ? undefined
-    : parsed.agentsOnly || parsed.follow ? true : undefined;
+    : parsed.agentsOnly || keepsWaiting ? true : undefined;
   const includeHeldInput = parsed.includeHeldInput && !parsed.noHeldInput ? true : undefined;
   // Lines mode turns presence into STUCK; JSON mode passes heldInputPresent through as the equivalent.
-  const includeHeldInputPresence = defaults.includeHeldInputPresence
-    && !parsed.noHeldInput && parsed.follow ? true : undefined;
+  const includeHeldInputPresence = defaults.heldInputDetection
+    && !parsed.noHeldInput && keepsWaiting ? true : undefined;
   const cadenceValueFlagPresent = hasCadenceValueFlag(parsed);
+  const ownPanelId = process.env.PANE_PANEL_ID?.trim() || undefined;
   // Cadence state lives in the daemon per named consumer, so an anonymous follower names itself.
   // A Session watch is named after the Session, so it survives an orchestrator agent switch.
   const sessionCursor = parsed.sessionId ? sessionWatchCursorName(parsed.sessionId) : undefined;
-  const panelCursor = process.env.PANE_PANEL_ID ? derivedWatchCursorName('panel', process.env.PANE_PANEL_ID) : undefined;
+  const panelCursor = ownPanelId ? derivedWatchCursorName('panel', ownPanelId) : undefined;
+  // An --until-event re-arm resumes where the last one stopped, under a name apart from the
+  // panel's --follow cursor so it never takes over a running monitor.
+  const untilEventCursor = ownPanelId && parsed.watchSince === undefined
+    ? derivedWatchCursorName('until', `until-${ownPanelId}`)
+    : undefined;
   const watchAs = parsed.watchAs
-    ?? (parsed.follow ? sessionCursor || panelCursor || (cadenceValueFlagPresent ? `follow-${process.pid}` : undefined) : undefined);
-  // --quiet drops lines that only prove liveness; --self-test still prints its WATCH OK result.
+    ?? (parsed.untilEvent ? untilEventCursor : undefined)
+    ?? (parsed.follow && parsed.watchSince === undefined ? sessionCursor || panelCursor || (cadenceValueFlagPresent ? `follow-${process.pid}` : undefined) : undefined);
+  // Under --until-event, --timeout-ms is the deadline for the whole wait, not for one daemon call.
+  const deadlineAt = parsed.untilEvent && parsed.timeoutMs !== undefined ? Date.now() + parsed.timeoutMs : undefined;
+  exitWhenReaderCloses();
+  // Follow prints WATCH OK once as proof it is armed.
   const emitControlLine = (line: string): void => {
-    if (!parsed.quiet) emitWatchLine(line);
+    emitWatchLine(line);
   };
   const request = {
     as: watchAs,
     since: parsed.watchSince,
+    epoch: parsed.watchEpoch,
     from: parsed.watchFrom,
     timeoutMs: parsed.timeoutMs,
     limit: parsed.limit,
@@ -2177,29 +2271,49 @@ export async function runWatch(parsed: ParsedArgs): Promise<number> {
     settleMs: parsed.settleMs,
     blockedSettleMs: parsed.blockedSettleMs,
     minIntervalMs: parsed.minIntervalMs,
-    idleBackoff: parsed.idleBackoff || undefined,
+    idleBackoff: parsed.idleBackoff,
   };
 
   let armed = false;
   let failingCode: string | undefined;
   let lastFailureAt = 0;
   let lastHeartbeatAt = Date.now();
-  let anonymousIdleWindowStartMs = !watchAs && parsed.follow ? 0 : undefined;
+  let anonymousIdleWindowStartMs = !watchAs && keepsWaiting ? 0 : undefined;
+  // --expire-after: IDLE re-fires and control lines don't count as activity.
+  const expireAfterMs = parsed.follow && parsed.expireAfterMs ? parsed.expireAfterMs : undefined;
+  let lastActivityAt = Date.now();
+  let lastActivityGeneration: number | undefined;
   do {
-    const requestedWaitMs = parsed.timeoutMs ?? (heartbeatMs > 0 ? heartbeatMs : 60_000);
+    if (expireAfterMs !== undefined && Date.now() - lastActivityAt >= expireAfterMs) {
+      if (failingCode) return 1;
+      emitWatchLine(formatNonEntry('_expired', { expireAfterMs }, format));
+      return 0;
+    }
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      emitControlLine(formatNonEntry('_timeout', { timeoutMs: parsed.timeoutMs }, format));
+      return 124;
+    }
+    const requestedWaitMs = deadlineAt !== undefined
+      ? deadlineAt - Date.now()
+      : parsed.timeoutMs ?? (heartbeatMs > 0 ? heartbeatMs : parsed.untilEvent ? 120_000 : 60_000);
     const heartbeatWaitMs = heartbeatMs > 0
       ? Math.max(0, heartbeatMs - (Date.now() - lastHeartbeatAt))
       : requestedWaitMs;
-    const timeoutMs = parsed.selfTest ? 0 : Math.min(requestedWaitMs, heartbeatWaitMs, 120_000);
+    const expiryWaitMs = expireAfterMs !== undefined ? Math.max(0, expireAfterMs - (Date.now() - lastActivityAt)) : requestedWaitMs;
+    const timeoutMs = parsed.selfTest ? 0 : Math.min(requestedWaitMs, heartbeatWaitMs, expiryWaitMs, 120_000);
     try {
       const callRequest = parsed.selfTest
-        ? { ...request, as: undefined, since: undefined, from: 'now' as const, idleAfterMs: 0, timeoutMs: 0 }
+        ? { ...request, as: undefined, since: undefined, epoch: undefined, from: 'now' as const, idleAfterMs: 0, timeoutMs: 0 }
         : { ...request, timeoutMs, idleWindowStartMs: anonymousIdleWindowStartMs };
       const result = await invokeDaemon('runpane:workspace:wait', [callRequest], workspaceWaitResultSchema, {
         paneDir: parsed.paneDir,
         timeoutMs: timeoutMs + 5_000,
         eventInclude: [],
       });
+      if (result.activityGeneration !== undefined) {
+        if (lastActivityGeneration !== undefined && result.activityGeneration > lastActivityGeneration) lastActivityAt = Date.now();
+        lastActivityGeneration = result.activityGeneration;
+      }
       if (request.session && !result.session) {
         // An older daemon ignores the unknown field and would watch every Pane instead.
         throw new Error('This Pane daemon does not support runpane watch --session; update Pane, or pass one --pane per Session Pane.');
@@ -2208,14 +2322,29 @@ export async function runWatch(parsed: ParsedArgs): Promise<number> {
         emitControlLine(formatNonEntry('_reconnected', { generation: result.generation }, format));
         failingCode = undefined;
       }
-      if (!armed && (parsed.follow || parsed.selfTest)) {
+      if (!armed && (keepsWaiting || parsed.selfTest)) {
         const okLine = formatNonEntry('_ok', { generation: result.generation, epoch: result.epoch }, format);
-        if (parsed.selfTest) emitWatchLine(okLine);
-        else emitControlLine(okLine);
+        // A follow monitor sees WATCH OK as proof it is armed; --until-event prints only its event.
+        if (parsed.follow || parsed.selfTest) emitWatchLine(okLine);
+
         armed = true;
         if (parsed.selfTest) return 0;
       }
-      for (const line of formatWaitResult(result, format)) emitWatchLine(line);
+      if (parsed.untilEvent) {
+        // A reset restates current state; it never ends the wait. Nor does the caller's own panel.
+        if (result.reset || result.dropped !== undefined) {
+          for (const line of formatWaitResult(result, format)) emitControlLine(line);
+        } else {
+          const entries = ownPanelId ? result.entries.filter(entry => entry.panelId !== ownPanelId) : result.entries;
+          if (entries.length > 0) {
+            for (const line of formatWaitResult({ ...result, entries }, format)) emitWatchLine(line);
+            return 0;
+          }
+        }
+      } else {
+        for (const line of formatWaitResult(result, format)) emitWatchLine(line);
+        if (result.entries.some(entry => entry.kind !== 'agent.idle' && !entry.replay && !entry.baseline)) lastActivityAt = Date.now();
+      }
       if (heartbeatMs > 0 && Date.now() - lastHeartbeatAt >= heartbeatMs) {
         emitControlLine(formatNonEntry('_heartbeat', {
           generation: result.generation,
@@ -2225,11 +2354,12 @@ export async function runWatch(parsed: ParsedArgs): Promise<number> {
       }
       if (!watchAs) {
         request.since = result.generation;
-        if (parsed.follow) anonymousIdleWindowStartMs = Date.now();
+        request.epoch = result.epoch;
+        if (keepsWaiting) anonymousIdleWindowStartMs = Date.now();
       }
     } catch (error) {
       const watchError = error instanceof Error ? error : new Error(String(error));
-      if (!parsed.follow || !isRetryableWatchError(watchError)) {
+      if (!keepsWaiting || !isRetryableWatchError(watchError)) {
         return emitWatchFailure(watchError, format);
       }
       const code = watchErrorCode(watchError);
@@ -2240,13 +2370,24 @@ export async function runWatch(parsed: ParsedArgs): Promise<number> {
       failingCode = code;
       await new Promise(resolve => setTimeout(resolve, 1_000));
     }
-  } while (parsed.follow);
+  } while (keepsWaiting);
 
   return 0;
 }
 
 function emitWatchLine(line: string): void {
   output.write(`${line}\n`);
+}
+
+/** Codes a stdout write fails with once its reader is gone: a pipe, a socket pair (macOS), or Windows. */
+const CLOSED_READER_CODES = new Set(['EPIPE', 'ENOTCONN', 'ECONNRESET', 'EOF']);
+
+/** A reader that exits early (`| head -1`) closes stdout; the next write then ends the watch cleanly. */
+function exitWhenReaderCloses(): void {
+  output.on('error', (error: NodeJS.ErrnoException) => {
+    if (!CLOSED_READER_CODES.has(error.code ?? '')) throw error;
+    process.exit(0);
+  });
 }
 
 /** Names older daemons accept; the daemon itself allows up to 128 characters. */
@@ -2717,10 +2858,27 @@ export async function runReport(parsed: ParsedArgs, env: NodeJS.ProcessEnv = pro
   if (parsed.json) {
     printJson(result);
   } else {
-    const sessions = result.sessionIds.length > 0 ? ` Recorded on Session ${result.sessionIds.join(', ')}.` : '';
-    console.log(`Reported ${describeReport(result.report)} for panel ${result.panelId}.${sessions}`);
+    for (const line of describeReportDelivery(result)) console.log(line);
   }
   return 0;
+}
+
+/**
+ * What `runpane report` prints: the report, who recorded it, and how many watches were waiting.
+ * Zero waiting watchers means nobody is waiting right now, not that the report is lost.
+ */
+function describeReportDelivery(result: ReportResult): string[] {
+  const sessions = result.sessionIds.length > 0 ? ` Recorded on Session ${result.sessionIds.join(', ')}.` : '';
+  const watchers = result.liveWatchers ?? 0;
+  const delivered = watchers > 0 ? ` Delivered to ${watchers} waiting watcher${watchers === 1 ? '' : 's'}.` : '';
+  const lines = [`Reported ${describeReport(result.report)} for panel ${result.panelId}.${sessions}${delivered}`];
+  if (result.sessionIds.length > 0 || watchers > 0) return lines;
+  const stored = `It is stored on the panel (runpane agents status --panel ${result.panelId})`;
+  lines.push(result.liveWatchers === undefined
+    ? `No Session recorded this report. ${stored}, and only watchers that list agent.report receive it.`
+    : `No Session recorded this report and no watcher was waiting for it. ${stored}, `
+      + 'and a watch with a named cursor (runpane watch --as <name> --kinds agent.report) still receives it when it next waits.');
+  return lines;
 }
 
 export async function runPanelsSubmit(parsed: ParsedArgs): Promise<number> {
@@ -2839,6 +2997,36 @@ export async function runPanelsWait(parsed: ParsedArgs): Promise<number> {
   }
 
   printPanelWaitResult(result);
+  return result.ok ? 0 : 1;
+}
+
+export async function runPanelsResume(parsed: ParsedArgs): Promise<number> {
+  const scopes = [parsed.panelId, parsed.sessionId, parsed.allStopped].filter(Boolean).length;
+  if (scopes !== 1) {
+    throw new Error('runpane panels resume requires exactly one of --panel, --session, or --all-stopped.');
+  }
+  if (parsed.panelId && parsed.concurrency !== undefined) {
+    throw new Error('runpane panels resume --concurrency applies only to --session or --all-stopped.');
+  }
+  await confirmPanelResume(parsed);
+  if (!parsed.panelId) {
+    return runPanelsResumeMany(parsed);
+  }
+
+  const result = await invokeDaemon('runpane:panels:resume', [{
+    panelId: parsed.panelId,
+    waitReady: parsed.waitReady,
+    readyTimeoutMs: parsed.readyTimeoutMs,
+  }], panelResumeResultSchema, {
+    paneDir: parsed.paneDir,
+    timeoutMs: (parsed.readyTimeoutMs ?? 30_000) + 10_000,
+  });
+
+  if (parsed.json) {
+    printJson(result);
+  } else {
+    printPanelResumeResult(result);
+  }
   return result.ok ? 0 : 1;
 }
 
@@ -3301,6 +3489,29 @@ async function confirmPanelInput(
   }
 }
 
+async function confirmPanelResume(parsed: ParsedArgs): Promise<void> {
+  if (parsed.yes) {
+    return;
+  }
+
+  if (!isInteractiveShell()) {
+    throw new Error('runpane panels resume restarts a Pane terminal. Rerun with --yes in non-interactive shells.');
+  }
+
+  const rl = createInterface({ input, output });
+  try {
+    const target = parsed.panelId
+      ? `panel ${parsed.panelId}`
+      : parsed.sessionId ? `every stopped agent panel in Session ${parsed.sessionId}` : 'every stopped agent panel';
+    const answer = (await rl.question(`Resume ${target}? [y/N] `)).trim().toLowerCase();
+    if (answer !== 'y' && answer !== 'yes') {
+      throw new Error('Cancelled.');
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 async function confirmPanelSubmitComposer(parsed: ParsedArgs): Promise<void> {
   if (parsed.yes) {
     return;
@@ -3377,11 +3588,19 @@ function workspaceLabel(kind: WorkspaceEntryKind): string {
     'pane.created': 'NEW',
     'pane.gone': 'GONE',
     'panel.exited': 'EXIT',
+    'panel.stopped': 'STOPPED',
     'pane.associated': 'JOINED',
     'pane.detached': 'LEFT',
     'pr.conflicted': 'PR CONFLICTED',
     'pr.checks': 'PR CHECKS',
     'pr.merged': 'PR MERGED',
+    'pr.closed': 'PR.CLOSED',
+    'pr.head': 'PR.HEAD',
+    'pr.review': 'PR.REVIEW',
+    'pr.comment': 'PR.COMMENT',
+    'pr.stopped': 'PR.STOPPED',
+    'github.unavailable': 'GITHUB.UNAVAILABLE',
+    'github.recovered': 'GITHUB.RECOVERED',
     'agent.report': 'REPORT',
   } satisfies Record<WorkspaceEntryKind, string>;
   return labels[kind];
@@ -3453,12 +3672,7 @@ function printPaneCreateResult(result: PaneCreateResult, dryRun = false, action:
         continue;
       }
       console.log(`Created ${item.name ?? `pane ${item.index}`}: session ${item.sessionId ?? 'unknown'} panel ${item.panelId ?? 'unknown'}${worktree}`);
-      if (item.readiness) {
-        console.log(`  Ready: ${item.readiness.ok ? 'yes' : item.readiness.timedOut ? 'timed out' : 'blocked'} after ${item.readiness.elapsedMs}ms`);
-        if (item.readiness.blocked) {
-          console.log(`  Blocked: ${item.readiness.blocked.message}`);
-        }
-      }
+      if (item.readiness) printReadiness(item.readiness, '  ');
       printInitialInputDelivery(item.initialInput, '  ');
       if (item.association) {
         console.log(item.association.ok
@@ -3466,6 +3680,9 @@ function printPaneCreateResult(result: PaneCreateResult, dryRun = false, action:
           : `  Not associated with Session ${item.association.sessionId}: ${item.association.error ?? 'unknown error'}`);
       }
       printPromptNotes(item, '  ');
+      if (item.base?.notice) {
+        console.log(`  ! ${item.base.notice}`);
+      }
       if (item.setupQueue) {
         console.log(`  ${item.setupQueue.message}`);
       }
@@ -3547,17 +3764,29 @@ function printArchiveCommitEvidence(
 
 function printPanelCreateResult(result: PanelCreateResult): void {
   console.log(`Created panel ${result.panelId} in pane ${result.paneId}: ${result.title}${result.active ? ' active' : ' background'}`);
-  if (result.readiness) {
-    console.log(`Ready: ${result.readiness.ok ? 'yes' : result.readiness.timedOut ? 'timed out' : 'blocked'} after ${result.readiness.elapsedMs}ms`);
-    if (result.readiness.blocked) {
-      console.log(`Blocked: ${result.readiness.blocked.message}`);
-    }
-  }
+  if (result.readiness) printReadiness(result.readiness);
   printInitialInputDelivery(result.initialInput);
   printPromptNotes(result);
   if (result.nextCommand) {
     console.log(`Next: ${result.nextCommand}`);
   }
+}
+
+/** One-line status for a bulk resume item that resumed but did not become ready. */
+function notReadySummary(readiness: PanelReadiness): string {
+  if (readiness.blocked) return `blocked: ${readiness.blocked.message}`;
+  const state = readiness.reason?.code === 'command-exited' ? 'command exited' : 'not ready';
+  return readiness.reason ? `${state}: ${readiness.reason.message}` : state;
+}
+
+function printReadiness(readiness: PanelReadiness, prefix = ''): void {
+  const state = readiness.ok ? 'yes'
+    : readiness.blocked ? 'blocked'
+    : readiness.reason?.code === 'command-exited' ? 'command exited'
+    : readiness.timedOut ? 'timed out' : 'no';
+  console.log(`${prefix}Ready: ${state} after ${readiness.elapsedMs}ms`);
+  if (readiness.blocked) console.log(`${prefix}Blocked: ${readiness.blocked.message}`);
+  if (readiness.reason) console.log(`${prefix}Why: ${readiness.reason.message}`);
 }
 
 function printInitialInputDelivery(initialInput: InitialInputDeliveryResult | undefined, prefix = ''): void {
@@ -3583,9 +3812,51 @@ function printInitialInputDelivery(initialInput: InitialInputDeliveryResult | un
   }
 }
 
+/** Time the daemon gets to restart every panel in scope, before any readiness wait. */
+const RESUME_MANY_RESTART_BUDGET_MS = 5 * 60_000;
+
+async function runPanelsResumeMany(parsed: ParsedArgs): Promise<number> {
+  const result = await invokeDaemon('runpane:panels:resume-many', [{
+    sessionId: parsed.sessionId,
+    allStopped: parsed.allStopped || undefined,
+    waitReady: parsed.waitReady,
+    readyTimeoutMs: parsed.readyTimeoutMs,
+    concurrency: parsed.concurrency,
+  }], panelResumeManyResultSchema, {
+    paneDir: parsed.paneDir,
+    // The resumed panels wait together, so the wait adds one --ready-timeout-ms however many there are.
+    timeoutMs: RESUME_MANY_RESTART_BUDGET_MS + (parsed.waitReady ? parsed.readyTimeoutMs ?? 30_000 : 0),
+  });
+
+  if (parsed.json) {
+    printJson(result);
+  } else {
+    const scope = result.scope.kind === 'session' ? `Session ${result.scope.sessionName}` : 'every Pane';
+    const notReady = result.notReady > 0 ? `, ${result.notReady} not ready` : '';
+    console.log(`Resumed ${result.resumed} stopped agent panel${result.resumed === 1 ? '' : 's'} in ${scope}, ${result.concurrency} at a time; ${result.alreadyRunning} already running, ${result.failed} failed${notReady}.`);
+    for (const item of result.items) {
+      const status = item.error
+        ? `failed: ${item.error}`
+        : item.readiness && !item.readiness.ok
+          ? notReadySummary(item.readiness)
+          : item.action ?? 'resumed';
+      console.log(`${item.ok ? 'OK' : 'FAIL'} ${item.paneName} panel ${item.panelId}: ${status}`);
+    }
+  }
+  return result.ok ? 0 : 1;
+}
+
+function printPanelResumeResult(result: PanelResumeResult): void {
+  console.log(`${result.action === 'resumed' ? 'Resumed' : 'Already running:'} panel ${result.panelId} in pane ${result.paneId}. ${result.message}`);
+  if (result.readiness) printReadiness(result.readiness);
+  console.log(`Next: ${result.nextCommand}`);
+}
+
 function printPanelWaitResult(result: PanelWaitResult): void {
   if (result.ok) {
     console.log(`Matched ${result.condition} for panel ${result.panelId} after ${result.elapsedMs}ms.`);
+  } else if (result.stopped && !result.timedOut) {
+    console.log(`Panel ${result.panelId} is not running, so it cannot become ${result.condition}.`);
   } else if (result.blocked) {
     console.log(`Blocked waiting for ${result.condition} on panel ${result.panelId}: ${result.blocked.message}`);
   } else if (result.timedOut) {
@@ -3593,8 +3864,10 @@ function printPanelWaitResult(result: PanelWaitResult): void {
   } else {
     console.log(`Did not match ${result.condition} for panel ${result.panelId}.`);
   }
+  if (result.reason) console.log(`Why: ${result.reason.message}`);
 
   const statusParts = [
+    result.state.running === false ? 'stopped' : undefined,
     result.state.initialized ? 'initialized' : 'not-initialized',
     result.state.activityStatus,
     result.state.isCliReady === undefined ? undefined : result.state.isCliReady ? 'cli-ready' : 'cli-not-ready',
@@ -3635,9 +3908,11 @@ function printPanelListResult(result: PanelListResult): void {
   for (const panel of result.panels) {
     const marker = panel.active ? '*' : ' ';
     const initialized = panel.initialized === undefined ? '' : panel.initialized ? ' initialized' : ' not-initialized';
+    const stopped = panel.running === false ? ' stopped' : '';
     const agent = panel.agentType ? ` ${panel.agentType}` : '';
     const detection = panel.agentDetection && panel.agentDetection !== 'command' ? ` (${panel.agentDetection})` : '';
-    console.log(`${marker} ${panel.id}\t${panel.type}\t${panel.title}${initialized}${agent}${detection}`);
+    const resume = panel.resumeId ? ` resume ${panel.resumeId}` : '';
+    console.log(`${marker} ${panel.id}\t${panel.type}\t${panel.title}${initialized}${stopped}${agent}${detection}${resume}`);
   }
 }
 

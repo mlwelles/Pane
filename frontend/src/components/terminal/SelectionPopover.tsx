@@ -18,7 +18,7 @@ export interface SelectionPopoverProps {
   panelTitle?: string;
   sessionId?: string;
   isRemoteMode?: boolean;
-  onOpenInBrowser?: (url: string) => void | Promise<void>;
+  onOpenInBrowser: (url: string) => void | Promise<void>;
   onClose: () => void;
 }
 
@@ -101,13 +101,7 @@ export const SelectionPopover: React.FC<SelectionPopoverProps> = ({
   const handleOpenInBrowser = async () => {
     if (urlMatch && sessionId) {
       try {
-        if (onOpenInBrowser) {
-          await onOpenInBrowser(urlMatch[0]);
-        } else {
-          window.dispatchEvent(new CustomEvent('browser-panel:navigate', {
-            detail: { url: urlMatch[0], sessionId }
-          }));
-        }
+        await onOpenInBrowser(urlMatch[0]);
       } catch (error) {
         console.error('Failed to open URL in browser panel:', error);
       } finally {

@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { browserFileContext } from '../services/browserFileContext';
-import { PaneError, reasonOf } from '../../../shared/paneError';
+import { PaneError, paneErrorText, reasonOf } from '../../../shared/paneError';
 import { isOrchestrationInternalSessionId } from '../../../shared/types/orchestrationSession';
 import type { IpcMain } from 'electron';
 import type { AppServices } from './types';
@@ -28,7 +28,7 @@ import { fastCheckWorkingDirectory, listCommitsAhead } from '../services/gitPlum
 import { assertNewBranchName } from '../services/worktreeManager';
 import { queuedSetupMessage } from '../services/taskQueue';
 import { assessComposerEvidence, hasConfiguredCodexScreen, isSlashCommandInput, looksLikePendingComposer } from './runpaneComposerEvidence';
-import { projectWorkspaceEntry } from '../services/workspaceJournal';
+import { presentStoppedPanel, projectWorkspaceEntry } from '../services/workspaceJournal';
 import { detectAgentState } from '../services/agentStatus/manifestEngine';
 import { getManifestForAgent, CURSOR_MANIFEST } from '../services/agentStatus/manifests';
 import { detectAgentComposer, detectAgentFromScreen, screenShowsQueuedMessage } from '../services/agents/agentScreenSignature';
@@ -60,11 +60,21 @@ import type { Session, SessionOutput } from '../types/session';
 import type { BrowserPanelState, CreatePanelRequest, EditorPanelState, TerminalAgentReport, TerminalPanelState, ToolPanel } from '../../../shared/types/panels';
 import { RUNPANE_CONTRACT } from '../../../shared/types/generatedRunpaneContract';
 import { isAgentSupportedOnPlatform } from '../../../shared/constants/agentLaunchPresets';
+import { getDockTerminalPanel } from '../../../shared/utils/terminalDock';
 import {
   TERMINAL_IMAGE_OPTIONS,
   terminalGraphicsProtocols,
 } from '../../../shared/constants/terminalGraphics';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
+import { customCommandResumeSchema, effectiveCustomResume, type CustomCommandResume } from '../../../shared/types/customCommandResume';
+import {
+  decodeOrchestrationSessionPayload,
+  orchestrationExpectedRevisionSchema,
+  orchestrationLinksSchema,
+  orchestrationReportSchema,
+  orchestrationTextArraySchema,
+  orchestrationTextSchema,
+} from '../services/orchestrationSessionPayload';
 import type {
   RunpaneAgentId,
   RunpaneAgentDoctorRequest,
@@ -109,7 +119,10 @@ import type {
   RunpanePanelActivityStatus,
   RunpanePaneAgentState,
   RunpaneAgentDetection,
+  RunpanePanelResumeSource,
+  RunpanePanelSummary,
   RunpanePanelBlockedState,
+  RunpaneReadinessReason,
   RunpaneDelivery,
   RunpanePanelCreateRequest,
   RunpanePanelCreateResult,
@@ -126,6 +139,11 @@ import type {
   RunpanePanelOutputResult,
   RunpanePanelScreenRequest,
   RunpanePanelScreenResult,
+  RunpanePanelResumeRequest,
+  RunpanePanelResumeResult,
+  RunpanePanelResumeManyItem,
+  RunpanePanelResumeManyRequest,
+  RunpanePanelResumeManyResult,
   RunpanePanelStateSummary,
   RunpanePanelSubmitComposerRequest,
   RunpanePanelSubmitComposerResult,
@@ -224,6 +242,8 @@ const RUNPANE_CHANNELS = [
   'runpane:panels:submit',
   'runpane:panels:submit-composer',
   'runpane:panels:wait',
+  'runpane:panels:resume',
+  'runpane:panels:resume-many',
   'runpane:panels:last-message',
   'runpane:report',
   'runpane:workspace:state',
@@ -238,7 +258,15 @@ const DEFAULT_PANEL_SCREEN_LIMIT = 80;
 const DEFAULT_LAST_MESSAGE_LIMIT = 20_000;
 const LAST_MESSAGE_TRUNCATION_MARKER = '[earlier text truncated]\n';
 const DEFAULT_PANEL_WAIT_TIMEOUT_MS = 30_000;
+/** How long a ready/idle wait lets a panel that is not running start before reporting it stopped. */
+const STOPPED_PANEL_WAIT_GRACE_MS = 2_000;
+/** Agents a bulk resume restarts at once; each spawn also takes one of the terminal manager's slots. */
+const DEFAULT_RESUME_CONCURRENCY = 3;
+const MAX_RESUME_CONCURRENCY = 10;
 const DEFAULT_PANEL_WAIT_INTERVAL_MS = 500;
+/** How much of a blocking prompt a blocked result quotes. */
+const BLOCKED_PROMPT_LINES = 12;
+const BLOCKED_PROMPT_CHARS = 1_500;
 const DEFAULT_COMPOSER_VERIFY_TIMEOUT_MS = 3_000;
 const DEFAULT_COMPOSER_VERIFY_INTERVAL_MS = 100;
 // The transcript settles a delivery the screen leaves open: polled this often, for this long after Enter.
@@ -289,51 +317,38 @@ const orchestrationSelectorSchema = boundary.object({
   sessionId: boundary.optional(boundary.nonEmptyString),
   name: boundary.optional(boundary.nonEmptyString),
 });
-const orchestrationLinkSchema = boundary.object({
-  label: boundary.nonEmptyString,
-  url: boundary.nonEmptyString,
-  kind: boundary.optional(boundary.enumeration('evidence', 'output', 'ticket', 'pull-request', 'other')),
-  provenance: boundary.optional(boundary.string),
-  addedAt: boundary.nonEmptyString,
-});
 const orchestrationSessionCreateSchema = boundary.object({
   runtime: boundary.optional(boundary.enumeration('windows', 'wsl')),
   wslDistribution: boundary.optional(boundary.nonEmptyString),
   name: boundary.nonEmptyString,
   isPinned: boundary.optional(boundary.boolean),
   agent: boundary.optional(boundary.enumeration('claude', 'codex', 'cursor')),
-  launchCommand: boundary.optional(boundary.string),
-  profile: boundary.optional(boundary.string),
-  goal: boundary.optional(boundary.string),
-  context: boundary.optional(boundary.string),
-  decisions: boundary.optional(boundary.array(boundary.string)),
-  blockers: boundary.optional(boundary.array(boundary.string)),
-  nextAction: boundary.optional(boundary.string),
-  evidence: boundary.optional(boundary.array(orchestrationLinkSchema)),
-  outputs: boundary.optional(boundary.array(orchestrationLinkSchema)),
+  launchCommand: boundary.optional(orchestrationTextSchema),
+  profile: boundary.optional(orchestrationTextSchema),
+  goal: boundary.optional(orchestrationTextSchema),
+  context: boundary.optional(orchestrationTextSchema),
+  decisions: boundary.optional(orchestrationTextArraySchema),
+  blockers: boundary.optional(orchestrationTextArraySchema),
+  nextAction: boundary.optional(orchestrationTextSchema),
+  evidence: boundary.optional(orchestrationLinksSchema),
+  outputs: boundary.optional(orchestrationLinksSchema),
 });
 const orchestrationSessionUpdateSchema = boundary.object({
-  name: boundary.optional(boundary.string),
+  name: boundary.optional(orchestrationTextSchema),
   archived: boundary.optional(boundary.boolean),
   isPinned: boundary.optional(boundary.boolean),
   agent: boundary.optional(boundary.enumeration('claude', 'codex', 'cursor')),
-  launchCommand: boundary.optional(boundary.string),
-  profile: boundary.optional(boundary.string),
-  goal: boundary.optional(boundary.string),
-  context: boundary.optional(boundary.string),
-  decisions: boundary.optional(boundary.array(boundary.string)),
-  blockers: boundary.optional(boundary.array(boundary.string)),
-  nextAction: boundary.optional(boundary.string),
-  evidence: boundary.optional(boundary.array(orchestrationLinkSchema)),
-  outputs: boundary.optional(boundary.array(orchestrationLinkSchema)),
-  report: boundary.optional(boundary.nullable(boundary.object({
-    summary: boundary.nonEmptyString,
-    status: boundary.enumeration('reported', 'verified'),
-    evidence: boundary.array(orchestrationLinkSchema),
-    reportedAt: boundary.nonEmptyString,
-    provenance: boundary.nonEmptyString,
-  }))),
-  expectedRevision: boundary.optional(boundary.number),
+  launchCommand: boundary.optional(orchestrationTextSchema),
+  profile: boundary.optional(orchestrationTextSchema),
+  goal: boundary.optional(orchestrationTextSchema),
+  context: boundary.optional(orchestrationTextSchema),
+  decisions: boundary.optional(orchestrationTextArraySchema),
+  blockers: boundary.optional(orchestrationTextArraySchema),
+  nextAction: boundary.optional(orchestrationTextSchema),
+  evidence: boundary.optional(orchestrationLinksSchema),
+  outputs: boundary.optional(orchestrationLinksSchema),
+  report: boundary.optional(boundary.nullable(orchestrationReportSchema)),
+  expectedRevision: boundary.optional(orchestrationExpectedRevisionSchema),
   source: boundary.optional(boundary.enumeration('user', 'agent')),
 });
 const lockOwnerInputSchema = boundary.object({
@@ -916,7 +931,7 @@ export function registerRunpaneHandlers(
             readyTimeoutMs: normalized.readyTimeoutMs,
           });
           items.push({
-            ok: Boolean((!readiness || readiness.ok) && (!initialInput || initialInput.submitted)),
+            ok: Boolean((!readiness || readiness.ok) && isInitialInputDelivered(initialInput, readiness)),
             index,
             name: item.name,
             pinned: item.pinned !== false,
@@ -1027,10 +1042,13 @@ export function registerRunpaneHandlers(
   });
 
   commandRegistry.register('runpane:panels:list', async (request: PaneCommandValue): Promise<RunpanePanelListResult> => {
-    return withRunpaneAction(services, 'panels:list', {}, () => {
+    return withRunpaneAction(services, 'panels:list', {}, async () => {
       const normalized = parsePanelListRequest(request);
       const pane = resolvePane(sessionManager, normalized.paneId);
-      const panels = panelManager.getPanelsForSession(pane.id).map(panelToSummary);
+      const storedPanels = panelManager.getPanelsForSession(pane.id);
+      const dockPanelId = getDockTerminalPanel(storedPanels)?.id;
+      const panels = await Promise.all(storedPanels.map(async panel =>
+        panelToSummary(panel, dockPanelId, await terminalPanelManager.hasLaunchCommandExited(panel.id))));
 
       return {
         ok: true,
@@ -1056,7 +1074,7 @@ export function registerRunpaneHandlers(
       });
 
       return {
-        ok: Boolean((!readiness || readiness.ok) && (!initialInput || initialInput.submitted)),
+        ok: Boolean((!readiness || readiness.ok) && isInitialInputDelivered(initialInput, readiness)),
         paneId: pane.id,
         panelId: panel.id,
         title: panel.title,
@@ -1215,6 +1233,92 @@ export function registerRunpaneHandlers(
       panelId: result.panelId,
       inputBytes: result.inputBytes,
     }));
+  });
+
+  commandRegistry.register('runpane:panels:resume', async (request: PaneCommandValue): Promise<RunpanePanelResumeResult> => {
+    return withRunpaneAction(services, 'panels:resume', {}, async () => {
+      const normalized = parsePanelResumeRequest(request);
+      return resumeTerminalPanel(services, resolveTerminalPanel(normalized.panelId), normalized);
+    }, result => ({
+      paneId: result.paneId,
+      panelId: result.panelId,
+      ok: result.ok,
+      resultCount: result.action === 'resumed' ? 1 : 0,
+    }));
+  });
+
+  commandRegistry.register('runpane:panels:resume-many', async (request: PaneCommandValue): Promise<RunpanePanelResumeManyResult> => {
+    return withRunpaneAction(services, 'panels:resume-many', {}, async () => {
+      const normalized = parsePanelResumeManyRequest(request);
+      let scope: RunpanePanelResumeManyResult['scope'] = { kind: 'all-stopped' };
+      let candidates = workspaceStateReader.listManagedCliPanels();
+      if (normalized.sessionId !== undefined) {
+        const record = await requireOrchestrationSessionManager(services).get({ sessionId: normalized.sessionId });
+        if (record.archived) {
+          throw new PaneError(
+            'ERR_RUNPANE_SESSION_ARCHIVED',
+            `Session ${record.name} is archived, so its panels were not resumed. Nothing was changed.`,
+            `Restore the Session in Pane, then run \`runpane panels resume --session ${record.id} --yes\`.`,
+          );
+        }
+        const membership = services.orchestrationSessionManager?.workspaceMembership(record.id);
+        scope = { kind: 'session', sessionId: record.id, sessionName: record.name };
+        candidates = candidates.filter((candidate) => {
+          const limitedTo = membership?.panes.get(candidate.paneId);
+          return limitedTo !== undefined
+            && (limitedTo.length === 0 || limitedTo.includes(candidate.panelId))
+            && !membership?.ownPaneIds.has(candidate.paneId)
+            && !membership?.ownPanelIds.has(candidate.panelId);
+        });
+      }
+
+      const exited = await Promise.all(candidates.map(candidate => terminalPanelManager.hasLaunchCommandExited(candidate.panelId)));
+      const stopped = candidates.filter((candidate, index) => !candidate.running || exited[index]);
+      const concurrency = normalized.concurrency ?? DEFAULT_RESUME_CONCURRENCY;
+      // Restart --concurrency panels at a time, then wait on all of them together, so the whole
+      // call takes the restarts plus one ready timeout however many panels are in scope.
+      const restarted = await mapWithConcurrency(stopped, concurrency, async (candidate): Promise<RunpanePanelResumeManyItem> => {
+        const base = {
+          panelId: candidate.panelId,
+          paneId: candidate.paneId,
+          paneName: candidate.paneName,
+          panelTitle: candidate.panelTitle,
+          agentType: candidate.agentType,
+        };
+        try {
+          const result = await resumeTerminalPanel(services, resolveTerminalPanel(candidate.panelId), { waitReady: false });
+          return { ...base, ok: result.ok, action: result.action, message: result.message, agentSessionId: result.agentSessionId };
+        } catch (error) {
+          return { ...base, ok: false, error: error instanceof PaneError ? paneErrorText(error) : error instanceof Error ? error.message : String(error) };
+        }
+      });
+      const items = normalized.waitReady
+        ? await Promise.all(restarted.map(async (item): Promise<RunpanePanelResumeManyItem> => {
+          if (item.error !== undefined) return item;
+          const panel = panelManager.getPanel(item.panelId);
+          if (!panel) return { ...item, ok: false, error: `Panel ${item.panelId} disappeared while resuming` };
+          const readiness = toPaneReadiness(await waitForPanel(panel, {
+            panelId: panel.id,
+            condition: 'ready',
+            timeoutMs: normalized.readyTimeoutMs ?? DEFAULT_PANEL_WAIT_TIMEOUT_MS,
+            intervalMs: DEFAULT_PANEL_WAIT_INTERVAL_MS,
+          }));
+          return { ...item, ok: readiness.ok, readiness };
+        }))
+        : restarted;
+
+      return {
+        ok: items.every(item => item.ok),
+        scope,
+        resumed: items.filter(item => item.action === 'resumed').length,
+        alreadyRunning: candidates.length - stopped.length + items.filter(item => item.action === 'already-running').length,
+        failed: items.filter(item => item.error !== undefined).length,
+        notReady: items.filter(item => item.readiness !== undefined && !item.readiness.ok).length,
+        concurrency,
+        items,
+        nextCommand: scope.kind === 'session' ? `runpane sessions overview --session ${scope.sessionId} --json` : undefined,
+      };
+    }, result => ({ ok: result.ok, resultCount: result.resumed }));
   });
 
   commandRegistry.register('runpane:panels:screen', async (request: PaneCommandValue): Promise<RunpanePanelScreenResult> => {
@@ -1455,7 +1559,7 @@ export function registerRunpaneHandlers(
       const report = normalizeAgentReport(normalized, new Date().toISOString());
       await storePanelAgentReport(panel, report);
       const panelSummary = panelToSummary(panelManager.getPanel(panel.id) ?? panel);
-      workspaceJournal.appendPaneEntry(panel.sessionId, {
+      const { liveWatchers } = workspaceJournal.deliverPaneEntry(panel.sessionId, {
         kind: 'agent.report',
         panelId: panel.id,
         panelTitle: panel.title,
@@ -1464,9 +1568,23 @@ export function registerRunpaneHandlers(
         report: journalAgentReport(report),
       });
       const sessionIds = await services.orchestrationSessionManager?.recordAgentReport(panel.id, report) ?? [];
-      return { ok: true, paneId: panel.sessionId, panelId: panel.id, report, sessionIds };
+      return { ok: true, paneId: panel.sessionId, panelId: panel.id, report, sessionIds, liveWatchers };
     }, result => ({ paneId: result.paneId, panelId: result.panelId, ok: result.ok }));
   });
+
+  for (const action of ['watch', 'unwatch', 'list'] as const) {
+    commandRegistry.register(`runpane:pr:${action}`, async (request: PaneCommandValue = {}) => {
+      const input = decodeBoundary(request, boundary.object({
+        paneId: boundary.optional(boundary.string), url: boundary.optional(boundary.string), head: boundary.optional(boundary.string),
+      }));
+      const monitor = services.sessionPrMonitor;
+      if (!monitor) throw new PaneError('ERR_PR_WATCH_UNAVAILABLE', 'PR watching is unavailable in this daemon. Nothing was changed.', 'Update Pane and retry.');
+      if (action === 'list') return { ok: true, watches: monitor.list(input.paneId) };
+      if (!input.paneId || !input.url) throw new PaneError('ERR_PR_WATCH_ARGUMENT', 'PR watch needs a Pane and PR URL. Nothing was changed.', 'Pass --pane <id> --url https://github.com/owner/repo/pull/123.');
+      if (action === 'unwatch') return { ok: true, removed: monitor.unwatch(input.paneId, input.url) };
+      return { ok: true, ...monitor.watch(input.paneId, input.url, input.head) };
+    });
+  }
 
   commandRegistry.register('runpane:workspace:state', async (request: PaneCommandValue = {}): Promise<RunpaneWorkspaceStateResult> => {
     return withRunpaneAction(services, 'workspace:state', {}, () => {
@@ -1474,7 +1592,8 @@ export function registerRunpaneHandlers(
       const project = normalized.repo
         ? resolveRepoSelector(databaseService.getAllProjects(), normalized.repo)
         : undefined;
-      return workspaceStateReader.read(project?.id);
+      const state = workspaceStateReader.read(project?.id);
+      return { ...state, entries: state.entries.map(entry => presentStoppedPanel(entry, {})) };
     }, result => ({ resultCount: result.entries.length }));
   });
 
@@ -1529,6 +1648,7 @@ export function registerRunpaneHandlers(
         // Baseline entries restate current state after a reset; replay marks them so a consumer never
         // reads a replayed agent.ready as a turn that just ended.
         const baselineEntries = (): RunpaneWorkspaceEntry[] => workspaceStateReader.read(project?.id).entries
+          .map(entry => presentStoppedPanel(entry, filter))
           .filter(workspaceJournal.matcher(filter))
           .map(entry => ({ ...projectWorkspaceEntry(entry, filter), replay: true as const }));
 
@@ -1552,6 +1672,10 @@ export function registerRunpaneHandlers(
           }
         }
 
+        if (normalized.epoch !== undefined && normalized.epoch !== workspaceJournal.epoch) {
+          reset = { reason: 'epoch-changed' };
+        }
+
         if (reset) {
           const silentBaseline = reset.reason === 'first-use' && normalized.from !== 'earliest';
           const baseline = silentBaseline ? [] : baselineEntries()
@@ -1561,12 +1685,13 @@ export function registerRunpaneHandlers(
           return {
             ok: true,
             epoch: workspaceJournal.epoch,
+            activityGeneration: workspaceJournal.activityGeneration(filter),
             generation: workspaceJournal.generation,
             entries,
             timedOut: false,
             reset,
             session,
-            nextCommand: workspaceNextCommand(normalized, workspaceJournal.generation, session),
+            nextCommand: workspaceNextCommand(normalized, workspaceJournal.generation, workspaceJournal.epoch, session),
           };
         }
 
@@ -1662,13 +1787,14 @@ export function registerRunpaneHandlers(
         return {
           ok: true,
           epoch: workspaceJournal.epoch,
+          activityGeneration: workspaceJournal.activityGeneration(filter),
           generation,
           entries,
           timedOut: entries.length === 0 && (cadence !== undefined || waited.timedOut),
           dropped: waited.dropped,
           reset,
           session,
-          nextCommand: workspaceNextCommand(normalized, generation, session),
+          nextCommand: workspaceNextCommand(normalized, generation, workspaceJournal.epoch, session),
         };
       } finally {
         lease.release();
@@ -1743,12 +1869,15 @@ function resolveAggregatedAgentStatus(panels: readonly ToolPanel[]): RunpanePane
 }
 
 /**
- * A Pane with a live terminal is running, whatever lifecycle value was stored
- * when it was created or adopted. Errors and startup keep their stored status.
+ * A Pane with a live tool or agent terminal is running, whatever lifecycle value was
+ * stored when it was created or adopted. The dock shell is ambient and doesn't count.
+ * Errors and startup keep their stored status.
  */
 function resolvePaneLiveStatus(session: Session, panels: readonly ToolPanel[]): string {
   if (session.status === 'error' || session.status === 'initializing') return session.status;
-  const hasLiveTerminal = panels.some(panel => panel.type === 'terminal' && terminalPanelManager.isTerminalInitialized(panel.id));
+  const dockPanelId = getDockTerminalPanel(panels)?.id;
+  const hasLiveTerminal = panels.some(panel =>
+    panel.type === 'terminal' && panel.id !== dockPanelId && terminalPanelManager.isTerminalInitialized(panel.id));
   return hasLiveTerminal ? 'running' : session.status;
 }
 
@@ -1774,7 +1903,31 @@ function optionalAgentDetection(value: PaneCommandValue): RunpaneAgentDetection 
   }
 }
 
-function panelToSummary(panel: ToolPanel) {
+function optionalCustomResume(value: PaneCommandValue): CustomCommandResume | undefined {
+  try {
+    return decodeBoundary(value, customCommandResumeSchema);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The panel's saved resume ID and which rule would resume it, so an orchestrator can reopen a stopped panel. */
+function panelResumeSummary(
+  customState: Record<string, PaneCommandValue>,
+  initialCommand: string | undefined,
+): Pick<RunpanePanelSummary, 'resumeId' | 'resumeSource'> {
+  const resumeId = optionalString(customState.agentSessionId);
+  if (!resumeId) return {};
+  const source = effectiveCustomResume({ initialCommand, customResume: optionalCustomResume(customState.customResume) })?.source;
+  const resumeSource: RunpanePanelResumeSource = source === 'agent-farm' ? 'agent-farm' : source === 'explicit' ? 'configured' : 'agent';
+  return { resumeId, resumeSource };
+}
+
+/**
+ * Pass the Pane's dock shell id (see getDockTerminalPanel) to mark that panel `dock: true`, and
+ * `launchExited` (hasLaunchCommandExited) to report a panel whose command exited to its shell as stopped.
+ */
+function panelToSummary(panel: ToolPanel, dockPanelId?: string, launchExited = false) {
   const customState = isRecord(panel.state.customState) ? panel.state.customState : {};
   const initialCommand = optionalString(customState.initialCommand);
   const commandAgentType = resolveAgentTypeFromCommand(initialCommand);
@@ -1791,14 +1944,17 @@ function panelToSummary(panel: ToolPanel) {
     title: panel.title,
     active: Boolean(panel.state.isActive),
     initialized: panel.type === 'terminal' ? terminalPanelManager.isTerminalInitialized(panel.id) : undefined,
+    running: panel.type === 'terminal' ? terminalPanelManager.isTerminalInitialized(panel.id) && !launchExited : undefined,
     agentType,
     agentDetection,
     launchCommand: optionalString(customState.launchCommand) ?? initialCommand,
     isCliPanel,
+    dock: panel.id === dockPanelId || undefined,
     position: optionalNumber(panel.metadata.position),
     createdAt: toIsoString(panel.metadata.createdAt),
     lastActiveAt: toIsoString(panel.metadata.lastActiveAt),
     report: readPanelAgentReport(panel),
+    ...panelResumeSummary(customState, initialCommand),
   };
 }
 
@@ -1950,9 +2106,9 @@ async function createTerminalPanelForSession(
   );
   const launch = options.launch !== false;
   const waitReady = launch && options.waitReady;
+  // A waited create delivers its own typed message, to the declared agent or the one Pane detects.
   const shouldCreateSubmitInitialInput = Boolean(
     waitReady &&
-    tool.agent &&
     tool.initialInput &&
     !useArgumentDelivery,
   );
@@ -2007,9 +2163,44 @@ async function createTerminalPanelForSession(
     }))
     : undefined;
 
-  const initialInput = readiness ? await submitCreateInitialInput(panel, tool, useArgumentDelivery, readiness, session.worktreePath) : undefined;
+  const initialInput = readiness
+    ? await submitCreateInitialInput(panel, tool, useArgumentDelivery, readiness, session.worktreePath)
+    : unawaitedInitialInput(panel, tool, useArgumentDelivery);
 
   return { panel, readiness, initialInput, promptFile, warnings };
+}
+
+/**
+ * Whether a create's starting message counts as delivered for its `ok`:
+ * Claude and Codex need a verified submit, agents Pane cannot verify
+ * (Cursor, OpenCode) need it sent. An unawaited message never fails a create.
+ */
+function isInitialInputDelivered(initialInput: RunpaneInitialInputDeliveryResult | undefined, readiness: RunpanePaneReadiness | undefined): boolean {
+  if (!initialInput || !readiness) return true;
+  return initialInput.verifiedSubmitted === true || (initialInput.verification === 'unverifiable' && initialInput.submitted);
+}
+
+/** A starting message the create did not wait for: the terminal manager sends it once the agent is ready. */
+function unawaitedInitialInput(
+  panel: ToolPanel,
+  tool: RunpaneResolvedTool,
+  useArgumentDelivery: boolean,
+): RunpaneInitialInputDeliveryResult | undefined {
+  if (!tool.initialInput) return undefined;
+  return {
+    delivered: false,
+    submitted: false,
+    verifiedSubmitted: false,
+    inputBytes: Buffer.byteLength(tool.initialInput, 'utf8'),
+    delivery: {
+      state: 'unknown',
+      evidence: useArgumentDelivery ? 'argv' : 'screen',
+      message: useArgumentDelivery
+        ? 'The message goes to the agent as a launch argument; this call did not wait (--wait-ready), so delivery is not verified.'
+        : 'Pane sends the message once the agent\'s input box is ready; this call did not wait (--wait-ready), so delivery is not verified.',
+    },
+    nextCommand: panelWaitCommand(panel.id),
+  };
 }
 
 async function submitCreateInitialInput(
@@ -2031,9 +2222,12 @@ async function submitCreateInitialInput(
     const sentAt = optionalString(customState.initialInputSentAt);
     const deliveryError = optionalString(customState.initialInputError);
     const delivered = Boolean(sentAt) && !deliveryError;
-    const delivery: RunpaneDelivery = delivered && readiness?.ok === true
-      ? await argumentDelivery(panel, tool, cwd, sentAt)
-      : { state: 'unknown', evidence: 'argv' };
+    const verifiable = tool.agent === 'claude' || tool.agent === 'codex';
+    const delivery: RunpaneDelivery = !verifiable
+      ? { state: 'unknown', evidence: 'argv', message: unverifiableDeliveryMessage(tool.agent) }
+      : delivered && readiness?.ok === true
+        ? await argumentDelivery(panel, tool, cwd, sentAt)
+        : { state: 'unknown', evidence: 'argv' };
     const result: RunpaneInitialInputDeliveryResult = {
       delivered,
       submitted: delivered,
@@ -2041,6 +2235,7 @@ async function submitCreateInitialInput(
       strategy: 'argument',
       sequenceName: 'argument',
       verifiedSubmitted: delivery.state === 'taken' || delivery.state === 'queued',
+      verification: verifiable ? undefined : 'unverifiable',
       delivery,
       sentAt,
       nextCommand: readiness?.nextCommand ?? panelWaitCommand(panel.id),
@@ -2053,38 +2248,116 @@ async function submitCreateInitialInput(
     return result;
   }
 
-  if (!tool.agent || !readiness) {
+  if (!readiness) {
     return undefined;
   }
+  const inputBytes = Buffer.byteLength(tool.initialInput, 'utf8');
 
   if (!readiness.ok) {
-    await clearInitialInputSentPremark(panel);
-    terminalPanelManager.deliverPendingInitialInput(panel.id);
+    // A prompt the person can answer, or an agent still starting, gets the message once it is ready.
+    if (readiness.blocked || readiness.state.agentType) {
+      await clearInitialInputSentPremark(panel);
+      terminalPanelManager.deliverPendingInitialInput(panel.id);
+      return {
+        delivered: false,
+        submitted: false,
+        verifiedSubmitted: false,
+        inputBytes,
+        error: {
+          message: readiness.blocked
+            ? 'The panel is waiting at a prompt, so the starting message was not sent. Pane sends it once the prompt is answered and the agent\'s input box is ready.'
+            : 'The agent is not ready yet, so the starting message was not sent. Pane sends it once the agent\'s input box is ready.',
+        },
+        nextCommand: readiness.nextCommand ?? panelWaitCommand(panel.id),
+      };
+    }
+    // No agent to give it to: never type it into a shell or a wrapper.
+    const message = `${readiness.reason?.code === 'command-exited' ? 'The launch command exited' : 'No supported agent appeared'}, so the starting message was not sent. `
+      + 'Pane will not type it into the shell. Check the screen, then send it with runpane panels submit once an agent is running.';
+    await markInitialInputUndelivered(panel, message);
+    logStartingMessage(panel.id, 'not sent', { bytes: inputBytes, reason: readiness.reason?.code ?? 'not-ready' });
     return {
       delivered: false,
       submitted: false,
       verifiedSubmitted: false,
-      inputBytes: Buffer.byteLength(tool.initialInput, 'utf8'),
-      error: { message: 'The agent is not ready yet, so initial input is queued and sent once it is.' },
-      nextCommand: readiness.nextCommand ?? panelWaitCommand(panel.id),
+      inputBytes,
+      error: { message },
+      nextCommand: panelScreenCommand(panel.id),
     };
   }
 
-  if (tool.agent !== 'claude' && tool.agent !== 'codex') {
-    const paste = tool.agent === 'opencode' && isLongPrompt(tool.initialInput)
+  const agent = tool.agent ?? readiness.state.agentType;
+  if (!agent) {
+    // A plain terminal with no launch command: its bytes as typed, then Enter.
+    terminalPanelManager.writeToTerminal(panel.id, ensureSubmitEnter(tool.initialInput));
+    return { delivered: true, submitted: true, verifiedSubmitted: false, verification: 'unverifiable', inputBytes, nextCommand: panelScreenCommand(panel.id) };
+  }
+  // An agent's composer reads CR as Enter; a detected agent gets the same text a declared one would.
+  const text = tool.agent ? tool.initialInput : stripTrailingNewlines(normalizePromptNewlines(tool.initialInput));
+  const agentTool: RunpaneResolvedTool = { ...tool, agent, initialInput: text };
+  const detection = tool.agent ? 'declared' : panelAgentDetection(panel) ?? 'detected';
+
+  if (agent !== 'claude' && agent !== 'codex') {
+    const paste = agent === 'opencode' && isLongPrompt(text)
       && terminalPanelManager.isBracketedPasteEnabled(panel.id);
-    terminalPanelManager.writeToTerminal(panel.id, paste ? bracketedPaste(tool.initialInput) : tool.initialInput);
+    logStartingMessage(panel.id, 'writing', { agent, detection, bytes: Buffer.byteLength(text, 'utf8'), submit: 'enter' });
+    terminalPanelManager.writeToTerminal(panel.id, paste ? bracketedPaste(text) : text);
     await sleep(300);
     if (paste) await waitForPanelOutputQuiet(panel.id);
-    return submitCreateComposerInput(panel, tool, tool.initialInput);
+    const result = await submitCreateComposerInput(panel, agentTool, text);
+    const unverifiable: RunpaneInitialInputDeliveryResult = {
+      ...result,
+      verification: 'unverifiable',
+      delivery: { state: 'unknown', evidence: 'screen', message: unverifiableDeliveryMessage(agent) },
+    };
+    logStartingMessage(panel.id, 'sent', { agent, delivery: 'unknown', submitted: result.submitted });
+    return unverifiable;
   }
-  const staged = await stageComposerText(panel, tool.agent, tool.initialInput);
-  return submitCreateComposerInput(panel, tool, staged.evidenceText, composerDeliveryProbe(panel, cwd, tool.agent, tool.initialInput));
+  logStartingMessage(panel.id, 'writing', {
+    agent, detection, bytes: Buffer.byteLength(text, 'utf8'), submit: agent === 'codex' ? 'codex-ctrl-enter' : 'enter',
+  });
+  const staged = await stageComposerText(panel, agent, text);
+  const result = await submitCreateComposerInput(panel, agentTool, staged.evidenceText, composerDeliveryProbe(panel, cwd, agent, text));
+  logStartingMessage(panel.id, result.verifiedSubmitted ? 'confirmed' : 'unconfirmed', {
+    agent, delivery: result.delivery?.state ?? 'unknown', evidence: result.delivery?.evidence, attempts: result.attempts,
+  });
+  return result;
+}
+
+function unverifiableDeliveryMessage(agent: RunpaneAgentId | undefined): string {
+  const title = agent ? AGENT_TEMPLATES[agent].title : 'this agent';
+  return `Pane cannot verify that ${title} accepted the message; check its screen.`;
+}
+
+function panelAgentDetection(panel: ToolPanel): string | undefined {
+  const customState = (panelManager.getPanel(panel.id) ?? panel).state.customState;
+  return isRecord(customState) ? optionalString(customState.agentDetection) : undefined;
+}
+
+/**
+ * One log line when Pane writes a create's starting message and one when it
+ * confirms or gives up. Never the message text.
+ */
+function logStartingMessage(panelId: string, event: string, fields: Record<string, string | number | boolean | undefined>): void {
+  const detail = Object.entries({ ...fields, agentFarmSession: terminalPanelManager.getLaunchSessionId(panelId) })
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(' ');
+  console.log(`[Runpane] Starting message ${event} for panel ${panelId}: ${detail}`);
+}
+
+/** Record that the create's starting message was not sent; the pre-mark stays so nothing types it later. */
+async function markInitialInputUndelivered(panel: ToolPanel, message: string): Promise<void> {
+  const currentPanel = panelManager.getPanel(panel.id) ?? panel;
+  const state = currentPanel.state ?? {};
+  const customState = isRecord(state.customState) ? state.customState : {};
+  await panelManager.updatePanel(panel.id, { state: { ...state, customState: { ...customState, initialInputError: message } } });
 }
 
 /**
  * Launch arguments prove routing, not acceptance. Verify the recorded turn or
- * a visible queue acknowledgement. One read: create has already waited for ready.
+ * a visible queue acknowledgement, giving the transcript the delivery window
+ * from launch to appear.
  */
 async function argumentDelivery(
   panel: ToolPanel,
@@ -2101,6 +2374,10 @@ async function argumentDelivery(
   const screen = await buildPanelScreenResult(panel, DEFAULT_PANEL_SCREEN_LIMIT);
   if (probe && screenShowsQueuedMessage(screen.text, probe.agentType, tool.initialInput ?? '')) {
     return { state: 'queued', evidence: 'screen' };
+  }
+  if (probe && !Number.isNaN(sentAtMs)) {
+    const late = await waitForTranscriptDelivery({ ...probe, sentAtMs }, Math.max(TRANSCRIPT_POLL_INTERVAL_MS, TRANSCRIPT_DELIVERY_TIMEOUT_MS - (Date.now() - sentAtMs)));
+    if (late) return late;
   }
   return { state: 'unknown', evidence: 'argv' };
 }
@@ -2339,6 +2616,7 @@ async function createPaneItem(
           message: `${queuedSetupMessage(setupPosition)}. Its agent starts after setup.`,
         },
         association,
+        base: sessionResult.base,
       };
     }
     await taskQueue.waitForSetup(session.id, Math.max(0, createDeadline - Date.now()));
@@ -2349,7 +2627,7 @@ async function createPaneItem(
       readyTimeoutMs: options.readyTimeoutMs,
     });
 
-    const itemOk = Boolean((!readiness || readiness.ok) && (!initialInput || initialInput.submitted));
+    const itemOk = Boolean((!readiness || readiness.ok) && isInitialInputDelivered(initialInput, readiness));
     return {
       ok: itemOk,
       index,
@@ -2368,6 +2646,7 @@ async function createPaneItem(
       association,
       promptFile,
       warnings,
+      base: sessionResult.base,
     };
   } catch (error) {
     // Two creates for one branch can both pass the early check; name the Pane that won.
@@ -2431,7 +2710,7 @@ class RunpaneCodedError extends Error {
 }
 
 function isPaneCreateItemSuccessful(item: RunpanePaneCreateResultItem): boolean {
-  return item.ok && (!item.readiness || item.readiness.ok) && (!('initialInput' in item) || !item.initialInput || item.initialInput.submitted);
+  return item.ok && (!item.readiness || item.readiness.ok) && (!('initialInput' in item) || isInitialInputDelivered(item.initialInput, item.readiness));
 }
 
 /**
@@ -2476,6 +2755,111 @@ function resolvePanelCreateActivation(
   return !tool.agent;
 }
 
+/**
+ * Restart a stopped terminal panel in place: the same restart the app runs when it shows the
+ * panel, so the saved launch command resolves to the agent's resume command. A running panel is
+ * left alone.
+ */
+async function resumeTerminalPanel(
+  services: AppServices,
+  panel: ToolPanel,
+  options: Pick<RunpanePanelResumeRequest, 'waitReady' | 'readyTimeoutMs'>,
+): Promise<RunpanePanelResumeResult> {
+  const pane = services.sessionManager.getSession(panel.sessionId);
+  // Archive marks the Pane before bounded process teardown and worktree removal.
+  // Cleanup may still be running or have failed; neither makes it resumable.
+  if (pane?.archived) {
+    throw new PaneError(
+      'ERR_RUNPANE_PANE_ARCHIVED',
+      `Pane ${pane.id} is archived, so panel ${panel.id} was not resumed. Nothing was changed.`,
+      'Restore the Pane from the Archived list in Pane before resuming its panels.',
+    );
+  }
+  // SAFETY: callers resolveTerminalPanel before reaching this terminal-only action.
+  const heldState = panel.state.customState as TerminalPanelState | undefined;
+  if (heldState?.updateResumeHold) {
+    await panelManager.updatePanel(panel.id, { state: { ...panel.state, customState: { ...heldState, updateResumeHold: undefined, updateResumeId: undefined } } });
+    panel = panelManager.getPanel(panel.id) ?? panel;
+  }
+  const waitIfAsked = async (target: ToolPanel) => options.waitReady
+    ? toPaneReadiness(await waitForPanel(target, {
+      panelId: target.id,
+      condition: 'ready',
+      timeoutMs: options.readyTimeoutMs ?? DEFAULT_PANEL_WAIT_TIMEOUT_MS,
+      intervalMs: DEFAULT_PANEL_WAIT_INTERVAL_MS,
+    }))
+    : undefined;
+  if (terminalPanelManager.isTerminalInitialized(panel.id)) {
+    // The agent exited back to Pane's shell: run its saved command there again, once for overlapping resumes.
+    if (await terminalPanelManager.relaunchIfExited(panel.id)) {
+      const relaunched = panelManager.getPanel(panel.id) ?? panel;
+      return panelResumeResult(relaunched, 'resumed', resumeMessage(relaunched), await waitIfAsked(relaunched));
+    }
+    // It may have just been started elsewhere (the app shows the Pane), so still answer --wait-ready.
+    return panelResumeResult(panel, 'already-running', 'The panel is already running; nothing was restarted.', await waitIfAsked(panel));
+  }
+
+  const customState = isRecord(panel.state.customState) ? panel.state.customState : {};
+  const cwd = pane?.worktreePath
+    ?? optionalString(customState.cwd)
+    ?? process.cwd();
+  // initializeTerminal also checks the old process tree: absence from the live
+  // PTY map alone does not prove that bounded teardown finished killing it.
+  await terminalPanelManager.initializeTerminal(panel, cwd, sessionWslContext(services, panel.sessionId));
+  const resumed = panelManager.getPanel(panel.id) ?? panel;
+  return panelResumeResult(resumed, 'resumed', resumeMessage(resumed), await waitIfAsked(resumed));
+}
+
+/** Run `worker` over `items`, at most `limit` at a time, keeping the input order in the results. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await worker(items[index]);
+    }
+  });
+  await Promise.all(lanes);
+  return results;
+}
+
+function panelResumeResult(
+  panel: ToolPanel,
+  action: RunpanePanelResumeResult['action'],
+  message: string,
+  readiness?: RunpanePaneReadiness,
+): RunpanePanelResumeResult {
+  const summary = panelToSummary(panel);
+  return {
+    ok: readiness?.ok ?? true,
+    panelId: panel.id,
+    paneId: panel.sessionId,
+    action,
+    message,
+    agentType: summary.agentType,
+    agentSessionId: summary.resumeId,
+    panel: summary,
+    readiness,
+    nextCommand: readiness?.nextCommand ?? (action === 'resumed' ? panelWaitCommand(panel.id) : panelScreenCommand(panel.id)),
+  };
+}
+
+function resumeMessage(panel: ToolPanel): string {
+  const customState = isRecord(panel.state.customState) ? panel.state.customState : {};
+  const initialCommand = optionalString(customState.initialCommand);
+  if (!initialCommand) return 'Started a new shell in the panel.';
+  const { resumeId, resumeSource } = panelResumeSummary(customState, initialCommand);
+  if (!resumeId) return "Relaunched the panel's command.";
+  return resumeSource === 'agent-farm'
+    ? `Relaunched the panel's Agent Farm command with --resume ${resumeId}.`
+    : `Relaunched the panel's agent, resuming conversation ${resumeId}.`;
+}
+
 function toPaneReadiness(result: RunpanePanelWaitResult): RunpanePaneReadiness {
   return {
     ok: result.ok,
@@ -2485,6 +2869,7 @@ function toPaneReadiness(result: RunpanePanelWaitResult): RunpanePaneReadiness {
     elapsedMs: result.elapsedMs,
     state: result.state,
     blocked: result.blocked,
+    reason: result.reason,
     nextCommand: result.nextCommand,
   };
 }
@@ -2513,7 +2898,7 @@ async function buildPanelScreenResult(panel: ToolPanel, limit: number): Promise<
   await terminalPanelManager.waitForTerminalState(panel.id);
   const liveSnapshot = terminalPanelManager.getTerminalSnapshot(panel.id);
   const customState = getTerminalCustomState(panel);
-  const state = panelStateSummary(panel, liveSnapshot, customState);
+  const state = panelStateSummary(panel, liveSnapshot, customState, await terminalPanelManager.hasLaunchCommandExited(panel.id));
   const persisted = liveSnapshot ? null : panelDatabase.getPanelBuffers(panel.id);
   const { source, rawText } = selectPanelScreenText(liveSnapshot, customState, persisted);
   const bounded = boundSanitizedLines(rawText, limit);
@@ -2538,7 +2923,9 @@ async function buildPanelScreenResult(panel: ToolPanel, limit: number): Promise<
     text: bounded.text,
     state,
     composer,
-    nextCommand: bounded.hasMore ? panelOutputCommand(panel.id) : panelWaitCommand(panel.id),
+    nextCommand: !state.running
+      ? panelResumeCommand(panel.id)
+      : bounded.hasMore ? panelOutputCommand(panel.id) : panelWaitCommand(panel.id),
   };
 }
 
@@ -2546,12 +2933,15 @@ function panelStateSummary(
   panel: ToolPanel,
   snapshot: TerminalPanelSnapshot | null,
   customState: TerminalPanelState = getTerminalCustomState(panel),
+  launchExited = false,
 ): RunpanePanelStateSummary {
   const customAgentType = optionalAgentId(customState.agentType);
   const hasLiveTerminal = Boolean(snapshot || terminalPanelManager.isTerminalInitialized(panel.id));
 
   return {
     initialized: hasLiveTerminal,
+    // Its shell is alive, but the command it launched has exited: stopped, so `panels resume` relaunches it.
+    running: hasLiveTerminal && !launchExited,
     isAlternateScreen: snapshot?.isAlternateScreen ?? customState.isAlternateScreen,
     activityStatus: snapshot?.activityStatus,
     isCliReady: snapshot?.isCliReady ?? (hasLiveTerminal ? customState.isCliReady : undefined),
@@ -2587,13 +2977,17 @@ async function waitForPanel(panel: ToolPanel, request: RunpanePanelWaitRequest):
   let condition = request.condition ?? defaultWaitCondition(lastScreen.state);
   let requiresFirstEvaluation = true;
   let readyCandidate = false;
+  const launched = Boolean(panelLaunchCommand(panel));
 
   while (requiresFirstEvaluation || Date.now() - startedAt <= timeoutMs) {
     requiresFirstEvaluation = false;
     lastScreen = await buildPanelScreenResult(panel, DEFAULT_PANEL_SCREEN_LIMIT);
     condition = request.condition ?? defaultWaitCondition(lastScreen.state);
-    const blocked = detectPanelBlocker(lastScreen.text, lastScreen.state.agentType, panel.id);
-    const matched = isWaitConditionMatched(condition, lastScreen, request.contains, blocked);
+    // A stopped panel's saved screen can show an old prompt; it is not a live blocker.
+    const blocked = lastScreen.state.running
+      ? detectPanelBlocker(lastScreen.text, lastScreen.state.agentType, panel.id)
+      : undefined;
+    const matched = isWaitConditionMatched(condition, lastScreen, request.contains, blocked, launched);
 
     // Codex briefly paints a usable-looking composer before its first-run menu.
     // Confirm CLI readiness on the next poll instead of accepting that boot frame.
@@ -2605,37 +2999,124 @@ async function waitForPanel(panel: ToolPanel, request: RunpanePanelWaitRequest):
     if (blocked && condition !== 'text') {
       return panelWaitResult(panel, condition, false, false, startedAt, lastScreen, blocked);
     }
+    if (condition === 'ready' && launched && await terminalPanelManager.hasLaunchCommandExited(panel.id)) {
+      return panelWaitResult(panel, condition, false, false, startedAt, lastScreen, undefined, commandExitedReason(panel, lastScreen));
+    }
+    // Give a lazy start a moment, then report a panel that is not running instead of timing out.
+    if (
+      (condition === 'ready' || condition === 'idle') &&
+      !lastScreen.state.running &&
+      Date.now() - startedAt >= STOPPED_PANEL_WAIT_GRACE_MS
+    ) {
+      return panelWaitResult(panel, condition, false, false, startedAt, lastScreen);
+    }
 
     const remainingMs = timeoutMs - (Date.now() - startedAt);
     if (remainingMs <= 0) break;
     await sleep(Math.min(intervalMs, Math.max(1, timeoutMs / 2), remainingMs));
   }
 
-  return panelWaitResult(panel, condition, false, true, startedAt, lastScreen);
+  const reason = condition === 'ready' && launched ? readinessTimeoutReason(lastScreen.state, timeoutMs) : undefined;
+  return panelWaitResult(panel, condition, false, true, startedAt, lastScreen, undefined, reason);
+}
+
+function commandExitedReason(panel: ToolPanel, screen: RunpanePanelScreenResult): RunpaneReadinessReason {
+  const cols = terminalPanelManager.getTerminalSnapshot(panel.id)?.cols;
+  const errorLine = lastLaunchErrorLine(screen.text, panelLaunchCommand(panel), cols);
+  const said = errorLine ? ` It printed: "${errorLine}".` : '';
+  if (!screen.state.agentType) {
+    return {
+      code: 'command-exited',
+      message: `The launch command exited back to the shell without starting a supported agent, so the panel will not become ready.${said} `
+        + 'Nothing was sent to it. Check the command on screen, or pass --agent if it runs an agent Pane should recognise.',
+    };
+  }
+  return {
+    code: 'command-exited',
+    message: `The ${AGENT_TEMPLATES[screen.state.agentType].title} command exited back to the shell, so the panel will not become ready.${said} `
+      + `Nothing was sent to it. Fix what it reported, then run \`${panelResumeCommand(panel.id)}\` to launch it again.`,
+  };
+}
+
+const ERROR_LINE_LIMIT = 300;
+const ERROR_LINE = /\b(?:error|fatal|failed|exception)\b/iu;
+
+/**
+ * The last line that reads as an error between the launch command's echo and
+ * the shell prompt it exited to, such as Agent Farm's `error: ...`. Rows that
+ * fill the terminal's `cols` continue on the next row and are joined back.
+ */
+function lastLaunchErrorLine(screenText: string, launchCommand: string | undefined, cols: number | undefined): string | undefined {
+  const rows = screenText.split(/\r?\n/u).filter(row => row.trim());
+  // The last row is the shell's prompt. The command's echo names its program as a word of its
+  // own; a path inside an error (`.agent-farm/generated/...`) does not end the search.
+  const program = launchCommand?.trim().split(/\s+/u)[0];
+  for (let index = rows.length - 2; index >= 0; index -= 1) {
+    if (program && rows[index].trim().split(/\s+/u).includes(program)) return undefined;
+    if (!ERROR_LINE.test(rows[index])) continue;
+    let line = rows[index];
+    for (let next = index + 1; cols && [...rows[next - 1]].length >= cols && next < rows.length - 1; next += 1) {
+      line += rows[next];
+    }
+    line = line.trim();
+    return line.length > ERROR_LINE_LIMIT ? `${line.slice(0, ERROR_LINE_LIMIT)}…` : line;
+  }
+  return undefined;
+}
+
+/** The command a terminal panel launched in its shell, if it launched one. */
+function panelLaunchCommand(panel: ToolPanel): string | undefined {
+  const customState = (panelManager.getPanel(panel.id) ?? panel).state.customState;
+  return isRecord(customState) ? optionalString(customState.initialCommand) : undefined;
+}
+
+function readinessTimeoutReason(state: RunpanePanelStateSummary, timeoutMs: number): RunpaneReadinessReason {
+  const seconds = Math.round(timeoutMs / 100) / 10;
+  if (!state.agentType) {
+    return {
+      code: 'no-agent-detected',
+      message: `The command showed no supported agent within ${seconds} s, so it is not ready and nothing was sent to it. `
+        + 'Check the screen for a prompt it is waiting on, wait longer with --ready-timeout-ms, or pass --agent if it runs an agent Pane should recognise.',
+    };
+  }
+  return {
+    code: 'agent-not-ready',
+    message: `Pane detected ${AGENT_TEMPLATES[state.agentType].title}, but its input box was not ready within ${seconds} s. `
+      + 'Check the screen, then wait again.',
+  };
 }
 
 function defaultWaitCondition(state: RunpanePanelStateSummary): RunpanePanelWaitCondition {
   return state.isCliPanel ? 'ready' : 'idle';
 }
 
+/**
+ * `ready` for a launched command means an identified agent at its own input
+ * box: declared, or detected from the command, process or screen. A plain
+ * shell with no launch command is ready once it exists.
+ */
 function isWaitConditionMatched(
   condition: RunpanePanelWaitCondition,
   screen: RunpanePanelScreenResult,
   contains: string | undefined,
-  blocked?: RunpanePanelBlockedState,
+  blocked: RunpanePanelBlockedState | undefined,
+  launched: boolean,
 ): boolean {
   switch (condition) {
     case 'initialized':
       return screen.state.initialized;
     case 'ready':
-      if (blocked || !screen.state.initialized) return false;
-      if (!screen.state.isCliPanel) return true;
+      // Not `initialized`: a launch that exited back to its live shell is stopped, whatever its last frame shows.
+      if (blocked || !screen.state.running) return false;
+      if (!screen.state.isCliPanel && !launched) return true;
+      if (!screen.state.agentType) return false;
       if (screen.state.agentType === 'codex' && !hasConfiguredCodexScreen(screen.text)) return false;
       // A composer alone is enough for Claude; Codex also has a provisional one.
       return screen.state.isCliReady === true
         && (screen.composer.isPresent || (screen.state.agentType !== 'claude' && screen.state.agentType !== 'codex'));
     case 'idle':
-      return screen.state.initialized && screen.state.activityStatus === 'idle';
+      // Like `ready`: an idle shell left behind by an exited launch is a stopped panel, not an idle agent.
+      return screen.state.running && screen.state.activityStatus === 'idle';
     case 'text':
       return Boolean(contains && screen.text.includes(contains));
   }
@@ -2649,9 +3130,11 @@ function panelWaitResult(
   startedAt: number,
   screen: RunpanePanelScreenResult,
   blocked?: RunpanePanelBlockedState,
+  reason?: RunpaneReadinessReason,
 ): RunpanePanelWaitResult {
+  const stopped = !matched && condition !== 'text' && !screen.state.running;
   return {
-    ok: matched && !timedOut && !blocked,
+    ok: matched && !timedOut && !blocked && !reason,
     panelId: panel.id,
     paneId: panel.sessionId,
     condition,
@@ -2660,12 +3143,16 @@ function panelWaitResult(
     elapsedMs: Date.now() - startedAt,
     state: screen.state,
     blocked,
+    reason,
+    stopped: stopped ? true : undefined,
     screen: {
       source: screen.source,
       text: screen.text,
       hasMore: screen.hasMore,
     },
-    nextCommand: blocked?.suggestedCommand ?? (matched ? panelScreenCommand(panel.id) : panelWaitCommand(panel.id, condition)),
+    nextCommand: blocked?.suggestedCommand ?? (matched || reason
+      ? panelScreenCommand(panel.id)
+      : stopped ? panelResumeCommand(panel.id) : panelWaitCommand(panel.id, condition)),
   };
 }
 
@@ -2677,7 +3164,7 @@ function detectPanelBlocker(
   if (!text) return undefined;
 
   const daemonChoice = text.match(/^\s*[›❯>]?\s*(\d+)\.\s*Run without daemon this time/im);
-  if (daemonChoice && /cannot use the background server/i.test(text)) {
+  if (daemonChoice && /cannot use the background server|background server has incompatible/i.test(text)) {
     return {
       kind: 'first-run-dialog',
       message: text.trim(),
@@ -2699,6 +3186,28 @@ function detectPanelBlocker(
     };
   }
 
+  // Agent Farm asks on stderr before it starts the agent; trust is the person's call.
+  if (/Trust this repository workspace\?\s*\[y\/N\]\s*$/i.test(lastNonEmptyLine(text))) {
+    return {
+      kind: 'first-run-dialog',
+      message: `${promptExcerpt(text)}\n\nAgent Farm is waiting for approval of this repository's workspace file, so the agent has not started. `
+        + 'Pane does not answer trust prompts. Review the workspace above, then answer in the panel, or approve it with '
+        + '`agent-farm workspace trust` in the Pane\'s worktree.',
+      suggestedCommand: panelScreenCommand(panelId),
+    };
+  }
+
+  // Codex 0.160 draws this over a live composer: a typed prompt would continue past it, a leading digit would choose.
+  if ((agentType === 'codex' || /codex/i.test(text)) && /^\s*[›❯>]?\s*\d+\.\s*Set up security\s*$/im.test(text) && /esc to dismiss/i.test(text)) {
+    // Quote the banner itself, not the composer under it.
+    const banner = text.slice(text.search(/^.*Set up security/im)).split(/(?<=esc to dismiss.*)\n/i)[0] ?? text;
+    return {
+      kind: 'agent-prompt',
+      message: promptExcerpt(banner),
+      suggestedCommand: `runpane panels input --panel ${panelId} --keys escape --yes --json`,
+    };
+  }
+
   if (
     (agentType === 'codex' || /codex/i.test(text)) &&
     /update available/i.test(text) &&
@@ -2714,15 +3223,32 @@ function detectPanelBlocker(
   // Scan the current screen as well as reading the published status, which lags it by up to one poll.
   const screenBlocked = detectAgentState(getManifestForAgent(agentType), { screen: text, oscTitle: '', oscProgress: '' })
     .state === 'blocked';
-  if (/press enter to continue/i.test(text) || screenBlocked || terminalPanelManager.getAgentStatus(panelId) === 'blocked') {
+  // Before a declared agent is on screen, its wrapper or the shell may be asking: read that with the generic rules.
+  const preAgentBlocked = agentType !== undefined
+    && !detectAgentFromScreen(text)
+    && !detectAgentComposer(text, agentType).isPresent
+    && detectAgentState(getManifestForAgent(undefined), { screen: text, oscTitle: '', oscProgress: '' }).state === 'blocked';
+  if (/press enter to continue/i.test(text) || screenBlocked || preAgentBlocked || terminalPanelManager.getAgentStatus(panelId) === 'blocked') {
     return {
       kind: 'agent-prompt',
-      message: 'The terminal is waiting at an interactive prompt.',
+      message: `The terminal is waiting at an interactive prompt:\n${promptExcerpt(text)}`,
       suggestedCommand: panelScreenCommand(panelId),
     };
   }
 
   return undefined;
+}
+
+function lastNonEmptyLine(text: string): string {
+  return text.split('\n').filter(line => line.trim()).at(-1) ?? '';
+}
+
+/** A prompt's own last lines, bounded, so a blocked result says what is being asked. */
+function promptExcerpt(text: string): string {
+  const lines = text.split('\n').map(line => line.trimEnd());
+  while (lines.length > 0 && !lines.at(-1)?.trim()) lines.pop();
+  const excerpt = lines.slice(-BLOCKED_PROMPT_LINES).join('\n').trim();
+  return excerpt.length > BLOCKED_PROMPT_CHARS ? excerpt.slice(-BLOCKED_PROMPT_CHARS) : excerpt;
 }
 
 function ensureSubmitEnter(input: string): string {
@@ -3338,6 +3864,10 @@ function panelScreenCommand(panelId: string): string {
   return `runpane panels screen --panel ${panelId} --limit ${DEFAULT_PANEL_SCREEN_LIMIT} --json`;
 }
 
+function panelResumeCommand(panelId: string): string {
+  return `runpane panels resume --panel ${panelId} --wait-ready --yes --json`;
+}
+
 function panelWaitCommand(panelId: string, condition: RunpanePanelWaitCondition = 'ready'): string {
   return `runpane panels wait --panel ${panelId} --for ${condition} --timeout-ms ${DEFAULT_PANEL_WAIT_TIMEOUT_MS} --json`;
 }
@@ -3426,7 +3956,7 @@ function parseOrchestrationSessionSelector(value: PaneCommandValue): RunpaneSess
 }
 
 function parseOrchestrationSessionCreateRequest(value: PaneCommandValue): OrchestrationSessionCreateInput {
-  return decodeBoundary(value, orchestrationSessionCreateSchema);
+  return decodeOrchestrationSessionPayload(value, orchestrationSessionCreateSchema, 'create');
 }
 
 interface OrchestrationSessionUpdateRequest {
@@ -3437,7 +3967,7 @@ interface OrchestrationSessionUpdateRequest {
 function parseOrchestrationSessionUpdateRequest(value: PaneCommandValue): OrchestrationSessionUpdateRequest {
   if (!isRecord(value)) throw new Error('Session update request must be an object');
   const selector = parseOrchestrationSessionSelector(value.selector);
-  const input = decodeBoundary(value.input, orchestrationSessionUpdateSchema);
+  const input = decodeOrchestrationSessionPayload(value.input, orchestrationSessionUpdateSchema, 'update');
   return { selector, input };
 }
 
@@ -3529,6 +4059,10 @@ function parseWorkspaceWaitRequest(value: PaneCommandValue): RunpaneWorkspaceWai
     throw new Error('Workspace wait as must contain 1-128 letters, numbers, dots, underscores, or hyphens');
   }
   const since = parseNonNegativeInteger(value.since, 'since');
+  const epoch = optionalString(value.epoch);
+  if (value.epoch !== undefined && (!epoch?.trim() || since === undefined || consumer)) {
+    throw new Error('Workspace wait epoch requires since and cannot be combined with as');
+  }
   if (consumer && since !== undefined) throw new Error('Workspace wait request cannot include both as and since');
   const session = optionalString(value.session)?.trim() || undefined;
   const paneIds = parseStringArray(value.paneIds, 'paneIds');
@@ -3541,6 +4075,7 @@ function parseWorkspaceWaitRequest(value: PaneCommandValue): RunpaneWorkspaceWai
 
   return {
     since,
+    epoch,
     as: consumer,
     from: value.from === 'earliest' ? 'earliest' : value.from === 'now' ? 'now' : undefined,
     timeoutMs: parseNonNegativeInteger(value.timeoutMs, 'timeoutMs'),
@@ -3573,11 +4108,19 @@ const workspaceEntryKindSchema = boundary.enumeration(
   'pane.created',
   'pane.gone',
   'panel.exited',
+  'panel.stopped',
   'pane.associated',
   'pane.detached',
   'pr.conflicted',
   'pr.checks',
   'pr.merged',
+  'pr.closed',
+  'pr.head',
+  'pr.review',
+  'pr.comment',
+  'pr.stopped',
+  'github.unavailable',
+  'github.recovered',
   'agent.report',
 );
 
@@ -4012,6 +4555,40 @@ function parsePanelScreenRequest(value: PaneCommandValue): RunpanePanelScreenReq
   return {
     panelId,
     limit: parsePositiveInteger(value.limit, 'limit'),
+  };
+}
+
+function parsePanelResumeRequest(value: PaneCommandValue): RunpanePanelResumeRequest {
+  if (!isRecord(value)) {
+    throw new Error('Panel resume request must be an object');
+  }
+  const panelId = optionalString(value.panelId)?.trim();
+  if (!panelId) {
+    throw new Error('Panel resume request must include panelId');
+  }
+  return {
+    panelId,
+    waitReady: optionalBoolean(value.waitReady),
+    readyTimeoutMs: parsePositiveInteger(value.readyTimeoutMs, 'readyTimeoutMs'),
+  };
+}
+
+function parsePanelResumeManyRequest(value: PaneCommandValue): RunpanePanelResumeManyRequest {
+  if (!isRecord(value)) {
+    throw new Error('Panel resume request must be an object');
+  }
+  const sessionId = optionalString(value.sessionId)?.trim() || undefined;
+  const allStopped = optionalBoolean(value.allStopped) === true;
+  if ((sessionId !== undefined) === allStopped) {
+    throw new Error('Panel resume request must include exactly one of sessionId or allStopped');
+  }
+  const concurrency = parsePositiveInteger(value.concurrency, 'concurrency');
+  return {
+    sessionId,
+    allStopped: allStopped || undefined,
+    waitReady: optionalBoolean(value.waitReady),
+    readyTimeoutMs: parsePositiveInteger(value.readyTimeoutMs, 'readyTimeoutMs'),
+    concurrency: concurrency === undefined ? undefined : Math.min(concurrency, MAX_RESUME_CONCURRENCY),
   };
 }
 
@@ -4938,6 +5515,19 @@ function resolveProjectByName(projects: Project[], selectorName: string): Projec
   return matches[0];
 }
 
+const TOOL_COMMAND_TITLE_LIMIT = 40;
+
+/** A tab title for a launched command: whole words up to the limit, never the dock's "Terminal". */
+function toolCommandTitle(command: string): string {
+  const words = command.trim().split(/\s+/u);
+  let title = words[0].slice(0, TOOL_COMMAND_TITLE_LIMIT);
+  for (const word of words.slice(1)) {
+    if (title.length + 1 + word.length > TOOL_COMMAND_TITLE_LIMIT) return `${title}…`;
+    title = `${title} ${word}`;
+  }
+  return words[0].length > TOOL_COMMAND_TITLE_LIMIT ? `${title}…` : title;
+}
+
 function resolveToolSpec(tool: RunpaneToolSpec, environment?: ProjectEnvironment): RunpaneResolvedTool {
   if ('agent' in tool) {
     const template = AGENT_TEMPLATES[tool.agent];
@@ -4960,7 +5550,7 @@ function resolveToolSpec(tool: RunpaneToolSpec, environment?: ProjectEnvironment
   }
   if (!declaredAgent) {
     return {
-      title: tool.title ?? 'Terminal',
+      title: tool.title ?? toolCommandTitle(tool.command),
       command: tool.command,
       initialInput: tool.initialInput,
       initialInputAsFilePointer: tool.initialInputAsFilePointer,
@@ -5189,9 +5779,10 @@ function workspaceCadenceOptions(
 function workspaceNextCommand(
   request: RunpaneWorkspaceWaitRequest,
   generation: number,
+  epoch: string,
   session: { id: string } | undefined,
 ): string {
-  const cursor = request.as ? `--as ${request.as}` : `--since ${generation}`;
+  const cursor = request.as ? `--as ${request.as}` : `--since ${generation} --epoch ${epoch}`;
   return `runpane watch ${cursor}${session ? ` --session ${session.id}` : ''}`;
 }
 

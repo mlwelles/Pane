@@ -53,6 +53,11 @@ export type TailnetMachineState =
   | 'password-required'
   /** Pane answers but predates visibility; it accepts only its owner. */
   | 'outdated'
+  /**
+   * Someone else's machine whose Pane accepts only its owner's login (Who can connect → Only me,
+   * or an older Pane). Listed only for the desktop app; never connectable.
+   */
+  | 'refused'
   /** Online on Tailscale, but Pane is closed there or remote access is off. */
   | 'unreachable'
   | 'offline';

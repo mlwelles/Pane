@@ -69,7 +69,8 @@ useConfigStore.setState({ config: { appearance: DEFAULT_APPEARANCE, theme: 'dark
 useSessionStore.setState({ sessions: location.search.includes('runtime') ? [] : panes, isLoaded: true, activeSessionId: null });
 useOrchestrationSessionStore.setState({ sessions: records, selectedSessionId: 'a', availability: 'ready' });
 useSessionWorkspaceLayoutStore.setState({ layout: null, loaded: false });
-useNavigationStore.setState({ activeView: 'sessions' });
+// Sessions start collapsed; these races click Panes under them, so start them expanded.
+useNavigationStore.setState({ activeView: 'sessions', expandedSessions: new Set(records.map(record => record.id)) });
 
 Object.assign(window, { selectionTest: {
   pending: () => pending.map(({ kind, id }) => ({ kind, id })),

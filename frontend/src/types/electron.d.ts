@@ -169,6 +169,8 @@ interface ElectronAPI {
     create: (input: OrchestrationSessionCreateInput) => Promise<IPCResponse<OrchestrationSessionView<Session>>>;
     get: (selector: OrchestrationSessionSelector) => Promise<IPCResponse<OrchestrationSessionView<Session>>>;
     update: (selector: OrchestrationSessionSelector, input: OrchestrationSessionUpdateInput) => Promise<IPCResponse<OrchestrationSessionRecord>>;
+    /** Saves the order of the listed Sessions among the places they hold; leaves every Session record unchanged. */
+    reorder: (sessionIds: string[]) => Promise<IPCResponse<OrchestrationSessionListResult>>;
     setAgent: (selector: OrchestrationSessionSelector, agent: PaneChatAgent) => Promise<IPCResponse<OrchestrationSessionView<Session>>>;
     associate: (selector: OrchestrationSessionSelector, association: OrchestrationAssociationInput) => Promise<IPCResponse<OrchestrationSessionRecord>>;
     detach: (selector: OrchestrationSessionSelector, paneId?: string) => Promise<IPCResponse<OrchestrationSessionRecord>>;
@@ -354,6 +356,7 @@ interface ElectronAPI {
   };
 
   remoteDaemon: {
+    restoreComplete: (restoreId: number, error?: string) => Promise<void>;
     getConfig: () => Promise<IPCResponse<RemoteDaemonConfig>>;
     getConnectionState: () => Promise<IPCResponse<RemotePaneConnectionState>>;
     getHostState: () => Promise<IPCResponse<RemoteDaemonHostRuntimeState>>;
@@ -422,7 +425,7 @@ interface ElectronAPI {
       repositoriesSectionExpanded: boolean;
       sshHostsSectionExpanded: boolean;
       sessionsSectionExpanded: boolean;
-      collapsedSessions: string[];
+      expandedSessions: string[];
       archivedSectionExpanded: boolean;
       expandedArchivedProjects: number[];
     }>>;
@@ -431,7 +434,7 @@ interface ElectronAPI {
     saveExpandedFolders: (folderIds: string[]) => Promise<IPCResponse>;
     saveSessionSortAscending: (ascending: boolean) => Promise<IPCResponse>;
     saveSidebarSectionExpanded: (section: 'pinned' | 'repositories' | 'sshHosts' | 'sessions' | 'archived', expanded: boolean) => Promise<IPCResponse>;
-    saveCollapsedSessions: (sessionIds: string[]) => Promise<IPCResponse>;
+    saveExpandedSessions: (sessionIds: string[]) => Promise<IPCResponse>;
     saveExpandedArchivedProjects: (projectIds: number[]) => Promise<IPCResponse>;
     getNavigationMemory: (hostId: string | null) => Promise<IPCResponse<HostNavigationMemory | null>>;
     saveNavigationMemory: (hostId: string | null, memory: HostNavigationMemory) => Promise<IPCResponse>;
@@ -515,7 +518,7 @@ interface ElectronAPI {
     // Window focus state from BrowserWindow (more reliable than document.hasFocus())
     onAppMenuAction: (callback: (action: 'open-about' | 'open-settings') => void) => () => void;
     onWindowFocusChanged: (callback: (focused: boolean) => void) => () => void;
-    onRemoteDaemonResyncRequested: (callback: (event: { hostChanged: boolean }) => void) => () => void;
+    onRemoteDaemonResyncRequested: (callback: (event: { hostChanged: boolean; restoreId?: number }) => void) => () => void;
 
     // Spotlight events
     onSpotlightStatusChanged?: (callback: (data: { sessionId: string; projectId: number; active: boolean }) => void) => () => void;

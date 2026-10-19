@@ -15,6 +15,7 @@ import type {
   VoiceTranscriptionRequest,
   VoiceTranscriptionResult,
 } from '@shared/types/voiceTranscription';
+import { NATIVE_APP_WEBSOCKET_ORIGIN } from '@shared/types/remoteDaemon';
 
 import { invokeChannel, useDaemon } from '@/daemon';
 
@@ -292,10 +293,12 @@ const HeaderWebSocket = WebSocket as unknown as new (
   options: { headers: Record<string, string> },
 ) => WebSocket;
 
-/** Opens the host's voice socket. The bearer token goes in a header, never the URL. */
+/** Opens the host's voice socket. The bearer token goes in a header, never the URL; the Origin gets it past a workspace's browser check. */
 function openSocket(url: string, token: string, onText: (data: string) => void): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const ws = new HeaderWebSocket(url, null, { headers: { Authorization: `Bearer ${token}` } });
+    const ws = new HeaderWebSocket(url, null, {
+      headers: { Authorization: `Bearer ${token}`, Origin: NATIVE_APP_WEBSOCKET_ORIGIN },
+    });
     ws.binaryType = 'arraybuffer';
     const timeout = setTimeout(() => {
       ws.close();

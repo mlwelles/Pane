@@ -75,6 +75,10 @@ export function useTerminal(panelId: string, sessionId: string) {
     if (size) void session.restore(size);
   });
 
+  useEffect(() => client.onRestore(async signal => {
+    if (!signal.aborted && size) await session.restore(size);
+  }), [client, session, size]);
+
   // Restore once the page has measured itself, and again after every
   // reconnect: the event stream does not replay output missed while offline.
   const connected = connection.status === 'connected';
@@ -139,7 +143,7 @@ export function useTerminal(panelId: string, sessionId: string) {
           : { cols: message.cols, rows: message.rows });
         break;
       case 'input':
-        void session.sendInput(message.data).catch(() => undefined);
+        void session.sendInput(message.data).catch(cause => { setError(cause); setStatus('error'); });
         break;
       case 'written':
         session.ack(message.units);

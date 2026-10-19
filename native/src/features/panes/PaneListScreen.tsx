@@ -38,7 +38,7 @@ import { StatusBadge } from './StatusBadge';
 export function PaneListScreen() {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
-  const { connection } = useDaemon();
+  const { client, connection } = useDaemon();
   const [query, setQuery] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const projects = useProjects();
@@ -185,7 +185,7 @@ export function PaneListScreen() {
           <Icon ios="apple.terminal" android="terminal" size={20} color={theme.colors.accent} />
           <Text variant="headline" accessibilityRole="header" numberOfLines={1} style={styles.brandTitle}>Remote Pane</Text>
         </View>
-        <ConnectionStatus status={connection.status} />
+        <ConnectionStatus updateIntent={connection.updateIntent} status={connection.status} onRetry={() => client.retryNow()} />
         <View style={styles.headerActions}>
           <IconButton label="Refresh remote sessions" testID="panes-refresh" onPress={() => void refresh()}>
             <RefreshIcon spinning={loading || refreshing} />

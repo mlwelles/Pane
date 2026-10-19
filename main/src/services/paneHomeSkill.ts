@@ -292,6 +292,13 @@ of it through the \`runpane\` CLI.
 - Read or wait on a panel: \`runpane panels screen --panel <panel-id> --limit 80 --json\`,
   \`runpane panels wait --panel <panel-id> --for idle --json\`
 - Send a message: \`runpane panels submit --panel <panel-id> --text "<message>" --yes --json\`
+- Wait for a tab's report (\`runpane report\`), with or without a Session. Run this
+  as a background task; it exits with the event's line. Act on it, then run it
+  again (the named cursor misses nothing in between). Use \`--pane <pane-id>\`
+  for workers in another Pane:
+  \`runpane watch --pane "$PANE_SESSION_ID" --as <your-name> --until-event --quiet --json --kinds agent.report,agent.blocked,panel.exited,pane.gone\`
+  Never pipe \`runpane watch --follow\` into \`grep -m1\` or \`head\` to wait:
+  \`--follow\` never exits on its own.
 
 ## Sessions
 

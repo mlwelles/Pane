@@ -51,7 +51,7 @@ export function Settings({ isOpen, onClose, category, onCategoryChange, openRequ
     discardAndContinue,
     stay,
   } = dirtyForms;
-  const [platform, setPlatform] = useState('darwin');
+  const [platform, setPlatform] = useState('');
   const [systemMonoFonts, setSystemMonoFonts] = useState<string[]>([]);
   const [remoteSubview, setRemoteSubview] = useState<RemoteAccessSubviewId | undefined>();
   const handledRequestRef = useRef<number | null>(null);
@@ -60,7 +60,11 @@ export function Settings({ isOpen, onClose, category, onCategoryChange, openRequ
 
   useEffect(() => {
     if (!isOpen) return;
-    void window.electronAPI.getPlatform().then(setPlatform);
+    let cancelled = false;
+    void window.electronAPI.getPlatform().then(
+      value => { if (!cancelled) setPlatform(value); },
+      () => { if (!cancelled) setPlatform(''); },
+    );
     if (!fontsLoadedRef.current) {
       fontsLoadedRef.current = true;
       void window.electronAPI.config.getMonospaceFonts().then((response) => {
@@ -70,6 +74,7 @@ export function Settings({ isOpen, onClose, category, onCategoryChange, openRequ
         }
       }).catch(() => undefined);
     }
+    return () => { cancelled = true; };
   }, [isOpen]);
 
   const focusSetting = useCallback((setting?: SettingsSettingId) => {
@@ -131,7 +136,7 @@ export function Settings({ isOpen, onClose, category, onCategoryChange, openRequ
         // onSendFeedback is passed straight through, unlike showUpdate/showKeyboardShortcuts:
         // the feedback dialog stacks on top of Settings instead of replacing it, so there is
         // no transition to guard and closing Settings would strand focus on an unmounted button.
-        return <GeneralSettings persistence={persistence} onUpdate={showUpdate} onSendFeedback={onSendFeedback} />;
+        return <GeneralSettings persistence={persistence} localPlatform={platform} onUpdate={showUpdate} onSendFeedback={onSendFeedback} />;
       case 'appearance':
         return <AppearanceSettings persistence={persistence} />;
       case 'terminal':

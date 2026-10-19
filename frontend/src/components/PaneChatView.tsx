@@ -1,3 +1,4 @@
+import { registerRemoteWorkspaceRestore } from '../utils/remoteRestoration';
 import type { CustomCommandResume } from '../../../shared/types/customCommandResume';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Info, Pencil, RefreshCw, Settings, Terminal, X } from 'lucide-react';
@@ -689,7 +690,7 @@ function NamedSessionWorkspace({ view, error, chrome, onOverviewUpdate, onRetry 
   const overviewRefreshTimer = useRef<number | null>(null);
   const isMounted = useRef(false);
 
-  const refreshOverview = useCallback(async () => {
+  const refreshOverview = useCallback(async (required = false) => {
     const sessionId = view.session.id;
     const requestId = ++overviewRequestId.current;
     const isCurrentRequest = () => isMounted.current && requestId === overviewRequestId.current;
@@ -698,14 +699,20 @@ function NamedSessionWorkspace({ view, error, chrome, onOverviewUpdate, onRetry 
       const response = await API.orchestrationSessions.overview({ sessionId });
       const responseFailure = responseError(response, 'Failed to refresh Session overview');
       if (responseFailure || !response.data) throw responseFailure ?? new Error('Failed to refresh Session overview');
-      if (!isCurrentRequest()) return;
+      if (!isCurrentRequest()) {
+        if (required && isMounted.current) throw new Error('Session overview changed during restoration; retrying the current view.');
+        return;
+      }
       setOverview(response.data);
       setOverviewError(null);
     } catch (cause) {
-      if (!isCurrentRequest()) return;
+      if (!isCurrentRequest()) { if (required && isMounted.current) throw cause; return; }
       setOverviewError(cause instanceof Error ? cause.message : 'Failed to refresh Session overview');
+      if (required) throw cause;
     }
   }, [view.session.id]);
+
+  useEffect(() => registerRemoteWorkspaceRestore(() => refreshOverview(true)), [refreshOverview]);
 
   const scheduleOverviewRefresh = useCallback(() => {
     if (!isMounted.current || overviewRefreshTimer.current !== null) return;

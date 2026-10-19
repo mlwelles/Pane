@@ -321,6 +321,7 @@ export const MissionControlTile = memo(function MissionControlTile({
   // A tile mirrors a real panel, so both of its bodies render in the typeface
   // that panel does — a preview that changed typeface on promotion would read
   // as the tile reloading rather than as the same agent.
+  const reserveEscape = useConfigStore(state => state.config?.terminalKeyboardPreset === 'readline-friendly');
   const userFont = useConfigStore(state => state.config?.terminalFontFamily) || DEFAULT_TERMINAL_FONT_FAMILY;
   const fontFamily = buildTerminalFontFamily(userFont);
 
@@ -505,7 +506,7 @@ export const MissionControlTile = memo(function MissionControlTile({
         {isFocused ? (
           <span className="flex items-center gap-1 font-medium text-interactive">
             <Keyboard className="h-2.5 w-2.5" aria-hidden="true" />
-            {sendEscape
+            {sendEscape || reserveEscape
               ? 'Typing goes to this agent — Escape is sent to it too'
               : 'Typing goes to this agent — Escape leaves'}
           </span>

@@ -419,6 +419,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     create: (input: OrchestrationSessionCreateInput): Promise<IPCResponse> => invokeIpc('orchestration-sessions:create', input),
     get: (selector: OrchestrationSessionSelector): Promise<IPCResponse> => invokeIpc('orchestration-sessions:get', selector),
     update: (selector: OrchestrationSessionSelector, input: OrchestrationSessionUpdateInput): Promise<IPCResponse> => invokeIpc('orchestration-sessions:update', selector, input),
+    reorder: (sessionIds: string[]): Promise<IPCResponse> => invokeIpc('orchestration-sessions:reorder', { sessionIds }),
     setAgent: (selector: OrchestrationSessionSelector, agent: 'claude' | 'codex' | 'cursor'): Promise<IPCResponse> => invokeIpc('orchestration-sessions:set-agent', selector, agent),
     associate: (selector: OrchestrationSessionSelector, association: OrchestrationAssociationInput): Promise<IPCResponse> => invokeIpc('orchestration-sessions:associate', selector, association),
     detach: (selector: OrchestrationSessionSelector, paneId?: string): Promise<IPCResponse> => invokeIpc('orchestration-sessions:detach', selector, paneId),
@@ -617,6 +618,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   remoteDaemon: {
+    restoreComplete: (restoreId: number, error?: string): Promise<void> => ipcRenderer.invoke('remote-daemon:restore-complete', restoreId, error),
     getConfig: (): Promise<IPCResponse<RemoteDaemonConfig>> => invokeIpc('remote-daemon:get-config'),
     getConnectionState: (): Promise<IPCResponse<RemotePaneConnectionState>> => invokeIpc('remote-daemon:get-connection-state'),
     getHostState: (): Promise<IPCResponse<RemoteDaemonHostRuntimeState>> => invokeIpc('remote-daemon:get-host-state'),
@@ -741,7 +743,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     saveExpandedFolders: (folderIds: string[]): Promise<IPCResponse> => invokeIpc('ui-state:save-expanded-folders', folderIds),
     saveSessionSortAscending: (ascending: boolean): Promise<IPCResponse> => invokeIpc('ui-state:save-session-sort-ascending', ascending),
     saveSidebarSectionExpanded: (section: 'pinned' | 'repositories' | 'sshHosts' | 'sessions' | 'archived', expanded: boolean): Promise<IPCResponse> => invokeIpc('ui-state:save-sidebar-section-expanded', section, expanded),
-    saveCollapsedSessions: (sessionIds: string[]): Promise<IPCResponse> => invokeIpc('ui-state:save-collapsed-sessions', sessionIds),
+    saveExpandedSessions: (sessionIds: string[]): Promise<IPCResponse> => invokeIpc('ui-state:save-expanded-sessions', sessionIds),
     saveExpandedArchivedProjects: (projectIds: number[]): Promise<IPCResponse> => invokeIpc('ui-state:save-expanded-archived-projects', projectIds),
     // Per-host navigation memory. The caller names the host because the renderer
     // can still be showing the outgoing host while main has switched runtimes.
@@ -1072,8 +1074,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('window:focus-changed', wrappedCallback);
       return () => ipcRenderer.removeListener('window:focus-changed', wrappedCallback);
     },
-    onRemoteDaemonResyncRequested: (callback: (event: { hostChanged: boolean }) => void) => {
-      const wrappedCallback = (_event: Electron.IpcRendererEvent, payload?: { hostChanged?: boolean }) => callback({ hostChanged: payload?.hostChanged === true });
+    onRemoteDaemonResyncRequested: (callback: (event: { hostChanged: boolean; restoreId?: number }) => void) => {
+      const wrappedCallback = (_event: Electron.IpcRendererEvent, payload?: { hostChanged?: boolean; restoreId?: number }) => callback({ hostChanged: payload?.hostChanged === true, restoreId: payload?.restoreId });
       ipcRenderer.on('remote-daemon:resync-required', wrappedCallback);
       return () => ipcRenderer.removeListener('remote-daemon:resync-required', wrappedCallback);
     },

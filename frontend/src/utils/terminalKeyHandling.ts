@@ -29,6 +29,22 @@ export function handleTerminalKeyboardPresetEvent(
   return false;
 }
 
+export function handleMissionControlTerminalKey(
+  event: KeyboardEvent,
+  config: TerminalKeyboardConfig,
+  actions: { copy: () => void; openPalette: () => void; leaveTyping: () => void; hasHotkey: () => boolean },
+  state: { isMac: boolean; interactive: boolean; sendEscape: boolean },
+): boolean {
+  if (state.interactive) {
+    const handling = handleTerminalKeyboardPresetEvent(event, config, actions, state.isMac);
+    if (handling !== undefined) return handling;
+    if (config.terminalKeyboardPreset === 'readline-friendly' && actions.hasHotkey()) return false;
+  }
+  if (event.key !== 'Escape' || !state.interactive || state.sendEscape) return true;
+  if (event.type === 'keydown') actions.leaveTyping();
+  return false;
+}
+
 export type TerminalKeyHandlingDecision =
   | { action: 'continue' }
   | { action: 'release-to-app' }

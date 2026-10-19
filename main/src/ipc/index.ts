@@ -1,8 +1,11 @@
+import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
+import type { PaneCommandValue } from '../daemon/commandRegistry';
 import { ipcMain, powerMonitor } from 'electron';
 import type { AppServices } from './types';
 import { registerAppHandlers } from './app';
 import { registerNotesHandlers } from './notes';
 import { registerUpdaterHandlers } from './updater';
+import { registerUpdateOperationHandlers } from './updateOperation';
 import { registerSessionHandlers } from './session';
 import { registerProjectHandlers } from './project';
 import { registerConfigHandlers } from './config';
@@ -62,8 +65,16 @@ export function registerIpcHandlers(services: AppServices): PaneCommandRegistry 
   remotePaneClientController.initialize({
     configManager: services.configManager,
     rendererEventSink,
+    rendererIds: () => {
+      const window = services.getMainWindow();
+      return window && !window.isDestroyed() ? [window.webContents.id] : [];
+    },
     analyticsManager: services.analyticsManager,
     resolveTailnetMachineUrl: (machine) => resolveTailnetMachineUrl(machine, readTailscaleStatus),
+  });
+  ipcMain.handle('remote-daemon:restore-complete', (event, restoreId: PaneCommandValue, error: PaneCommandValue) => {
+    const result = decodeBoundary({ restoreId, error }, boundary.object({ restoreId: boundary.number, error: boundary.optional(boundary.string) }));
+    remotePaneClientController.acknowledgeRestore(event.sender.id, result.restoreId, result.error);
   });
   // Pause the remote connection while the system sleeps and reconnect on wake.
   powerMonitor.on('suspend', () => remotePaneClientController.suspend());
@@ -74,6 +85,7 @@ export function registerIpcHandlers(services: AppServices): PaneCommandRegistry 
   registerNotesHandlers(ipcMain, services);
   registerFeedbackHandlers(ipcMain, services);
   registerUpdaterHandlers(ipcMain, services);
+  registerUpdateOperationHandlers(services, commandRegistry);
   registerSessionHandlers(ipcMain, services, commandRegistry);
   registerProjectHandlers(ipcMain, services, commandRegistry);
   registerConfigHandlers(ipcMain, services, commandRegistry);

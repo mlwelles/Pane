@@ -119,7 +119,8 @@ export function registerRemoteDaemonHandlers(
 
     await configManager.updateConfig({ remoteDaemon: next });
     if (result.resyncRenderer) {
-      requestRendererRemoteResync();
+      if (next.client.mode === 'remote') remotePaneClientController.commitActivation();
+      else requestRendererRemoteResync();
     }
 
     return next;

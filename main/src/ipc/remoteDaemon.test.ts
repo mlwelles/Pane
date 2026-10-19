@@ -235,7 +235,8 @@ describe('remote daemon IPC', () => {
         mode: 'remote',
       },
     });
-    expect(send).toHaveBeenCalledWith('remote-daemon:resync-required', { hostChanged: true });
+    // The controller requests restoration after the config commit, with an acknowledgement ID.
+    expect(send).not.toHaveBeenCalledWith('remote-daemon:resync-required', { hostChanged: true });
 
     await expect(getConfig?.({})).resolves.toEqual({
       success: true,

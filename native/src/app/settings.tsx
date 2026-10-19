@@ -34,7 +34,7 @@ export default function SettingsScreen() {
           testID="settings-current-host"
           title={profile.label}
           subtitle={profile.baseUrl}
-          trailing={<ConnectionStatus status={connection.status} />}
+          trailing={<ConnectionStatus updateIntent={connection.updateIntent} status={connection.status} onRetry={() => client.retryNow()} />}
         />
         <ListRow testID="settings-sign-out" title="Sign Out" destructive onPress={confirmSignOut} />
       </ListSection>

@@ -29,10 +29,10 @@ export const SETTINGS_CATEGORIES: readonly SettingsCategoryDefinition[] = [
   {
     id: 'general',
     label: 'General',
-    description: 'Startup, application updates, and feedback.',
+    description: 'Startup, application updates, feedback, port discovery, and opening files.',
     icon: Settings,
-    settingIds: ['automatic-updates', 'check-updates-now', 'send-feedback', 'start-on-login', 'keep-awake'],
-    aliases: ['startup', 'updates', 'feedback', 'bug report', 'feature request', 'github issue', 'login', 'sleep', 'caffeinate', 'awake', 'power'],
+    settingIds: ['automatic-updates', 'check-updates-now', 'send-feedback', 'start-on-login', 'keep-awake', 'html-file-open-mode', 'port-discovery-mode'],
+    aliases: ['startup', 'updates', 'feedback', 'bug report', 'feature request', 'github issue', 'login', 'sleep', 'caffeinate', 'awake', 'power', 'html', 'preview', 'open html', 'explorer', 'source', 'ports', 'discovery', 'active', 'passive', 'probes', 'forwarding'],
   },
   {
     id: 'appearance',
@@ -109,10 +109,10 @@ export const SETTINGS_CATEGORIES: readonly SettingsCategoryDefinition[] = [
   {
     id: 'privacy',
     label: 'Privacy',
-    description: 'Analytics and data-sharing choices.',
+    description: 'Analytics, data-sharing choices, and browser logins.',
     icon: Shield,
-    settingIds: ['analytics'],
-    aliases: ['analytics', 'telemetry', 'tracking'],
+    settingIds: ['analytics', 'browser-data'],
+    aliases: ['analytics', 'telemetry', 'tracking', 'browser', 'cookies', 'logins', 'sign out'],
   },
   {
     id: 'advanced',

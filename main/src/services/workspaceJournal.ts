@@ -1,8 +1,12 @@
 import { randomUUID } from 'crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { PaneError } from '../../../shared/paneError';
+import { workspaceEntrySchema } from './workspaceJournalSchema';
 import type { PaneEventArgument, PaneEventSink } from '../core/eventSink';
 import type { AgentState } from '../../../shared/types/agentStatus';
-import { boundary, decodeOptionalBoundary } from '../../../shared/validation/boundaryDecoder';
-import { extractWorkspaceHeldInput } from './workspaceHeldInput';
+import { boundary, decodeBoundary, decodeOptionalBoundary, type JsonObject } from '../../../shared/validation/boundaryDecoder';
+import { extractWorkspaceHeldInput, type WorkspaceHeldInputScreen } from './workspaceHeldInput';
 import type {
   RunpaneWorkspaceEntry,
   RunpaneWorkspaceEntryKind,
@@ -23,8 +27,8 @@ interface WorkspacePanelMetadata {
   agentType?: string;
   panelTitle?: string;
   lastActivityAt?: string;
-  /** Latest terminal screen text; held input is derived from it, ignoring composer placeholders. */
-  screenText?: string;
+  /** The live viewport and its typed layer; held input is read from the typed layer only. */
+  screen?: WorkspaceHeldInputScreen;
 }
 
 export interface WorkspaceJournalFilter {
@@ -44,6 +48,12 @@ export interface WorkspaceJournalReadResult {
   entries: RunpaneWorkspaceEntry[];
   generation: number;
   dropped?: number;
+}
+
+export interface WorkspaceJournalDelivery {
+  entry: RunpaneWorkspaceEntry;
+  /** Watches that were waiting when the entry was appended and received it. */
+  liveWatchers: number;
 }
 
 interface WorkspaceWaiter {
@@ -66,6 +76,7 @@ export interface WorkspaceSessionMembership {
 }
 
 interface WorkspaceJournalOptions {
+  filePath?: string;
   capacity?: number;
   now?: () => number;
   resolvePane?: (paneId: string) => WorkspacePaneMetadata | undefined;
@@ -98,14 +109,25 @@ const sessionMembershipEventSchema = boundary.object({
 });
 /** Kinds only a consumer that asks for them (by `kinds`, or a Session scope) receives, so older clients never see them. */
 const OPT_IN_KINDS: readonly RunpaneWorkspaceEntryKind[] = [
+  'panel.stopped',
   'pane.associated',
   'pane.detached',
   'pr.conflicted',
   'pr.checks',
   'pr.merged',
+  'pr.closed',
+  'pr.head',
+  'pr.review',
+  'pr.comment',
+  'pr.stopped',
+  'github.unavailable',
+  'github.recovered',
 ];
-/** Pane-level kinds that carry no agent type and still pass `agentsOnly`. */
-const PANE_LEVEL_KINDS: readonly RunpaneWorkspaceEntryKind[] = ['pane.created', 'pane.gone', ...OPT_IN_KINDS];
+/**
+ * Kinds that still pass `agentsOnly` without an agent type: Pane-level kinds, and `agent.report`,
+ * which a panel only raises on purpose (a shell tab, or a wrapper launch not yet detected).
+ */
+const AGENTS_ONLY_EXEMPT_KINDS: readonly RunpaneWorkspaceEntryKind[] = ['pane.created', 'pane.gone', 'agent.report', ...OPT_IN_KINDS];
 const panelExitEventSchema = boundary.object({
   type: boundary.string,
   source: boundary.object({
@@ -119,7 +141,9 @@ const panelExitEventSchema = boundary.object({
 });
 
 export class WorkspaceJournal implements PaneEventSink {
-  readonly epoch = randomUUID();
+  epoch: string = randomUUID();
+  githubState: JsonObject = {};
+  private readonly filePath?: string;
   private readonly ring: RunpaneWorkspaceEntry[] = [];
   private readonly paneById = new Map<string, WorkspacePaneMetadata>();
   private readonly stateByPanel = new Map<string, AgentState>();
@@ -134,11 +158,58 @@ export class WorkspaceJournal implements PaneEventSink {
   private nextGeneration = 0;
 
   constructor(options: WorkspaceJournalOptions = {}) {
+    this.filePath = options.filePath;
     this.capacity = options.capacity ?? DEFAULT_CAPACITY;
     this.now = options.now ?? Date.now;
     this.resolvePane = options.resolvePane;
     this.resolvePanel = options.resolvePanel;
     this.resolveSessionMembership = options.resolveSessionMembership;
+    if (this.filePath && fs.existsSync(this.filePath)) {
+      try {
+        const saved = decodeBoundary(JSON.parse(fs.readFileSync(this.filePath, 'utf8')), boundary.object({
+          epoch: boundary.string, generation: boundary.number, githubState: boundary.jsonObject,
+          entries: boundary.array(workspaceEntrySchema),
+        }));
+        this.epoch = saved.epoch;
+        this.nextGeneration = saved.generation;
+        this.githubState = saved.githubState;
+        this.ring.push(...saved.entries.slice(-this.capacity));
+      } catch {
+        throw new PaneError('ERR_WATCH_JOURNAL_READ', 'The saved watch journal could not be read. Watching did not start.', 'Restore workspace-journal.json from backup, or move it aside to explicitly reset watch cursors.');
+      }
+    }
+  }
+
+  /** Baseline and emitted transitions share an atomic file replacement, before any waiter wakes. */
+  commitGithubState(state: JsonObject, entries: Array<Omit<RunpaneWorkspaceEntry, 'gen' | 'at' | 'paneName'>>): void {
+    const full = entries.map((entry, index) => ({
+      ...(this.lookupPane(entry.paneId) ?? { paneName: entry.paneId }), ...entry,
+      gen: this.nextGeneration + index + 1, at: new Date(this.now()).toISOString(),
+    }));
+    const ring = [...this.ring, ...full].slice(-this.capacity);
+    const generation = this.nextGeneration + full.length;
+    this.persist(ring, generation, state);
+    this.githubState = state;
+    this.ring.splice(0, this.ring.length, ...ring);
+    this.nextGeneration = generation;
+    if (full.length) this.resolveWaiters(generation);
+  }
+
+  private persist(entries: RunpaneWorkspaceEntry[], generation: number, githubState = this.githubState): void {
+    if (!this.filePath) return;
+    fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
+    const temporary = `${this.filePath}.tmp-${randomUUID()}`;
+    try {
+      // Composer text remains ephemeral; durable watches retain only its presence.
+      const safeEntries = entries.map(({ heldInput, ...entry }) => {
+        if (heldInput) entry.heldInputPresent = true;
+        return entry;
+      });
+      fs.writeFileSync(temporary, JSON.stringify({ epoch: this.epoch, generation, githubState, entries: safeEntries }), { mode: 0o600 });
+      fs.renameSync(temporary, this.filePath);
+    } finally {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    }
   }
 
   get generation(): number {
@@ -158,15 +229,7 @@ export class WorkspaceJournal implements PaneEventSink {
   }
 
   append(entry: Omit<RunpaneWorkspaceEntry, 'gen' | 'at'>): RunpaneWorkspaceEntry {
-    const full: RunpaneWorkspaceEntry = {
-      ...entry,
-      gen: ++this.nextGeneration,
-      at: new Date(this.now()).toISOString(),
-    };
-    this.ring.push(full);
-    if (this.ring.length > this.capacity) this.ring.shift();
-    this.resolveWaiters();
-    return full;
+    return this.deliver(entry).entry;
   }
 
   /**
@@ -177,8 +240,29 @@ export class WorkspaceJournal implements PaneEventSink {
     paneId: string,
     entry: Omit<RunpaneWorkspaceEntry, 'gen' | 'at' | keyof WorkspacePaneMetadata>,
   ): RunpaneWorkspaceEntry {
+    return this.deliverPaneEntry(paneId, entry).entry;
+  }
+
+  /**
+   * Like `appendPaneEntry`, and also says how many watches were waiting for this entry right now
+   * and received it. A snapshot: a named cursor that re-arms later still reads the entry.
+   */
+  deliverPaneEntry(
+    paneId: string,
+    entry: Omit<RunpaneWorkspaceEntry, 'gen' | 'at' | keyof WorkspacePaneMetadata>,
+  ): WorkspaceJournalDelivery {
     const pane = this.lookupPane(paneId) ?? { paneId, paneName: paneId };
-    return this.append({ ...pane, ...entry });
+    return this.deliver({ ...pane, ...entry });
+  }
+
+  /** Activity includes events held by cadence or hidden by the output-kind filter. */
+  activityGeneration(filter: WorkspaceJournalFilter): number {
+    const matches = this.matcher({ ...filter, kinds: [...new Set(this.ring.map(entry => entry.kind))] });
+    for (let index = this.ring.length - 1; index >= 0; index--) {
+      const entry = this.ring[index];
+      if (entry.kind !== 'agent.idle' && !entry.replay && !entry.baseline && matches(entry)) return entry.gen;
+    }
+    return 0;
   }
 
   readAfter(cursor: number, filter: WorkspaceJournalFilter = {}, limit = 256): WorkspaceJournalReadResult {
@@ -298,9 +382,6 @@ export class WorkspaceJournal implements PaneEventSink {
       if (!payload || payload.type !== 'terminal:exit') return;
       const { panelId, sessionId: paneId } = payload.source;
       if (this.exitedPanels.has(panelId)) return;
-      this.exitedPanels.add(panelId);
-      this.stateByPanel.delete(panelId);
-      this.readySinceByPanel.delete(panelId);
       const pane = this.lookupPane(paneId);
       if (!pane) return;
       const panel = this.resolvePanel?.(panelId);
@@ -314,6 +395,9 @@ export class WorkspaceJournal implements PaneEventSink {
         exitCode: payload.data.exitCode,
         reason: payload.data.signal === undefined ? 'terminal:exit' : `signal:${payload.data.signal}`,
       });
+      this.exitedPanels.add(panelId);
+      this.stateByPanel.delete(panelId);
+      this.readySinceByPanel.delete(panelId);
     }
   }
 
@@ -345,26 +429,22 @@ export class WorkspaceJournal implements PaneEventSink {
       this.readySinceByPanel.delete(panelId);
       return;
     }
-    this.exitedPanels.delete(panelId);
     const panel = this.resolvePanel?.(panelId);
     if (!panel?.isCliPanel) return;
 
     const previous = this.stateByPanel.get(panelId);
-    this.stateByPanel.set(panelId, state);
-    if (state !== 'idle') this.readySinceByPanel.delete(panelId);
     if (previous === state) return;
 
     const kind = agentEntryKind(state, previous);
-    if (!kind) return;
+    if (!kind) { this.stateByPanel.set(panelId, state); return; }
     const pane = this.lookupPane(paneId);
     if (!pane) return;
     const now = this.now();
-    if (kind === 'agent.ready') this.readySinceByPanel.set(panelId, now);
     const lastActivityMs = panel?.lastActivityAt ? Date.parse(panel.lastActivityAt) : Number.NaN;
     const settledMs = kind === 'agent.ready' && Number.isFinite(lastActivityMs)
       ? Math.max(0, now - lastActivityMs)
       : undefined;
-    const heldInput = kind === 'agent.ready' && panel?.screenText ? extractWorkspaceHeldInput(panel.screenText) : undefined;
+    const heldInput = kind === 'agent.ready' ? extractWorkspaceHeldInput(panel.agentType, panel.screen) : undefined;
     const entry: Omit<RunpaneWorkspaceEntry, 'gen' | 'at'> = {
       ...pane,
       kind,
@@ -379,6 +459,10 @@ export class WorkspaceJournal implements PaneEventSink {
     };
     if (heldInput) entry.heldInput = heldInput;
     this.append(entry);
+    this.exitedPanels.delete(panelId);
+    this.stateByPanel.set(panelId, state);
+    if (state !== 'idle') this.readySinceByPanel.delete(panelId);
+    if (kind === 'agent.ready') this.readySinceByPanel.set(panelId, now);
   }
 
   private lookupPane(paneId: string): WorkspacePaneMetadata | undefined {
@@ -389,14 +473,31 @@ export class WorkspaceJournal implements PaneEventSink {
     return resolved;
   }
 
-  private resolveWaiters(): void {
+  private deliver(entry: Omit<RunpaneWorkspaceEntry, 'gen' | 'at'>): WorkspaceJournalDelivery {
+    const full: RunpaneWorkspaceEntry = {
+      ...entry,
+      gen: this.nextGeneration + 1,
+      at: new Date(this.now()).toISOString(),
+    };
+    this.persist([...this.ring, full].slice(-this.capacity), full.gen);
+    this.nextGeneration = full.gen;
+    this.ring.push(full);
+    if (this.ring.length > this.capacity) this.ring.shift();
+    return { entry: full, liveWatchers: this.resolveWaiters(full.gen) };
+  }
+
+  /** Resolves every waiter with something to read; returns how many of them received entry `gen`. */
+  private resolveWaiters(gen: number): number {
+    let received = 0;
     for (const waiter of [...this.waiters]) {
       const result = this.readAfter(waiter.cursor, waiter.filter, waiter.limit);
       if (result.entries.length === 0 && !result.dropped) continue;
       clearTimeout(waiter.timer);
       this.waiters.delete(waiter);
+      if (result.entries.some(entry => entry.gen === gen)) received += 1;
       waiter.resolve({ ...result, timedOut: false });
     }
+    return received;
   }
 }
 
@@ -438,7 +539,7 @@ function matchesFilter(
   if (filter.excludePaneIds && filter.excludePaneIds.includes(entry.paneId)) return false;
   if (filter.repoId !== undefined && entry.repoId !== filter.repoId) return false;
   if (filter.nameContains && !entry.paneName.toLocaleLowerCase().includes(filter.nameContains.toLocaleLowerCase())) return false;
-  if (filter.agentsOnly && !entry.agentType && !PANE_LEVEL_KINDS.includes(entry.kind)) return false;
+  if (filter.agentsOnly && !entry.agentType && !AGENTS_ONLY_EXEMPT_KINDS.includes(entry.kind)) return false;
   return true;
 }
 
@@ -455,6 +556,19 @@ function matchesSession(
   const panelIds = membership.panes.get(entry.paneId);
   if (!panelIds) return false;
   return !entry.panelId || panelIds.length === 0 || panelIds.includes(entry.panelId);
+}
+
+/**
+ * Older runpane clients reject kinds they do not know, and a stopped panel reaches every
+ * consumer in the baseline after each restart. So it reads as `agent.unknown` (still
+ * `running: false`, never `agent.ready`) unless the consumer lists `panel.stopped` in its kinds.
+ */
+export function presentStoppedPanel(
+  entry: RunpaneWorkspaceEntry,
+  filter: Pick<WorkspaceJournalFilter, 'kinds'>,
+): RunpaneWorkspaceEntry {
+  if (entry.kind !== 'panel.stopped') return entry;
+  return filter.kinds?.includes('panel.stopped') ? entry : { ...entry, kind: 'agent.unknown' };
 }
 
 export function projectWorkspaceEntry(

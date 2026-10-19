@@ -102,6 +102,10 @@ export class API {
       if (!isElectron()) throw new Error('Electron API not available');
       return window.electronAPI.orchestrationSessions.update(selector, input);
     },
+    async reorder(sessionIds: string[]): Promise<IPCResponse<OrchestrationSessionListResult>> {
+      if (!isElectron()) throw new Error('Electron API not available');
+      return window.electronAPI.orchestrationSessions.reorder(sessionIds);
+    },
     async setAgent(selector: OrchestrationSessionSelector, agent: PaneChatAgent): Promise<IPCResponse<OrchestrationSessionView<Session>>> {
       if (!isElectron()) throw new Error('Electron API not available');
       return window.electronAPI.orchestrationSessions.setAgent(selector, agent);

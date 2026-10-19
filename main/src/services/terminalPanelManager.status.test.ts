@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as processTree from '../utils/processTree';
 import { TerminalPanelManager } from './terminalPanelManager';
 import { inProcessEmulatorHost } from '../test/inProcessEmulatorHost';
 import { AgentStatusMonitor } from './agentStatus/agentStatusMonitor';
@@ -14,7 +15,7 @@ function createTerminal(agentType: 'claude' | 'codex' | undefined = 'codex') {
   let onData: (data: string) => void = () => undefined;
   let onExit: (exit: { exitCode: number; signal?: number }) => void = () => undefined;
   const terminal = {
-    panelId: 'p', sessionId: 's', agentType,
+    panelId: 'p', sessionId: 's', agentType, launchCwd: '/launch-origin',
     pty: {
       onData: (listener: typeof onData) => { onData = listener; },
       onExit: (listener: typeof onExit) => { onExit = listener; },
@@ -41,6 +42,7 @@ interface StatusAccess {
   setupTerminalHandlers(terminal: TerminalFixture['terminal']): void;
   pollAgentStatus(): void;
   sendInitialInputOnce(panelId: string): void;
+  holdInitialInput(panelId: string): void;
   getProcessCwd(pid: number): Promise<string>;
 }
 
@@ -67,6 +69,7 @@ async function pollAgentStatus() {
 }
 
 beforeEach(() => {
+  vi.spyOn(processTree, 'listDescendantPids').mockResolvedValue([]);
   // xterm writes need real timers; only the status clock is controlled.
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(20_000);
@@ -393,6 +396,24 @@ describe('terminal status events', () => {
     }) }));
   });
 
+  it('preserves the panel launch directory when reading and saving terminal state', async () => {
+    attach('codex');
+    const panel: ToolPanel = {
+      id: 'p', sessionId: 's', type: 'terminal', title: 'Codex',
+      state: { isActive: true, customState: { cwd: '/workspace/owned-session' } },
+      metadata: { createdAt: '', lastActiveAt: '', position: 0 },
+    };
+    panelManager.getPanel.mockReturnValue(panel);
+    panelManager.updatePanel.mockResolvedValue(undefined);
+    expect((await manager.getTerminalState('p'))?.cwd).toBe('/workspace/owned-session');
+    vi.spyOn(access, 'getProcessCwd').mockRejectedValue(new Error('Process cwd unavailable'));
+    await manager.saveTerminalState('p');
+    expect(panel.state.customState).toMatchObject({ cwd: '/workspace/owned-session' });
+    panel.state.customState = {};
+    await manager.saveTerminalState('p');
+    expect(panel.state.customState).toMatchObject({ cwd: '/launch-origin' });
+  });
+
   it('discards a terminal state read after the terminal was replaced', async () => {
     const old = attach('codex');
     old.data('old terminal output');
@@ -452,6 +473,136 @@ describe('terminal status events', () => {
     expect(manager.getAgentStatus('p')).toBeUndefined();
   });
 
+  describe('a held starting message for a wrapper launch', () => {
+    const rule = '─'.repeat(40);
+    let customState: TerminalPanelState;
+
+    function attachWrapper(initialInput = 'Read and follow /tmp/prompt.md') {
+      customState = { initialCommand: 'agent-farm run greenfield/planner:opus', initialInput, initialInputSubmitStrategy: 'enter' };
+      const panel = {
+        id: 'p', sessionId: 's', type: 'terminal' as const, title: 'Farm',
+        state: { isActive: true, customState },
+        metadata: { createdAt: '', lastActiveAt: '', position: 0 },
+      };
+      panelManager.getPanel.mockImplementation(() => ({ ...panel, state: { ...panel.state, customState } }));
+      panelManager.updatePanel.mockImplementation(async (_id: string, updates: { state?: { customState?: TerminalPanelState } }) => {
+        if (updates.state?.customState) customState = { ...updates.state.customState };
+      });
+      const fixture = attach();
+      fixture.terminal.agentType = undefined;
+      fixture.terminal.pty.process = 'node';
+      access.holdInitialInput('p');
+      return fixture;
+    }
+
+    // The status poll runs the release; let its write and the staged submit settle on real timers.
+    async function settle(ms = 1_000) {
+      const now = Date.now();
+      vi.useRealTimers();
+      await new Promise(resolve => setTimeout(resolve, ms));
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(now + ms);
+    }
+
+    it('waits for the detected agent\'s composer, then stages the text and presses Enter on its own', async () => {
+      const fixture = attachWrapper();
+      fixture.data('Building agent bundle...\r\n');
+      await pollAgentStatus();
+      await pollAgentStatus();
+      await settle(100);
+      expect(fixture.terminal.pty.write).not.toHaveBeenCalled();
+
+      fixture.data(`\x1b[2J\x1b[H${rule}\r\n❯ \r\n${rule}\r\n`);
+      await pollAgentStatus();
+      await pollAgentStatus();
+      expect(fixture.terminal.agentType).toBe('claude');
+      fixture.terminal.pty.write.mockImplementation((data: string) => {
+        if (data !== '\r') fixture.data(`\x1b[2J\x1b[H${rule}\r\n❯ ${data}\r\n${rule}\r\n`);
+      });
+      // Idle once the screen has settled.
+      vi.setSystemTime(Date.now() + 11_000);
+      await pollAgentStatus();
+      expect(manager.getAgentStatus('p')).toBe('idle');
+      await settle(1_000);
+      expect(fixture.terminal.pty.write.mock.calls.map(call => call[0])).toEqual(['Read and follow /tmp/prompt.md', '\r']);
+      expect(customState.initialInputSentAt).toEqual(expect.any(String));
+    });
+
+    it('submits to a detected Codex with Ctrl+Enter', async () => {
+      const fixture = attachWrapper('say hi');
+      // Detected from its screen, which works where the foreground process name is unknown (Windows).
+      fixture.data('>_ OpenAI Codex (v0.160.1)\r\n\r\n› Ask Codex to do anything\r\n\r\n  gpt-5.6 high\r\n  ? for shortcuts');
+      await pollAgentStatus();
+      await pollAgentStatus();
+      expect(fixture.terminal.agentType).toBe('codex');
+      fixture.terminal.pty.write.mockImplementation((data: string) => { if (data === 'say hi') fixture.data('x'); });
+      vi.setSystemTime(Date.now() + 11_000);
+      await pollAgentStatus();
+      expect(manager.getAgentStatus('p')).toBe('idle');
+      await settle(1_500);
+      expect(fixture.terminal.pty.write.mock.calls.map(call => call[0])).toEqual(['say hi', '\x1b[13;5u\r']);
+    });
+
+    it('never types the message when no supported agent appears, and records why', async () => {
+      const fixture = attachWrapper();
+      fixture.data('Building agent bundle...\r\n');
+      await pollAgentStatus();
+      vi.setSystemTime(Date.now() + 31_000);
+      await pollAgentStatus();
+      fixture.data('Done.\r\n');
+      await pollAgentStatus();
+      await settle(100);
+      expect(fixture.terminal.pty.write).not.toHaveBeenCalled();
+      expect(customState.initialInputError).toContain('No supported agent');
+      expect(customState.initialInputSentAt).toBeUndefined();
+    });
+
+    it('keeps holding while a startup prompt waits for the person', async () => {
+      const fixture = attachWrapper();
+      fixture.data('Trust this repository workspace? [y/N] ');
+      await pollAgentStatus();
+      vi.setSystemTime(Date.now() + 60_000);
+      await pollAgentStatus();
+      expect(customState.initialInputError).toBeUndefined();
+      expect(fixture.terminal.pty.write).not.toHaveBeenCalled();
+    });
+  });
+
+  // Windows terminals cannot report their foreground, so Pane never claims an exit there.
+  it.skipIf(process.platform === 'win32')('reports a launch command as exited once its shell owns the foreground again', async () => {
+    let foregroundGroup: number | undefined = 999;
+    const exitManager = new TerminalPanelManager(undefined, undefined, async () => foregroundGroup);
+    // SAFETY: This seam mirrors the private members used by these PTY fixtures, as `access` does above.
+    const exitAccess = exitManager as StatusAccess;
+    const fixture = createTerminal();
+    fixtures.push(fixture);
+    fixture.terminal.agentType = undefined;
+    fixture.terminal.pty.process = 'zsh';
+    Object.assign(fixture.terminal, { launchCommandWrittenAt: Date.now(), isPtyHost: false });
+    exitAccess.terminals.set('p', fixture.terminal);
+    const shellPid = fixture.terminal.pty.pid;
+
+    // Too soon after the command was written: the shell may not have started it yet.
+    foregroundGroup = shellPid;
+    expect(await exitManager.hasLaunchCommandExited('p')).toBe(false);
+
+    vi.setSystemTime(Date.now() + 2_000);
+    expect(await exitManager.hasLaunchCommandExited('p')).toBe(true);
+
+    // A wrapper, even a script run by the same shell program, runs in a process group of its own.
+    foregroundGroup = shellPid + 1;
+    expect(await exitManager.hasLaunchCommandExited('p')).toBe(false);
+
+    // An agent Pane identified that exits back to the shell has exited too.
+    foregroundGroup = shellPid;
+    fixture.terminal.agentType = 'claude';
+    expect(await exitManager.hasLaunchCommandExited('p')).toBe(true);
+
+    // Only Pane's own shell in the foreground can mean the command exited.
+    fixture.terminal.pty.process = 'claude';
+    expect(await exitManager.hasLaunchCommandExited('p')).toBe(false);
+  });
+
   it('detects a wrapper agent from its screen and then reports it to agents-only watchers', async () => {
     const customState: TerminalPanelState = { initialCommand: 'agent-farm run free-range' };
     const panel = {
@@ -490,5 +641,52 @@ describe('terminal status events', () => {
     expect(wrapperJournal.readAfter(0, { agentsOnly: true }).entries.map(entry => [entry.kind, entry.agentType]))
       .toEqual([['agent.busy', 'claude']]);
     wrapperJournal.dispose();
+  });
+});
+
+describe('update resume acceptance', () => {
+  const nonce = '11111111-1111-4111-8111-111111111111';
+  function resumedFixture(agent: 'claude' | 'codex' = 'codex') {
+    const fixture = attach(agent);
+    Object.assign(fixture.terminal, { launchCommandWrittenAt: 19_000, updateResumeNonce: nonce });
+    panelManager.getPanel.mockReturnValue({
+      id: 'p', sessionId: 's', type: 'terminal', title: 'Resume',
+      state: { isActive: true, customState: { agentType: agent, agentSessionId: 'exact', customResume: { mode: 'reported', resumeTemplate: '{command} --resume {sessionId}' } } },
+      metadata: { createdAt: '', lastActiveAt: '', position: 0 },
+    });
+    return fixture;
+  }
+
+  it('does not accept a wrapper ID or startup working state before a failed command', async () => {
+    const fixture = resumedFixture();
+    fixture.data('PANE_AGENT_SESSION_ID=exact\r\nStarting wrapper\r\n');
+    vi.spyOn(manager, 'getAgentStatus').mockReturnValue('working');
+    const exited = vi.spyOn(manager, 'hasLaunchCommandExited').mockResolvedValue(true);
+    await expect(manager.verifyUpdateResume('p', 'exact')).rejects.toThrow('exited');
+    expect(exited).toHaveBeenCalled();
+  });
+
+  it.each(['startup', 'old nonce', 'login'] as const)('refuses %s instead of manufacturing a successful resume', async scenario => {
+    const fixture = resumedFixture();
+    fixture.data(`PANE_AGENT_SESSION_ID=exact\r\nPANE_UPDATE_RESUME_READY=${scenario === 'old nonce' ? '22222222-2222-4222-8222-222222222222' : nonce}:exact\r\n`);
+    if (scenario === 'startup') Object.assign(fixture.terminal, { updateResumeReadyId: undefined });
+    vi.spyOn(manager, 'getAgentStatus').mockReturnValue(scenario === 'login' ? 'blocked' : 'working');
+    vi.spyOn(manager, 'hasLaunchCommandExited').mockImplementation(async () => { vi.setSystemTime(21_000); return false; });
+    await expect(manager.verifyUpdateResume('p', 'exact', 500)).rejects.toThrow(scenario === 'login' ? 'requires attention' : 'did not confirm');
+  });
+
+  it.each(['claude', 'codex'] as const)('accepts a fresh explicit adapter acknowledgment for %s only after checking exit', async agent => {
+    const fixture = resumedFixture(agent);
+    fixture.data(`PANE_UPDATE_RESUME_READY=${nonce}:exact\r\n`);
+    const exited = vi.spyOn(manager, 'hasLaunchCommandExited').mockResolvedValue(false);
+    await expect(manager.verifyUpdateResume('p', 'exact')).resolves.toEqual({ pid: process.pid });
+    expect(exited).toHaveBeenCalled();
+  });
+
+  it('rejects a harness acknowledgment for a different conversation', async () => {
+    const fixture = resumedFixture();
+    fixture.data(`PANE_UPDATE_RESUME_READY=${nonce}:different\r\n`);
+    vi.spyOn(manager, 'hasLaunchCommandExited').mockResolvedValue(false);
+    await expect(manager.verifyUpdateResume('p', 'exact')).rejects.toThrow('different conversation');
   });
 });

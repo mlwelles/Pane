@@ -10,8 +10,8 @@ const PEER_RETRY_MS = 60_000;
 
 /**
  * Shares integration keys between this host and every host the desktop has
- * paired with. Syncs on start, when a key changes here, and when a paired
- * host reports a settings change. No timer.
+ * saved. Syncs on start, when a key changes here, and when a saved host
+ * reports a settings change. No timer.
  */
 export class SharedCredentialSync {
   private readonly peers = new Map<string, RemotePaneClient>();
@@ -82,9 +82,8 @@ export class SharedCredentialSync {
 
   /** One event stream per paired host, so its settings changes reach this desktop. */
   private refreshPeers(): void {
-    // Sharing keys needs a paired device; codeless profiles carry no pairing token.
-    const profiles = (this.configManager.getConfig().remoteDaemon?.client.profiles ?? [])
-      .filter(profile => !profile.tailnetMachine);
+    // A computer reached over Tailscale shares keys only with its owner and refuses everyone else.
+    const profiles = this.configManager.getConfig().remoteDaemon?.client.profiles ?? [];
     const wanted = new Map(profiles.map(profile => [peerKey(profile), profile]));
     for (const [key, peer] of this.peers) {
       if (wanted.has(key)) continue;

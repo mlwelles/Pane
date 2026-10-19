@@ -2,7 +2,7 @@
 
 `runpane workspace` lets your Macs, Windows PCs, and Linux machines read files, write files, run commands, and drive each other's Pane over the Tailscale network you already use. There is no SSH, no keys, and no pairing code: each request is trusted because Tailscale says which login it comes from. Your own login is always let in; a teammate's machine lets you in when its owner shares it with everyone on the tailnet.
 
-The same listener powers codeless desktop remote mode: Settings → Remote Access → **Your computers** lists the machines on your tailnet with Pane open, and **Connect** switches the desktop app to that machine with no `pane-remote://` code. `runpane workspace` reaches the same machines. Who may connect is set under **Access to this computer** → **Who can connect** (see [Who is trusted](#who-is-trusted)).
+The same listener powers codeless desktop remote mode: Settings → Remote Access → **Your computers** lists the machines on your tailnet with Pane open (a teammate's machine that accepts only its owner shows as "Owner only" and can't be connected to), and **Connect** switches the desktop app to that machine with no `pane-remote://` code. `runpane workspace` reaches the same machines. Who may connect is set under **Access to this computer** → **Who can connect** (see [Who is trusted](#who-is-trusted)).
 
 ```
 runpane workspace list
@@ -67,7 +67,8 @@ Password protection is off by default. When it is on, every client must send the
 - Under "Only me", a device signed in as another Tailscale user, including a teammate's Mac shared into your tailnet, is refused.
 - A tagged device is refused: Serve sends no identity for it.
 - Pane answers only requests that arrive through Serve: Serve's target path carries a secret that changes every launch, and requests straight to the loopback port are refused. Another OS user on the same machine who can read `tailscale serve status` could learn it, so give other accounts on a joined machine only the trust you would give the owner.
-- Browsers are refused. A web page open on one of your devices could otherwise send requests that Serve signs with your login.
+- Browsers are refused. A web page open on one of your devices could otherwise send requests that Serve signs with your login. Pane refuses any request that carries a browser `Origin`; the phone app's WebSockets, which always carry one, send a fixed value no browser can.
+- Integration keys are shared only with the owner's login, even under "Everyone on this tailnet". See [Shared integration keys](SHARED_CREDENTIALS.md).
 - Any device signed in as you, your phone included, is trusted. `runpane workspace list` shows only Macs, Windows PCs, and Linux machines, but that is a listing choice, not a block.
 - Removing a device from Tailscale revokes it everywhere.
 - The same setting decides who opens the host's dev servers and HTML pages in the Remote Pane app's browser tabs, at their `https://<host>.ts.net:<n>` addresses. A page in a frame cannot send the password, so those pages are off while password protection is on. See [Browser tabs on the phone](SELF_HOSTED_REMOTE_DAEMON.md#browser-tabs-on-the-phone).
@@ -88,6 +89,8 @@ runpane handoff "claude opus on parsas-macbook-pro" --note-file ~/handoff.md --p
 ```
 
 The destination machine needs Pane running, the repository saved in Pane with a remote for the same GitHub repository, and its own `runpane` on PATH (otherwise it uses `npx runpane@latest`). The note lands in that machine's `~/.pane/handoffs/`, the agent starts in a new Pane branched from your branch, and it reports back to your panel with `runpane workspace <your machine> panels submit`. The note's sections are in the `handoff` skill's [note template](../main/src/services/paneChatBundle/skills/handoff/references/note-template.md).
+
+Run from a Session's terminal, whose folder is outside git, handoff moves the Session instead (the Session menu's **Move to host…** asks the Session's agent to do this). It skips the git steps and pushes nothing, writes the note to the other machine's `~/.pane/handoffs/` the same way, and creates a Session there with the same name, goal and agent, whose next action is to read the note. The destination needs only Pane running with workspaces; no repository has to be saved there. The new Session waits for your first message, and the original stays where it is. A Session can't be handed off to the machine it is on. See [Move a Session to another machine](SESSIONS.md#move-a-session-to-another-machine).
 
 ## Paths across Windows, WSL, and macOS
 

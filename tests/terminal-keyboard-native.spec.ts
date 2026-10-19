@@ -115,15 +115,15 @@ for (const preset of ['standard', 'readline-friendly'] as const) {
       await expect.poll(() => menuPolicy(app)).toBe(true);
       await app.evaluate(({ BrowserWindow }) => {
         const contents = BrowserWindow.getAllWindows()[0].webContents;
-        contents.sendInputEvent({ type: 'keyDown', keyCode: 'W', modifiers: ['control'] });
-        contents.sendInputEvent({ type: 'keyDown', keyCode: 'W', modifiers: ['control', 'isAutoRepeat'] });
+        contents.sendInputEvent({ type: 'keyDown', keyCode: 'F6', modifiers: ['control'] });
+        contents.sendInputEvent({ type: 'keyDown', keyCode: 'F6', modifiers: ['control', 'isAutoRepeat'] });
       });
       await expect(record).toHaveText('Press a key combination');
       expect(await menuPolicy(app)).toBe(true);
       await app.evaluate(({ BrowserWindow }) => {
-        BrowserWindow.getAllWindows()[0].webContents.sendInputEvent({ type: 'keyUp', keyCode: 'W', modifiers: ['control'] });
+        BrowserWindow.getAllWindows()[0].webContents.sendInputEvent({ type: 'keyUp', keyCode: 'F6', modifiers: ['control'] });
       });
-      await expect(record).toHaveText('Ctrl+W');
+      await expect(record).toHaveText('Ctrl+F6');
       await expect.poll(() => menuPolicy(app)).toBe(false);
       await expect(record).toHaveAttribute('data-test-keydown', '4');
       await expect(record).toHaveAttribute('data-test-keyup', '3');
@@ -134,7 +134,7 @@ for (const preset of ['standard', 'readline-friendly'] as const) {
         const mock = (window as typeof window & { __paneTestElectronMock: { getConfigUpdates: () => Array<{ terminalEscapeShortcut?: { code: string } }> } }).__paneTestElectronMock;
         return mock.getConfigUpdates().filter(update => update.terminalEscapeShortcut).map(update => update.terminalEscapeShortcut?.code);
       });
-      expect(savedChords).toEqual(['Comma', 'KeyW']);
+      expect(savedChords).toEqual(['Comma', 'F6']);
       expect(await inputMessages(page)).toEqual([]);
       expect(await paneActions(page)).toEqual([]);
       const nativeCalls = await app.evaluate(() => {

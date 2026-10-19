@@ -24,18 +24,18 @@ interface PortsListProps {
   /** Shown on tcp rows when this client cannot open them at all (a phone: "desktop only"). */
   tcpLabel?: string;
   onOpen(port: number): void;
+  onRetry?(): void;
 }
 
-/** The host's listening ports, grouped by who opened them. Web ports open in the tab. */
-export const PortsList: React.FC<PortsListProps> = ({ snapshot, currentPort, canOpen, tcpLabel, onOpen }) => {
+/** The host's listening ports, grouped by owner; web and unchecked ports can open in the tab. */
+export const PortsList: React.FC<PortsListProps> = ({ snapshot, currentPort, canOpen, tcpLabel, onOpen, onRetry }) => {
   if (!snapshot) {
     return <p className="px-3 py-2 text-xs text-text-tertiary">Reading ports…</p>;
   }
-  if (snapshot.ports.length === 0) {
-    return <p className="px-3 py-2 text-xs text-text-tertiary">No listening ports on {snapshot.host}</p>;
-  }
   return (
     <div className="py-1">
+      {snapshot.discoveryMode === 'passive' && <p className="px-3 py-2 text-xs text-text-tertiary">Passive discovery</p>}
+      {snapshot.ports.length === 0 && <p className="px-3 py-2 text-xs text-text-tertiary">No listening ports on {snapshot.host}</p>}
       {LISTENING_PORT_GROUP_ORDER.map(group => {
         const ports = snapshot.ports.filter(port => port.group === group);
         if (ports.length === 0) return null;
@@ -46,7 +46,16 @@ export const PortsList: React.FC<PortsListProps> = ({ snapshot, currentPort, can
               <span>{ports.length}</span>
             </h3>
             {ports.map(port => (
-              <PortRow key={port.port} port={port} isCurrent={port.port === currentPort} canOpen={canOpen} tcpLabel={tcpLabel} onOpen={onOpen} />
+              <div key={port.port}>
+                <PortRow port={port} isCurrent={port.port === currentPort} canOpen={canOpen} tcpLabel={tcpLabel} onOpen={onOpen} />
+                {port.forwardingError && (
+                  <div className="px-3 pb-2 text-xs text-status-error">
+                    <p>{port.forwardingError.message}</p>
+                    <p>{port.forwardingError.next}</p>
+                    {onRetry && <button type="button" aria-label={`Retry forwarding port ${port.port}`} onClick={onRetry} className="mt-1 rounded text-interactive hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring-subtle">Retry</button>}
+                  </div>
+                )}
+              </div>
             ))}
           </section>
         );
@@ -57,7 +66,8 @@ export const PortsList: React.FC<PortsListProps> = ({ snapshot, currentPort, can
 
 const PortRow: React.FC<{ port: ListeningPort; isCurrent: boolean; canOpen: boolean; tcpLabel?: string; onOpen(port: number): void }> = ({ port, isCurrent, canOpen, tcpLabel, onOpen }) => {
   const isWeb = port.kind === 'web';
-  const opens = isWeb && (canOpen || port.localPort !== undefined);
+  const unchecked = port.probeStatus === 'unchecked';
+  const opens = (unchecked || isWeb) && (canOpen || port.localPort !== undefined);
   const content = (
     <>
       <span className="w-12 flex-shrink-0 font-mono text-xs font-semibold text-text-primary">{port.port}</span>
@@ -65,10 +75,10 @@ const PortRow: React.FC<{ port: ListeningPort; isCurrent: boolean; canOpen: bool
       <span
         className={cn(
           'flex-shrink-0 rounded border px-1 font-mono text-[10px] leading-4',
-          isWeb ? 'border-current text-status-success' : 'border-border-primary text-text-tertiary',
+          !unchecked && isWeb ? 'border-current text-status-success' : 'border-border-primary text-text-tertiary',
         )}
       >
-        {port.kind}
+        {unchecked ? 'unchecked' : port.kind}
       </span>
       <span className="min-w-0 flex-1 truncate text-xs text-text-tertiary">{port.paneName}</span>
       {port.localPort !== undefined && port.localPort !== port.port && (
@@ -81,13 +91,13 @@ const PortRow: React.FC<{ port: ListeningPort; isCurrent: boolean; canOpen: bool
       )}
       {/* One fixed slot for the swapping indicator: Open, the current-page check, the tcp label, or nothing. */}
       <span className={cn('flex flex-shrink-0 justify-end text-xs', tcpLabel ? 'w-20' : 'w-10', opens ? 'text-interactive' : 'text-text-tertiary')}>
-        {opens ? (isCurrent ? <Check className="h-3.5 w-3.5" aria-label="Open in this tab" /> : 'Open') : !isWeb && tcpLabel}
+        {opens ? (isCurrent ? <Check className="h-3.5 w-3.5" aria-label="Open in this tab" /> : 'Open') : !unchecked && !isWeb && tcpLabel}
       </span>
     </>
   );
   const rowClass = 'flex w-full items-center gap-2 px-3 py-1 text-left';
   if (!opens) {
-    return <div className={rowClass} title={isWeb ? undefined : `${port.port} does not answer HTTP`}>{content}</div>;
+    return <div className={rowClass} title={unchecked || isWeb ? undefined : `${port.port} does not answer HTTP`}>{content}</div>;
   }
   return (
     <button

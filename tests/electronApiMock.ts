@@ -71,6 +71,12 @@ export type ElectronApiMockOptions = {
   gitCommands?: JsonObject;
   /** Seeded split layout for the session under test (panels:get-layout). */
   initialLayout?: JsonObject | null;
+  /**
+   * Keep this desktop's own per-Pane layouts (uiState pane layouts) as the
+   * real ui-state store does, across reloads. Off by default: every visit then
+   * opens on the host's layout, as on a desktop that has never shown the Pane.
+   */
+  rememberPaneLayouts?: boolean;
   initialCombinedDiff?: JsonObject | null;
   initialMissionControlAgents?: JsonObject[];
   initialTerminalStates?: Record<string, JsonObject>;
@@ -324,6 +330,32 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
     const writeSessionWorkspaceLayouts = (layouts: Record<string, JsonObject>): void => {
       window.localStorage.setItem(sessionWorkspaceLayoutKey, JSON.stringify(layouts));
     };
+    // This desktop's per-host, per-Pane layouts, kept like the tiling above.
+    const paneLayoutKey = '__pane_test_pane_layouts__';
+    const readPaneLayouts = (): Record<string, JsonObject> => {
+      const raw = window.localStorage.getItem(paneLayoutKey);
+      if (!raw) return {};
+      try {
+        // SAFETY: only this mock writes that key, with the record below.
+        return JSON.parse(raw) as Record<string, JsonObject>;
+      } catch {
+        return {};
+      }
+    };
+    // Opened Sessions, kept per host like main keeps them ('' is this computer).
+    // In localStorage so a reload reads back what the previous page saved.
+    const expandedSessionsKey = '__pane_test_expanded_sessions__';
+    const readExpandedSessions = (): Record<string, string[]> => {
+      const raw = window.localStorage.getItem(expandedSessionsKey);
+      if (!raw) return {};
+      try {
+        // SAFETY: only this mock writes that key, with the record below.
+        return JSON.parse(raw) as Record<string, string[]>;
+      } catch {
+        return {};
+      }
+    };
+    const paneLayoutId = (hostId: string | null, paneId: string) => `${hostId ?? ''}/${paneId}`;
     const uiState = {
       expandedProjects: [] satisfies number[],
       expandedFolders: [] satisfies string[],
@@ -331,7 +363,7 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
       pinnedSectionExpanded: true,
       repositoriesSectionExpanded: true,
       sessionsSectionExpanded: true,
-      collapsedSessions: [] satisfies string[],
+      expandedSessions: [] satisfies string[],
       archivedSectionExpanded: false,
       expandedArchivedProjects: [] satisfies number[],
       ...clone(mockOptions.initialUiState ?? {}),
@@ -419,6 +451,9 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         }
         if (prop === 'onPermissionResolved') {
           return (callback: MockEventCallback) => subscribe('permission:resolved', callback);
+        }
+        if (prop === 'onPaneFocusRequested') {
+          return (callback: MockEventCallback) => subscribe('pane:focus-requested', callback);
         }
         if (prop === 'onRemoteDaemonResyncRequested') {
           return (callback: () => void) => subscribe('remote-daemon:resync-required', callback);
@@ -819,6 +854,8 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
             panelId,
             text: `snapshot for ${panelId}`,
             lineCount: 1,
+            cols: 80,
+            rows: 24,
             isAlternateScreen: false,
             isLive: true,
             lastActivityAt: null,
@@ -1217,7 +1254,8 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
       }),
       uiState: namespace({
         getExpanded: () => {
-          const read = success(clone(uiState));
+          const storedSessions = readExpandedSessions()[remoteConnectionState.activeProfileId ?? ''];
+          const read = success({ ...clone(uiState), expandedSessions: storedSessions ?? clone(uiState.expandedSessions) });
           if (!holdNextExpandedRead) return read;
           holdNextExpandedRead = false;
           return new Promise(resolve => { heldExpandedReads.push(() => resolve(read)); });
@@ -1239,8 +1277,10 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
           else if (section === 'archived') uiState.archivedSectionExpanded = expanded;
           return success();
         },
-        saveCollapsedSessions: (sessionIds: string[]) => {
-          uiState.collapsedSessions = clone(sessionIds);
+        saveExpandedSessions: (sessionIds: string[]) => {
+          const stored = readExpandedSessions();
+          stored[remoteConnectionState.activeProfileId ?? ''] = clone(sessionIds);
+          window.localStorage.setItem(expandedSessionsKey, JSON.stringify(stored));
           return success();
         },
         saveExpandedArchivedProjects: (projectIds: number[]) => {
@@ -1254,6 +1294,16 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
           if (layout === null) delete layouts[hostId ?? ''];
           else layouts[hostId ?? ''] = clone(layout);
           writeSessionWorkspaceLayouts(layouts);
+          return success();
+        },
+        getPaneLayout: (hostId: string | null, paneId: string) =>
+          success(mockOptions.rememberPaneLayouts ? readPaneLayouts()[paneLayoutId(hostId, paneId)] ?? null : null),
+        savePaneLayout: (hostId: string | null, paneId: string, layout: JsonObject | null) => {
+          if (!mockOptions.rememberPaneLayouts) return success();
+          const layouts = readPaneLayouts();
+          if (layout === null) delete layouts[paneLayoutId(hostId, paneId)];
+          else layouts[paneLayoutId(hostId, paneId)] = clone(layout);
+          window.localStorage.setItem(paneLayoutKey, JSON.stringify(layouts));
           return success();
         },
         getNavigationMemory: (hostId: string | null) =>
@@ -1348,6 +1398,14 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         emitPermissionRequest(request: PanePermissionRequest) {
           pendingPermissions.push(request);
           emit('permission:request', request);
+        },
+        // Stands in for `runpane panes focus`.
+        emitPaneFocusRequested(paneId: string) {
+          emit('pane:focus-requested', { paneId });
+        },
+        // Names the host that host-keyed ui state reads and writes, as main's active profile does.
+        setActiveRemoteProfileId(profileId: string | null) {
+          remoteConnectionState.activeProfileId = profileId;
         },
         emitRemoteDaemonResyncRequested(event: { hostChanged: boolean } = { hostChanged: false }) {
           emit('remote-daemon:resync-required', event);

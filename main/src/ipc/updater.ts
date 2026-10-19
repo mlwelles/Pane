@@ -9,7 +9,7 @@ import { getCurrentWorktreeName } from '../utils/worktreeUtils';
 import { getAppDirectory } from '../utils/appDirectory';
 import { getUpdateCapabilities } from '../utils/updateCapabilities';
 
-const MAC_UPDATE_COMMAND = 'curl -fsSL https://runpane.com/install.sh | sh';
+const MAC_UPDATE_COMMAND = 'runpane update --wait';
 
 export function registerUpdaterHandlers(ipcMain: IpcMain, { app, versionChecker }: AppServices): void {
   ipcMain.handle('updater:get-capabilities', async () => ({
@@ -198,19 +198,24 @@ export function registerUpdaterHandlers(ipcMain: IpcMain, { app, versionChecker 
     }
   });
 
-  ipcMain.handle('updater:install-update', () => {
+  ipcMain.handle('updater:install-update', async () => {
     try {
       if (!app.isPackaged && !process.env.TEST_UPDATES) {
         return { success: false, error: 'Auto-update is only available in packaged apps' };
       }
 
-      // Quit and install the update
-      getAutoUpdater().quitAndInstall(false, true);
-
-      return { success: true, message: 'Installing update...' };
+      getAutoUpdater().autoInstallOnAppQuit = false;
+      const paneDir = getAppDirectory();
+      const engine = path.join(paneDir, 'bin', 'runpane.cjs');
+      const output = await new Promise<string>((resolve, reject) => {
+        execFile(process.execPath, [engine, 'update', '--pane-dir', paneDir, '--json'], {
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, encoding: 'utf8', timeout: 60_000,
+        }, (error, stdout, stderr) => error ? reject(new Error(stderr.trim() || error.message)) : resolve(stdout));
+      });
+      return { success: true, message: 'Independent update started. Pane will restart after staging and checkpointing.', data: JSON.parse(output) };
     } catch (error) {
       console.error('Failed to install update:', error);
-      return { success: false, error: 'Failed to install update' };
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to start the independent update' };
     }
   });
 }

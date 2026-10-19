@@ -32,11 +32,12 @@ export function RemoteHostSwitcher({
   const remote = connectionState.mode === 'remote';
   const activeStatusText = connectionState.status === 'connected'
     ? 'Connected'
-    : connectionState.status === 'error' ? 'Connection failed' : 'Connecting';
+    : connectionState.status === 'restoring' ? 'Restoring'
+    : connectionState.status === 'error' ? 'Connection failed · Retry now' : 'Reconnecting · Retry now';
 
   const switchTo = async (profileId: string) => {
     // Picking the current host again retries it after a failed connection.
-    if (switching || (profileId === model.selectedId && connectionState.status !== 'error')) return;
+    if (switching || (profileId === model.selectedId && connectionState.status === 'connected')) return;
     const updates = profileId === LOCAL_RUNTIME_ID
       ? { activeProfileId: null, mode: 'local' as const }
       : { activeProfileId: profileId, mode: 'remote' as const };
@@ -47,6 +48,8 @@ export function RemoteHostSwitcher({
       const response = await API.remoteDaemon.updateClientState(updates);
       if (!response.success) console.error('Failed to switch remote host:', response.error);
       await fetchConfig().catch(() => undefined);
+    } catch (error) {
+      console.warn('Remote connection could not be changed:', error);
     } finally {
       setSwitching(false);
     }

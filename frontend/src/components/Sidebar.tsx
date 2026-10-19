@@ -143,7 +143,7 @@ export function Sidebar({ onAboutClick, onSettingsClick, onRemoteSettingsClick, 
   });
   const { connectionState: remoteConnectionState, hostState: remoteHostState } = useRemoteRuntimeState();
   const hydrateExpandedProjects = useNavigationStore(s => s.hydrateExpandedProjects);
-  const hydrateCollapsedSessions = useNavigationStore(s => s.hydrateCollapsedSessions);
+  const hydrateExpandedSessions = useNavigationStore(s => s.hydrateExpandedSessions);
   const hydrateExpandedArchivedProjects = useNavigationStore(s => s.hydrateExpandedArchivedProjects);
 
   useEffect(() => {
@@ -156,7 +156,7 @@ export function Sidebar({ onAboutClick, onSettingsClick, onRemoteSettingsClick, 
         if (result.success && result.data) {
           setSessionSortAscending(result.data.sessionSortAscending ?? true);
           hydrateExpandedProjects(result.data.expandedProjects ?? []);
-          hydrateCollapsedSessions(result.data.collapsedSessions ?? []);
+          hydrateExpandedSessions(result.data.expandedSessions ?? []);
           hydrateExpandedArchivedProjects(result.data.expandedArchivedProjects ?? []);
           setSidebarSectionExpansion({
             pinned: result.data.pinnedSectionExpanded ?? true,
@@ -176,7 +176,7 @@ export function Sidebar({ onAboutClick, onSettingsClick, onRemoteSettingsClick, 
     return () => {
       cancelled = true;
     };
-  }, [hydrateCollapsedSessions, hydrateExpandedArchivedProjects, hydrateExpandedProjects]);
+  }, [hydrateExpandedArchivedProjects, hydrateExpandedProjects, hydrateExpandedSessions]);
 
   const toggleSessionSortOrder = async () => {
     const newValue = !sessionSortAscending;

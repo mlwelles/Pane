@@ -5,7 +5,7 @@ import type { BoundarySchema, JsonObject, JsonValue } from '../validation/bounda
 
 export type RemoteDaemonTransport = 'http+sse';
 export type RemoteDaemonClientMode = 'local' | 'remote';
-export type RemotePaneConnectionStatus = 'local' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+export type RemotePaneConnectionStatus = 'local' | 'connecting' | 'connected' | 'restoring' | 'reconnecting' | 'error';
 export type RemoteSetupChannel = 'stable' | 'nightly';
 export type RemoteSetupTunnelPreference = 'auto' | 'tailscale' | 'ssh' | 'manual';
 export type RemoteSetupDataDirectoryMode = 'current' | 'isolated';
@@ -319,6 +319,7 @@ export interface RemotePwaAffordances {
 }
 
 export interface RemotePaneConnectionState {
+  updateIntent?: import('../remoteClient/updateIntent').RemoteUpdateIntent | null;
   mode: RemoteDaemonClientMode;
   status: RemotePaneConnectionStatus;
   activeProfileId: string | null;
@@ -363,6 +364,13 @@ export function decodeRemoteHeartbeatPayload<Value>(value: Value): RemoteDaemonH
 export function decodeRemoteDaemonEventEnvelope<Value>(value: Value): RemoteDaemonEventEnvelope {
   return decodeBoundary(value, remoteDaemonEventEnvelopeSchema);
 }
+
+/**
+ * The Origin the native app sends on its WebSockets. React Native always sends an Origin on a
+ * WebSocket and workspaces refuse browser origins, so the app names itself with a value no browser
+ * can send: browsers send only "null" or scheme://host.
+ */
+export const NATIVE_APP_WEBSOCKET_ORIGIN = 'runpane-native-app';
 
 export const DEFAULT_REMOTE_DAEMON_HOST_CONFIG: RemoteDaemonHostConfig = {
   enabled: false,

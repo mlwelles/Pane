@@ -2,7 +2,8 @@
  * Puts Pane's own `runpane` on PATH for every terminal Pane launches, so agents
  * never depend on a global `npm i -g runpane` (or a stale one).
  *
- * At startup Pane copies its bundled CLI into `<PANE_DIR>/bin/runpane.cjs` and
+ * Unless a CLI-only update selected a separate managed package/runtime, startup
+ * copies the bundled CLI into `<PANE_DIR>/bin/runpane.cjs` and
  * writes a `runpane` shim that runs it with this Electron binary as Node
  * (ELECTRON_RUN_AS_NODE=1). Terminal launches then prepend `<PANE_DIR>/bin` to
  * PATH and, for zsh, bash and fish, re-apply that after the user's startup
@@ -13,6 +14,7 @@
  * distro, and env set on wsl.exe does not reach the Linux shell anyway.
  */
 import fs from 'fs';
+import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
 import path from 'path';
 import type { PtyHostSpawnOpts } from '../ptyHost/types';
 
@@ -209,16 +211,34 @@ export function installRunpaneShim(options: InstallRunpaneShimOptions): RunpaneS
 
   const binDir = path.join(options.appDirectory, 'bin');
   ensureDirectory(binDir);
-  const cliPath = path.join(binDir, 'runpane.cjs');
-  if (!writeManagedFile(cliPath, cli, null, 0o644)) return null;
+  let cliPath = path.join(binDir, 'runpane.cjs');
+  let execPath = options.execPath;
+  const overrideFile = path.join(binDir, 'runpane-override.json');
+  if (fs.existsSync(overrideFile)) {
+    // CLI-only updates are an explicit installation choice. Older Pane startup
+    // must neither overwrite that package nor switch its runtime back to Electron.
+    if (isSymlink(overrideFile)) return null;
+    const override = decodeBoundary(JSON.parse(fs.readFileSync(overrideFile, 'utf8')), boundary.object({
+      version: boundary.nonEmptyString,
+      entrypoint: boundary.nonEmptyString,
+      runtime: boundary.nonEmptyString,
+    }));
+    const root = fs.realpathSync(path.join(binDir, 'cli'));
+    for (const file of [override.entrypoint, override.runtime]) {
+      const relative = path.relative(root, fs.realpathSync(file));
+      if (relative.startsWith('..') || path.isAbsolute(relative) || !fs.statSync(file).isFile()) return null;
+    }
+    cliPath = override.entrypoint;
+    execPath = override.runtime;
+  } else if (!writeManagedFile(cliPath, cli, null, 0o644)) return null;
 
   const shimPath = path.join(binDir, platform === 'win32' ? 'runpane.cmd' : 'runpane');
   // Git Bash on Windows also finds the extensionless POSIX shim.
-  if (!writeManagedFile(path.join(binDir, 'runpane'), posixShim(options.appDirectory, options.execPath, cliPath), PANE_MANAGED_SHIM_MARKER, 0o755)) {
+  if (!writeManagedFile(path.join(binDir, 'runpane'), posixShim(options.appDirectory, execPath, cliPath), PANE_MANAGED_SHIM_MARKER, 0o755)) {
     return null;
   }
   if (platform === 'win32'
-    && !writeManagedFile(shimPath, windowsShim(options.appDirectory, options.execPath, cliPath), PANE_MANAGED_SHIM_MARKER, 0o755)) {
+    && !writeManagedFile(shimPath, windowsShim(options.appDirectory, execPath, cliPath), PANE_MANAGED_SHIM_MARKER, 0o755)) {
     return null;
   }
 

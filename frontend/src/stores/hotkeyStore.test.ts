@@ -78,7 +78,23 @@ describe('hotkeyStore keyboard shortcut preference', () => {
     expect(isHotkeyEnabledForEvent(availabilityEvent as KeyboardEvent)).toBe(false);
   });
 
-  it('uses the rebound terminal palette escape instead of the registered palette chord', () => {
+  it.each([
+    { key: 'k', code: 'KeyK', metaKey: true, keys: 'mod+k' },
+    { key: 'k', code: 'KeyK', metaKey: true, altKey: true, keys: 'mod+alt+k' },
+    { key: '\\', code: 'Backslash', metaKey: true, keys: 'mod+\\' },
+  ])('runs a nonconflicting macOS shortcut from terminal input: $keys', ({ keys, ...input }) => {
+    vi.stubGlobal('navigator', { platform: 'MacIntel' });
+    const action = vi.fn();
+    useConfigStore.setState({ config: { terminalKeyboardPreset: 'readline-friendly' } });
+    useHotkeyStore.getState().register({ id: 'test-shortcut', label: 'Test shortcut', keys, category: 'tabs', action });
+    keydownListener?.(keyboardEvent(input, {
+      tagName: 'TEXTAREA', isContentEditable: false, closest: () => null,
+      matches: () => true, classList: { contains: () => true },
+    }, vi.fn()));
+    expect(action).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a nonconflicting registered palette chord alongside its terminal replacement', () => {
     const action = vi.fn();
     const preventDefault = vi.fn();
     useConfigStore.setState({ config: {
@@ -93,12 +109,12 @@ describe('hotkeyStore keyboard shortcut preference', () => {
       matches: (selector: string) => selector === 'textarea.xterm-helper-textarea',
       classList: { contains: (name: string) => name === 'xterm-helper-textarea' },
     };
-    keydownListener?.(keyboardEvent({ key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true }, target, preventDefault));
-    expect(action).not.toHaveBeenCalled();
-    expect(preventDefault).not.toHaveBeenCalled();
-    keydownListener?.(keyboardEvent({ key: 'o', code: 'KeyO', altKey: true }, target, preventDefault));
+    keydownListener?.(keyboardEvent({ key: 'P', code: 'KeyP', metaKey: true, shiftKey: true }, target, preventDefault));
     expect(action).toHaveBeenCalledOnce();
     expect(preventDefault).toHaveBeenCalledOnce();
+    keydownListener?.(keyboardEvent({ key: 'o', code: 'KeyO', altKey: true }, target, preventDefault));
+    expect(action).toHaveBeenCalledTimes(2);
+    expect(preventDefault).toHaveBeenCalledTimes(2);
   });
 
   it.each([
@@ -129,7 +145,7 @@ describe('hotkeyStore keyboard shortcut preference', () => {
       category: 'navigation' as const, action,
     };
     let modalOpen = true;
-    const dispatch = () => keydownListener?.(keyboardEvent({ key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true }, {
+    const dispatch = () => keydownListener?.(keyboardEvent({ key: 'P', code: 'KeyP', metaKey: true, shiftKey: true }, {
       tagName: 'TEXTAREA', isContentEditable: false,
       closest: selector => modalOpen && selector === '[aria-modal="true"]' ? { matched: true } : null,
       matches: () => true, classList: { contains: () => true },
@@ -154,7 +170,7 @@ describe('hotkeyStore keyboard shortcut preference', () => {
       closest: (selector: string) => selector === '[aria-modal="true"]' ? target : null,
     });
     const event: Event = Object.assign(new Event('keydown'), {
-      key: 'P', code: 'KeyP', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true,
+      key: 'P', code: 'KeyP', ctrlKey: false, metaKey: true, altKey: false, shiftKey: true,
       getModifierState: () => false,
     });
     Object.defineProperty(event, 'target', { value: target });
@@ -179,7 +195,7 @@ describe('hotkeyStore keyboard shortcut preference', () => {
       closest: (selector: string) => selector === '[aria-modal="true"]' ? target : null,
     });
     const event: Event = Object.assign(new Event('keydown', { cancelable: true }), {
-      key: 'P', code: 'KeyP', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true,
+      key: 'P', code: 'KeyP', ctrlKey: false, metaKey: true, altKey: false, shiftKey: true,
       getModifierState: () => false,
     });
     Object.defineProperty(event, 'target', { value: target });
