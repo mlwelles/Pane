@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import type { ListeningPortsSnapshot } from '../../../shared/types/listeningPorts';
 
 /** The host's listening ports, kept current by the host's `ports:changed` event. Null until the first read. */
-export function useListeningPorts(): ListeningPortsSnapshot | null {
+export function useListeningPorts(refreshKey = 0): ListeningPortsSnapshot | null {
   const [snapshot, setSnapshot] = useState<ListeningPortsSnapshot | null>(null);
 
   useEffect(() => {
@@ -28,7 +28,7 @@ export function useListeningPorts(): ListeningPortsSnapshot | null {
       unsubscribeChanges();
       unsubscribeResync?.();
     };
-  }, []);
+  }, [refreshKey]);
 
   return snapshot;
 }

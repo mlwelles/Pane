@@ -8,9 +8,15 @@ import type { BoundarySchema } from '../validation/boundaryDecoder';
  */
 export type ListeningPortGroup = 'pane-terminal' | 'other' | 'system' | 'pane';
 
+export type PortDiscoveryMode = 'active' | 'passive';
+
+export function supportsPassivePortDiscovery(platform: string | undefined): boolean {
+  return platform === 'darwin' || platform === 'linux';
+}
+
 export const LISTENING_PORT_GROUP_ORDER: readonly ListeningPortGroup[] = ['pane-terminal', 'other', 'system', 'pane'];
 
-/** `web` answered an HTTP request when first seen; `tcp` did not. */
+/** `web` answered HTTP; `tcp` did not, or is the compatible fallback when unchecked. */
 export type ListeningPortKind = 'web' | 'tcp';
 
 export interface ListeningPort {
@@ -20,6 +26,8 @@ export interface ListeningPort {
   process: string;
   group: ListeningPortGroup;
   kind: ListeningPortKind;
+  probeStatus?: 'unchecked';
+  forwardingError?: { code: string; message: string; next: string };
   /** The Pane whose terminal started the process, for `pane-terminal` ports. */
   sessionId?: string;
   paneName?: string;
@@ -43,6 +51,7 @@ export interface ListeningPortsSnapshot {
   /** Sorted by group order, then port. */
   ports: ListeningPort[];
   phone?: PhonePreviewStatus;
+  discoveryMode?: PortDiscoveryMode;
   /**
    * Set by a remote desktop when its host is too old to list ports: nothing is tunnelled, and
    * loopback URLs open this computer's own ports.
@@ -58,10 +67,22 @@ const listeningPortsSnapshotSchema: BoundarySchema<ListeningPortsSnapshot> = bou
     process: boundary.string,
     group: boundary.enumeration(...LISTENING_PORT_GROUP_ORDER),
     kind: boundary.enumeration('web', 'tcp'),
+    probeStatus: boundary.optional(boundary.literal('unchecked')),
+    forwardingError: boundary.optional(boundary.object({
+      code: boundary.string,
+      message: boundary.string,
+      next: boundary.string,
+    })),
     sessionId: boundary.optional(boundary.string),
     paneName: boundary.optional(boundary.string),
     localPort: boundary.optional(boundary.number),
+    phoneUrl: boundary.optional(boundary.string),
   })),
+  phone: boundary.optional(boundary.union(
+    boundary.object({ state: boundary.literal('on'), filesUrl: boundary.string }),
+    boundary.object({ state: boundary.literal('off'), reason: boundary.string }),
+  )),
+  discoveryMode: boundary.optional(boundary.enumeration('active', 'passive')),
   unsupportedHost: boundary.optional(boundary.literal(true)),
 });
 

@@ -16,6 +16,7 @@ import { AppearanceValidationError } from '../../../shared/types/appearance';
 import { agentPresetsForPlatform } from '../../../shared/constants/agentLaunchPresets';
 import { normalizePaneChatAgent, type PaneChatAgent } from '../../../shared/types/paneChat';
 import { getPaneEventSink } from '../core/runtime';
+import { paneErrorText } from '../../../shared/paneError';
 
 export function registerConfigHandlers(
   ipcMain: IpcMain,
@@ -77,7 +78,7 @@ export function registerConfigHandlers(
       return { success: true, data: config };
     } catch (error) {
       console.error('Failed to get config:', error);
-      return { success: false, error: 'Failed to get config' };
+      return { success: false, error: paneErrorText(error instanceof Error ? error : { message: String(error) }) };
     }
   });
 

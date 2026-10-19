@@ -39,12 +39,8 @@ export interface PhonePreviewHostOptions {
   onChange?(): void;
 }
 
-/**
- * Phone pages: one `tailscale serve --https=<n>` handler per web port a phone has opened, plus one for HTML files and
- * media, each pointing at a loopback preview proxy. Every handler target starts with
- * `/pane-<instance>/`, so a relaunch, even after kill -9, finds and removes this instance's
- * leftovers without touching handlers that belong to anyone else.
- */
+/** Phone previews use per-requested-port Serve handlers plus one files handler.
+ * Instance-prefixed targets let later launches remove only this Pane's leftovers. */
 export class PhonePreviewHost {
   private readonly instancePrefix: string;
   private readonly basePath: string;
@@ -52,8 +48,8 @@ export class PhonePreviewHost {
   private proxy: PreviewProxy | null = null;
   /** Serve HTTPS port for each forwarded port (by number) and for files. */
   private handlers = new Map<string, number>();
-  private webPorts: number[] = [];
-  /** Web ports a phone has opened while they kept listening. */
+  private eligiblePorts = new Set<number>();
+  /** Ports explicitly opened while their listener and access remain available. */
   private readonly requested = new Set<number>();
   private listeningPorts = new Set<number>();
   private lastError: string | null = null;
@@ -80,30 +76,28 @@ export class PhonePreviewHost {
     await this.reconcile();
   }
 
-  /** Follows the Ports list: web ports gain handlers, and ports that stopped listening lose theirs. */
+  /** Listener removal revokes a grant; classification changes preserve it. */
   update(snapshot: ListeningPortsSnapshot): Promise<void> {
-    this.webPorts = snapshot.ports.filter(port => port.kind === 'web').map(port => port.port);
+    this.eligiblePorts = new Set(snapshot.ports.filter(port => port.kind === 'web' || port.probeStatus === 'unchecked').map(port => port.port));
     this.listeningPorts = new Set(snapshot.ports.map(port => port.port));
     // A port that stopped listening must be asked for again once it is back.
-    for (const port of this.requested) if (!this.webPorts.includes(port)) this.requested.delete(port);
+    for (const port of this.requested) if (!this.listeningPorts.has(port)) this.requested.delete(port);
     return this.reconcile();
   }
 
-  /**
-   * A phone wants to open a web port: give it a handler. Handlers exist only for ports a phone
-   * opened, because Serve loses its whole config (other apps' handlers included) once a machine
-   * holds a few hundred of them.
-   */
+  /** Explicit requests limit Serve handlers, whose total capacity is shared with other apps. */
   request(port: number): Promise<void> {
-    if (!this.webPorts.includes(port) || this.requested.has(port)) return this.queue;
+    if (!this.previewAllowed() || !this.eligiblePorts.has(port) || this.requested.has(port)) return this.queue;
     this.requested.add(port);
     return this.reconcile();
   }
 
-  /** The Ports list as phones need it: each web port's phone address, and whether pages work. */
+  /** Decorates explicitly opened listeners with their current phone addresses and access state. */
   decorate(snapshot: ListeningPortsSnapshot): ListeningPortsSnapshot {
+    const allowed = this.previewAllowed();
+    snapshot = { ...snapshot, ports: snapshot.ports.map(({ phoneUrl: _phoneUrl, ...port }) => port) };
     const tailnet = this.options.workspace.getTailnet();
-    const filesPort = this.handlers.get(FILES);
+    const filesPort = allowed ? this.handlers.get(FILES) : undefined;
     if (this.options.workspace.getAccessPolicy()?.verifySecret) {
       return { ...snapshot, phone: { state: 'off', reason: PASSWORD_REASON } };
     }
@@ -117,7 +111,8 @@ export class PhonePreviewHost {
       ...snapshot,
       ports: snapshot.ports.map(port => {
         const servePort = this.handlers.get(String(port.port));
-        return servePort === undefined ? port : { ...port, phoneUrl: origin(servePort) };
+        return servePort === undefined || !this.requested.has(port.port) || !this.listeningPorts.has(port.port)
+          ? port : { ...port, phoneUrl: origin(servePort) };
       }),
       phone: { state: 'on', filesUrl: origin(filesPort) },
     };
@@ -132,24 +127,36 @@ export class PhonePreviewHost {
     this.proxy = null;
   }
 
+  private previewAllowed(): boolean {
+    const policy = this.options.workspace.getAccessPolicy();
+    const allowed = !this.stopped && Boolean(this.options.workspace.getTailnet() && policy && !policy.verifySecret);
+    if (!allowed) this.requested.clear();
+    return allowed;
+  }
+
+  private wantsHandler(key: string): boolean {
+    return this.previewAllowed() && (key === FILES || (this.requested.has(Number(key)) && this.listeningPorts.has(Number(key))));
+  }
+
   private gate() {
+    this.previewAllowed();
     const tailnet = this.options.workspace.getTailnet();
     const policy = this.options.workspace.getAccessPolicy();
     if (!tailnet || !policy) return null;
     // A frame sends no password, so on a password-protected machine every page request fails here.
-    const detected = new Set(this.webPorts);
     return {
       dnsName: tailnet.dnsName,
       machineName: tailnet.machineName,
       ownerLogin: tailnet.ownerLogin,
       admits: (login: string) => authenticateWorkspaceRequest(login, undefined, policy).ok,
-      // Detection revokes a port at once, before Serve confirms its handler is gone.
+      // Listener removal revokes access before Serve confirms its handler is gone.
       refusal: policy.verifySecret ? `${tailnet.machineName} is password protected, so its pages do not open on phones.` : undefined,
-      ports: new Set([...this.handlers.keys()].filter(key => key !== FILES).map(Number).filter(port => detected.has(port))),
+      ports: new Set([...this.handlers.keys()].filter(key => key !== FILES).map(Number).filter(port => this.requested.has(port) && this.listeningPorts.has(port))),
     };
   }
 
   private reconcile(): Promise<void> {
+    this.previewAllowed();
     const work = () => this.applyHandlers().catch(error => {
       this.lastError = error instanceof Error ? error.message : String(error);
       console.warn('[Pane phone previews] Serve handlers out of sync:', this.lastError);
@@ -185,11 +192,10 @@ export class PhonePreviewHost {
 
       const proxyPort = this.proxy?.port;
       const target = (key: string) => `http://127.0.0.1:${proxyPort}${this.basePath}/${key}`;
-      const passwordProtected = Boolean(this.options.workspace.getAccessPolicy()?.verifySecret);
-      const wanted = tailnet && proxyPort && !passwordProtected ? [FILES, ...[...this.requested].map(String)] : [];
+      const wanted = proxyPort && this.previewAllowed() ? [FILES, ...[...this.requested].map(String)] : [];
 
       for (const handler of ours) {
-        if (wanted.includes(handler.key) && handler.target === target(handler.key) && !next.has(handler.key)) {
+        if (wanted.includes(handler.key) && this.wantsHandler(handler.key) && handler.target === target(handler.key) && !next.has(handler.key)) {
           next.set(handler.key, handler.servePort);
           continue;
         }
@@ -202,7 +208,7 @@ export class PhonePreviewHost {
         if (!removal.ok) failure ??= `could not remove the Serve handler on ${handler.servePort}: ${firstLine(removal.stderr || removal.stdout)}`;
       }
       for (const key of wanted) {
-        if (next.has(key)) continue;
+        if (next.has(key) || !this.wantsHandler(key)) continue;
         let servePort = FIRST_SERVE_PORT;
         while (taken.has(servePort) || this.listeningPorts.has(servePort)) servePort += 1;
         taken.add(servePort);
@@ -210,9 +216,15 @@ export class PhonePreviewHost {
         if (added.ok) next.set(key, servePort);
         else failure ??= `tailscale serve could not add a handler on ${servePort}: ${firstLine(added.stderr || added.stdout)}`;
       }
+      for (const [key, servePort] of next) {
+        if (this.wantsHandler(key)) continue;
+        next.delete(key);
+        const removal = await serve([`--https=${servePort}`, '--set-path=/', 'off']);
+        if (!removal.ok) failure ??= `could not remove the Serve handler on ${servePort}: ${firstLine(removal.stderr || removal.stdout)}`;
+      }
     });
 
-    this.handlers = next;
+    this.handlers = new Map([...next].filter(([key]) => this.wantsHandler(key)));
     this.lastError = failure;
     this.serveClear = next.size === 0 && failure === null;
     this.publishIfChanged();

@@ -34,9 +34,9 @@ export function phonePage(url: string, ports: ListeningPortsSnapshot | null, pan
   if (ports?.phone?.state !== 'on') return unavailable(address, offReason(ports));
   const listening = ports.ports.find(candidate => candidate.port === port);
   if (!listening) return unavailable(address, `Nothing on ${host} listens on port ${port}.`);
-  if (listening.kind !== 'web') return unavailable(address, `localhost:${port} does not answer HTTP, so it opens only on desktops.`);
-  if (!listening.phoneUrl) return { kind: 'unavailable', address, host, reason: `Pane is giving localhost:${port} a phone address…`, request: port };
-  return { kind: 'frame', src: `${listening.phoneUrl}${path}`, address, host };
+  if (listening.phoneUrl) return { kind: 'frame', src: `${listening.phoneUrl}${path}`, address, host };
+  if (listening.kind !== 'web' && listening.probeStatus !== 'unchecked') return unavailable(address, `localhost:${port} does not answer HTTP, so it opens only on desktops.`);
+  return { kind: 'unavailable', address, host, reason: `Pane is giving localhost:${port} a phone address…`, request: port };
 }
 
 /**
