@@ -40,7 +40,13 @@ describe('socket fixtures', () => {
     expect(parsed.sockets.map(socket => socket.pid)).toEqual([42, 43, null]);
     expect(parsed.sockets.map(socket => socket.family)).toEqual(['ipv4', 'ipv4', 'ipv6']);
   });
-  it.each(['LISTEN 0 128 bad:3000 *:*', 'LISTEN 0', 'unexpected output', 'LISTEN 0 128 *:3000 *:* users:(("node",pid=bad,fd=1))'])('rejects unknown Linux rows: %s', line => {
+  it('normalizes an interface-scoped IPv4 listener reported by Linux', () => {
+    expect(parseSsResult(result('LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n'))).toEqual({
+      complete: true,
+      sockets: [{ address: '127.0.0.53', family: 'ipv4', port: 53, pid: null, process: '' }],
+    });
+  });
+  it.each(['LISTEN 0 128 bad:3000 *:*', 'LISTEN 0', 'unexpected output', 'LISTEN 0 128 127.0.0.53%lo!:53 *:*', 'LISTEN 0 128 *:3000 *:* users:(("node",pid=bad,fd=1))'])('rejects unknown Linux rows: %s', line => {
     expect(parseSsResult(result(line)).complete).toBe(false);
   });
   it('accepts a successful empty Linux socket table', () => {
