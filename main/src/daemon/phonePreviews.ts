@@ -3,7 +3,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { boundary, decodeOptionalBoundary } from '../../../shared/validation/boundaryDecoder';
-import type { ListeningPortsSnapshot } from '../../../shared/types/listeningPorts';
+import type { ListeningPort, ListeningPortsSnapshot } from '../../../shared/types/listeningPorts';
 import { authenticateWorkspaceRequest } from './auth';
 import { runRemoteSetupCommand, type RemoteSetupCommandRunner } from './remote-setup-command';
 import { resolveTailscaleCommandAsync, runTailscaleServe, type ResolvedCommand } from './tailscaleSetup';
@@ -50,7 +50,8 @@ export class PhonePreviewHost {
   private handlers = new Map<string, number>();
   private eligiblePorts = new Set<number>();
   /** Ports explicitly opened while their listener and access remain available. */
-  private readonly requested = new Set<number>();
+  private readonly requested = new Map<number, Pick<ListeningPort, 'pid' | 'process'>>();
+  private owners = new Map<number, Pick<ListeningPort, 'pid' | 'process'>>();
   private listeningPorts = new Set<number>();
   private lastError: string | null = null;
   /** What `decorate` last reflected, to publish only real changes. */
@@ -76,19 +77,23 @@ export class PhonePreviewHost {
     await this.reconcile();
   }
 
-  /** Listener removal revokes a grant; classification changes preserve it. */
+  /** Listener removal or owner change revokes a grant; classification changes preserve it. */
   update(snapshot: ListeningPortsSnapshot): Promise<void> {
     this.eligiblePorts = new Set(snapshot.ports.filter(port => port.kind === 'web' || port.probeStatus === 'unchecked').map(port => port.port));
-    this.listeningPorts = new Set(snapshot.ports.map(port => port.port));
-    // A port that stopped listening must be asked for again once it is back.
-    for (const port of this.requested) if (!this.listeningPorts.has(port)) this.requested.delete(port);
+    this.owners = new Map(snapshot.ports.map(({ port, pid, process }) => [port, { pid, process }]));
+    this.listeningPorts = new Set(this.owners.keys());
+    for (const [port, owner] of this.requested) {
+      const current = this.owners.get(port);
+      if (!current || current.pid !== owner.pid || current.process !== owner.process) this.requested.delete(port);
+    }
     return this.reconcile();
   }
 
   /** Explicit requests limit Serve handlers, whose total capacity is shared with other apps. */
   request(port: number): Promise<void> {
-    if (!this.previewAllowed() || !this.eligiblePorts.has(port) || this.requested.has(port)) return this.queue;
-    this.requested.add(port);
+    const owner = this.owners.get(port);
+    if (!this.previewAllowed() || !this.eligiblePorts.has(port) || !owner || this.requested.has(port)) return this.queue;
+    this.requested.set(port, owner);
     return this.reconcile();
   }
 
@@ -192,7 +197,7 @@ export class PhonePreviewHost {
 
       const proxyPort = this.proxy?.port;
       const target = (key: string) => `http://127.0.0.1:${proxyPort}${this.basePath}/${key}`;
-      const wanted = proxyPort && this.previewAllowed() ? [FILES, ...[...this.requested].map(String)] : [];
+      const wanted = proxyPort && this.previewAllowed() ? [FILES, ...[...this.requested.keys()].map(String)] : [];
 
       for (const handler of ours) {
         if (wanted.includes(handler.key) && this.wantsHandler(handler.key) && handler.target === target(handler.key) && !next.has(handler.key)) {

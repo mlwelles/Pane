@@ -91,11 +91,16 @@ export function createListeningPortMonitor(options: ListeningPortMonitorOptions)
     if (!result.complete) {
       throw new PaneError('listening_ports_read_failed', `Could not refresh listening ports: ${result.reason} The previous list was retained.`, 'Retry refreshing the port list.');
     }
-    const byPort = new Map<number, ListeningSocket>();
+    const byPort = new Map<number, ListeningSocket[]>();
     for (const socket of result.sockets) {
-      if (!byPort.has(socket.port)) byPort.set(socket.port, socket);
+      const rows = byPort.get(socket.port) ?? [];
+      rows.push(socket);
+      byPort.set(socket.port, rows);
     }
-    const sockets = [...byPort.values()];
+    // A numeric port with uncertain ownership cannot be forwarded to a known process.
+    const sockets = [...byPort.values()].flatMap(rows => rows.length === 1 ||
+      (rows[0].pid !== null && rows.every(row => row.pid === rows[0].pid && row.process === rows[0].process))
+      ? [rows[0]] : []);
     socketReadMs = Date.now() - readStartedAt;
     const key = (socket: ListeningSocket) => `${socket.port}:${socket.pid ?? ''}:${socket.process}`;
     const unknownOwners = sockets.filter(socket => !owners.has(key(socket)));

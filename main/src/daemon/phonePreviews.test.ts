@@ -199,6 +199,24 @@ describe('phone previews', () => {
     expect(previews.decorate(snapshot([web])).ports[0].phoneUrl).toMatch(/^https:/u);
   });
 
+  it('revokes a phone preview when another process takes over the same port', async () => {
+    const tailscale = createFakeTailscale();
+    const web = port(5173);
+    const { previews } = await startHost(tailscale);
+    await previews.update(snapshot([web]));
+    await previews.request(web.port);
+    const phoneUrl = previews.decorate(snapshot([web])).ports[0].phoneUrl ?? '';
+    const targets = await serveTargets(tailscale);
+
+    const replacement = { ...web, pid: 9999, process: 'replacement', kind: 'tcp' as const, probeStatus: 'unchecked' as const };
+    await previews.update(snapshot([replacement]));
+    expect(previews.decorate(snapshot([replacement])).ports[0].phoneUrl).toBeUndefined();
+    expect((await visit(targets, phoneUrl)).status).toBe(404);
+
+    await previews.request(web.port);
+    expect(previews.decorate(snapshot([replacement])).ports[0].phoneUrl).toMatch(/^https:/u);
+  });
+
   it.each(['password', 'disabled'] as const)('revokes grants on %s denial and requires a fresh request after access returns', async denial => {
     const tailscale = createFakeTailscale();
     const workspaces: WorkspaceAccessConfig = { enabled: true };

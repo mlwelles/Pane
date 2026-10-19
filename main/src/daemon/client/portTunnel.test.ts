@@ -299,7 +299,7 @@ describe('passive port tunnel', () => {
       ...ownTable().sockets, { ...endpoint, port, pid: null, process: '' },
     ] }));
     const listenSpy = vi.spyOn(net.Server.prototype, 'listen');
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy }));
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy }));
     const result = await tunnel.sync([port]);
     expect(result.localPorts.get(port)).toBeDefined();
     expect(result.localPorts.get(port)).not.toBe(port);
@@ -311,7 +311,7 @@ describe('passive port tunnel', () => {
   it('excludes an established forward even when the next table omits it', async () => {
     const port = await freePort();
     const omittedPorts = new Set<number>();
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => ({
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => ({
       complete: true, sockets: [
         ...ownTable().sockets.filter(row => !omittedPorts.has(row.port)),
         { port, address: '0.0.0.0', family: 'ipv4', pid: null, process: '' },
@@ -333,7 +333,7 @@ describe('passive port tunnel', () => {
     const port = await freePort();
     let fail = true;
     let reads = 0;
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => {
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => {
       reads += 1;
       return fail && (stage === 'pre' || reads === 2) ? incomplete : ownTable();
     } }));
@@ -351,7 +351,7 @@ describe('passive port tunnel', () => {
 
   it.each(['missing', 'unknown', 'wrong pid', 'wrong address', 'wrong family', 'duplicate'])('rejects %s self ownership and never exposes a forward', async ownership => {
     const port = await freePort();
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => {
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => {
       const table = ownTable();
       if (!table.sockets.length) return table;
       const row = table.sockets[0];
@@ -373,7 +373,7 @@ describe('passive port tunnel', () => {
   it('closes competing candidates and bounds retries at eight port-zero attempts', async () => {
     const port = await freePort();
     const listenSpy = vi.spyOn(net.Server.prototype, 'listen');
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => {
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => {
       const table = ownTable();
       if (table.sockets.length) table.sockets.push({ ...table.sockets[0], address: '::', family: 'ipv6', pid: null });
       return table;
@@ -387,7 +387,7 @@ describe('passive port tunnel', () => {
 
   it('retries a binding failure without exposing its partially bound listener', async () => {
     const occupied = await listen(net.createServer(), '::1');
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => ({
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => ({
       ...ownTable(), sockets: ownTable().sockets.filter(row => row.port !== occupied || row.address !== '::1'),
     }) }));
     const result = await tunnel.sync([occupied]);
@@ -399,7 +399,7 @@ describe('passive port tunnel', () => {
   it('keeps a successful forward when another fails, and removes it on disappearance', async () => {
     const port = await freePort();
     let reads = 0;
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => ++reads === 3 ? incomplete : ownTable() }));
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => ++reads === 3 ? incomplete : ownTable() }));
     const result = await tunnel.sync([port, port + 1]);
     expect(result.localPorts.get(port)).toBe(port);
     expect(result.errors.has(port + 1)).toBe(true);
@@ -414,7 +414,7 @@ describe('passive port tunnel', () => {
     const entered = deferred<void>();
     let reads = 0;
     const openStream = vi.fn(noStream);
-    const tunnel = track(createPortTunnel(openStream, { mode: 'passive', readOccupancy: async () => {
+    const tunnel = track(createPortTunnel(openStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => {
       if (++reads === 2) { entered.resolve(); return post.promise; }
       return ownTable();
     } }));
@@ -435,7 +435,7 @@ describe('passive port tunnel', () => {
     const read = deferred<SocketRead>();
     const entered = deferred<void>();
     const reader = vi.fn(async () => { entered.resolve(); return read.promise; });
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: reader }));
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: reader }));
     const pending = tunnel.sync([port]);
     await entered.promise;
     tunnel.setMode('passive');
@@ -460,7 +460,7 @@ it('aborts Active availability synchronously, treats the same mode as a no-op, a
     probes.push(socket);
     return socket;
   });
-  const tunnel = track(createPortTunnel(noStream, { readOccupancy: async () => ownTable() }));
+  const tunnel = track(createPortTunnel(noStream, { platform: 'linux', readOccupancy: async () => ownTable() }));
   const pending = tunnel.sync([port]);
   expect(probes).toHaveLength(2);
   tunnel.setMode('active');
@@ -474,7 +474,7 @@ it('aborts Active availability synchronously, treats the same mode as a no-op, a
 it('preserves established listeners and accepted streams across mode changes', async () => {
   const host = await startEchoHost();
   const port = await freePort();
-  const tunnel = track(createPortTunnel(host.openStream, { mode: 'passive', readOccupancy: async () => ownTable() }));
+  const tunnel = track(createPortTunnel(host.openStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => ownTable() }));
   await tunnel.sync([port]);
   const socket = realConnect({ host: '127.0.0.1', port });
   cleanups.push(() => { socket.destroy(); });
@@ -501,7 +501,7 @@ it('closes a listener that finishes binding after close', async () => {
     binding.resolve();
     return this;
   });
-  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => ownTable() }));
+  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => ownTable() }));
   const pending = tunnel.sync([port]);
   await binding.promise;
   await tunnel.close();
@@ -514,7 +514,7 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')('
   it('attributes every actual bound loopback endpoint and opens without availability connections', async () => {
     const port = await freePort();
     const tables: SocketRead[] = [];
-    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => {
+    const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => {
       const table = await readLocalPortOccupancy();
       tables.push(table);
       return table;
@@ -550,7 +550,7 @@ it('retains the operating-system bind error when all candidates fail', async () 
     queueMicrotask(() => this.emit('error', Object.assign(new Error('controlled permission failure'), { code: 'EACCES' })));
     return this;
   });
-  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => ownTable() }));
+  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => ownTable() }));
   const result = await tunnel.sync([31004]);
   expect(result.errors.get(31004)?.message).toContain('controlled permission failure');
   expect(net.connect).not.toHaveBeenCalled();
@@ -568,7 +568,7 @@ it('rejects a port-zero assignment already present in its fresh pre-bind table',
     { port, address: '0.0.0.0', family: 'ipv4', pid: null, process: '' },
     { port: assigned, address: '::', family: 'ipv6', pid: null, process: '' },
   ] }));
-  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy }));
+  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy }));
   const result = await tunnel.sync([port]);
   expect(result.errors.has(port)).toBe(true);
   expect(result.localPorts.size).toBe(0);
@@ -589,7 +589,7 @@ it.each(['win32', 'unknown'])('keeps Active available on local %s', async platfo
 it('invalidates an outstanding pre-bind read on close without binding', async () => {
   const read = deferred<SocketRead>();
   const entered = deferred<void>();
-  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => {
+  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => {
     entered.resolve();
     return read.promise;
   } }));
@@ -605,7 +605,7 @@ it('invalidates an outstanding pre-bind read on close without binding', async ()
 it('reports unavailable if a provisional listener disappears before verification', async () => {
   const port = await freePort();
   let reads = 0;
-  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', readOccupancy: async () => {
+  const tunnel = track(createPortTunnel(noStream, { mode: 'passive', platform: 'linux', readOccupancy: async () => {
     if (++reads === 2) for (const server of createdServers.filter(server => server.listening)) {
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
