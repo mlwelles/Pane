@@ -24,7 +24,12 @@ async function readTestSockets(
   readOccupancy: typeof readLocalPortOccupancy = readLocalPortOccupancy,
 ): Promise<SocketRead> {
   const result = await readDiscovery();
-  if (!result.complete) return result;
+  if (!result.complete) {
+    if (process.platform !== 'darwin' || result.reason !== 'Socket command exited with status 1.' || result.sockets.length) return result;
+    const occupancy = await readOccupancy();
+    if (!occupancy.complete || occupancy.sockets.some(socket => testListeners.has(socket.port))) return result;
+    return { complete: true, sockets: [] };
+  }
   const occupancy = await readOccupancy();
   if (!occupancy.complete) return occupancy;
   const sockets = result.sockets.filter(socket => testListeners.has(socket.port));
@@ -249,7 +254,8 @@ describe('socket read results', () => {
       await new Promise<void>(resolve => foreign.close(() => resolve()));
     }
   });
-  it('deduplicates display ports after the reader preserves all rows', async () => {
+  it('omits a port with uncertain owners before probing or forwarding it', async () => {
+    const probe = vi.spyOn(http, 'request');
     const monitor = createListeningPortMonitor({
       terminalPanes: () => [],
       readSockets: async () => ({ complete: true, sockets: [
@@ -258,7 +264,31 @@ describe('socket read results', () => {
       ] }),
     });
     const snapshot = await monitor.refresh();
-    expect(snapshot.ports).toEqual([{ port: 3000, pid: null, process: 'nc', group: 'system', kind: 'tcp' }]);
+    expect(snapshot.ports).toEqual([]);
+    expect(probe).not.toHaveBeenCalled();
+  });
+  it('keeps one displayed port when both loopback families have the same known owner', async () => {
+    const monitor = createListeningPortMonitor({
+      mode: 'passive', terminalPanes: () => [], readProcessTable: async () => [],
+      readSockets: async () => ({ complete: true, sockets: [
+        { port: 3000, address: '127.0.0.1', family: 'ipv4', pid: 42, process: 'node' },
+        { port: 3000, address: '::1', family: 'ipv6', pid: 42, process: 'node' },
+      ] }),
+    });
+    expect((await monitor.refresh()).ports).toMatchObject([{ port: 3000, pid: 42, process: 'node' }]);
+  });
+  it('removes a displayed port when another process starts listening on its other loopback family', async () => {
+    let conflict = false;
+    const monitor = createListeningPortMonitor({
+      mode: 'passive', terminalPanes: () => [], readProcessTable: async () => [],
+      readSockets: async () => ({ complete: true, sockets: [
+        { port: 3000, address: '127.0.0.1', family: 'ipv4', pid: 42, process: 'node' },
+        ...(conflict ? [{ port: 3000, address: '::1', family: 'ipv6' as const, pid: 43, process: 'other' }] : []),
+      ] }),
+    });
+    expect((await monitor.refresh()).ports).toHaveLength(1);
+    conflict = true;
+    expect((await monitor.refresh()).ports).toEqual([]);
   });
   it('rejects an incomplete read and retains the previous snapshot', async () => {
     let result: SocketRead = { complete: true, sockets: [
