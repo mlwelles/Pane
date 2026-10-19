@@ -30,10 +30,12 @@ function finish(result: CommandResult, sockets: ListeningSocket[], valid: boolea
   return { complete: true, sockets };
 }
 
-function endpoint(value: string, separator: ':' | '.', family?: Endpoint['family'], allowZero = false): Endpoint | null {
+function endpoint(value: string, separator: ':' | '.', family?: Endpoint['family'], allowZero = false, allowScopedIpv4 = false): Endpoint | null {
   const boundary = value.lastIndexOf(separator);
   if (boundary < 0) return null;
-  const address = value.slice(0, boundary).replace(/^\[(.*)\]$/u, '$1');
+  const rawAddress = value.slice(0, boundary).replace(/^\[(.*)\]$/u, '$1');
+  const scopedIpv4 = allowScopedIpv4 ? rawAddress.match(/^(.+)%[A-Za-z0-9_.-]+$/u) : null;
+  const address = scopedIpv4 && isIP(scopedIpv4[1]) === 4 ? scopedIpv4[1] : rawAddress;
   const portText = value.slice(boundary + 1);
   if (!/^\d+$/u.test(portText)) return null;
   const port = Number(portText);
@@ -106,7 +108,7 @@ export function parseSsResult(result: CommandResult): SocketRead {
   let valid = true;
   for (const line of result.stdout.split(/\r?\n/u).map(row => row.trim()).filter(Boolean)) {
     const fields = line.split(/\s+/u);
-    const local = endpoint(fields[3] ?? '', ':');
+    const local = endpoint(fields[3] ?? '', ':', undefined, false, true);
     const remote = fields[4]?.replace(/:\*$/u, ':0');
     if (fields[0] !== 'LISTEN' || !/^\d+$/u.test(fields[1] ?? '') || !/^\d+$/u.test(fields[2] ?? '') || !local || !remote || !endpoint(remote, ':', undefined, true)) {
       valid = false;
