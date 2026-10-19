@@ -317,7 +317,7 @@ jobs:
   # cancelled ones fail it.
   ci-result:
     name: CI result
-    needs: [changes, quality-checks, functional-smoke, runpane-wrapper-tests, cross-os-main-tests]
+    needs: [changes, quality-checks, native-passive-ports, functional-smoke, runpane-wrapper-tests, cross-os-main-tests]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
