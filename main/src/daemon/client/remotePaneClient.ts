@@ -25,9 +25,9 @@ import { boundary, decodeBoundary, decodeOptionalBoundary } from '../../../../sh
 import type { BoundarySchema, JsonValue } from '../../../../shared/validation/boundaryDecoder';
 import { PaneSseParser } from './sseParser';
 import { RemoteInputQueue } from '../../../../shared/remoteInputQueue';
-import { decodeListeningPortsSnapshot, type ListeningPortsSnapshot } from '../../../../shared/types/listeningPorts';
+import { decodeListeningPortsSnapshot, type ListeningPortsSnapshot, type ListeningPort, type PortDiscoveryMode } from '../../../../shared/types/listeningPorts';
 import { localTargetOf } from '../../../../shared/utils/browserUrl';
-import { createPortTunnel, type PortTunnel } from './portTunnel';
+import { createPortTunnel, type PortTunnel, type PortTunnelSyncResult } from './portTunnel';
 import { REMOTE_READ_CHANNELS, REMOTE_RESTORE_CHANNELS } from '../../../../shared/remoteClient/readChannels';
 import { RecoveryCycle } from '../../../../shared/remoteClient/recoveryCycle';
 import { PaneError } from '../../../../shared/paneError';
@@ -696,6 +696,8 @@ export class RemotePaneClientController extends EventEmitter {
   private connectionGeneration = 0;
   /** Mirrors the active host's forwarded ports onto this machine's loopback. */
   private portTunnel: PortTunnel | null = null;
+  private portDiscoveryMode: PortDiscoveryMode = 'active';
+  private portModeRevision = 0;
   /** Tunnel syncs run one at a time, in the order the host's lists arrived. */
   private portTunnelSync: Promise<unknown> = Promise.resolve();
   /** The host's last Ports list, with where this desktop reaches each port. */
@@ -707,6 +709,7 @@ export class RemotePaneClientController extends EventEmitter {
   private remoteRuntimeUsageTracked = false;
 
   private readonly configUpdatedListener = () => {
+    this.syncPortDiscoveryMode();
     void this.syncToConfig().catch((error) => {
       this.setConnectionState({
         ...this.state,
@@ -725,6 +728,7 @@ export class RemotePaneClientController extends EventEmitter {
 
     this.rendererIds = options.rendererIds ?? (() => []);
     this.configManager = options.configManager;
+    this.syncPortDiscoveryMode();
     this.rendererEventSink = options.rendererEventSink;
     this.analyticsManager = options.analyticsManager;
     this.resolveTailnetMachineUrl = options.resolveTailnetMachineUrl;
@@ -876,11 +880,21 @@ export class RemotePaneClientController extends EventEmitter {
     return this.getConnectionState();
   }
 
+  private syncPortDiscoveryMode(): void {
+    const mode = this.configManager?.getConfig().portDiscoveryMode ?? 'active';
+    if (mode === this.portDiscoveryMode) return;
+    this.portDiscoveryMode = mode;
+    this.portModeRevision += 1;
+    this.portTunnel?.setMode(mode);
+    if (this.activeClient) void this.refreshTunnelledPorts(this.activeClient);
+  }
+
   async syncToConfig(): Promise<void> {
     if (!this.configManager) {
       return;
     }
 
+    this.syncPortDiscoveryMode();
     const remoteConfig = normalizeRemoteDaemonConfig(this.configManager.getConfig().remoteDaemon);
     const activeProfileId = remoteConfig.client.activeProfileId;
     if (remoteConfig.client.mode !== 'remote' || !activeProfileId) {
@@ -1026,7 +1040,8 @@ export class RemotePaneClientController extends EventEmitter {
     });
 
     this.activeClient = client;
-    this.portTunnel = createPortTunnel(port => client.openPortStream(port));
+    this.syncPortDiscoveryMode();
+    this.portTunnel = createPortTunnel(port => client.openPortStream(port), { mode: this.portDiscoveryMode });
     try {
       await client.connect({
         retryOnInitialFailure: options.retryOnInitialFailure,
@@ -1096,17 +1111,33 @@ export class RemotePaneClientController extends EventEmitter {
     const hostPorts = snapshot.ports
       .filter(port => !(snapshot.host === getOsHostname() && port.pid === process.pid))
       .map(port => port.port);
-    const sync = this.portTunnelSync.then(() => tunnel.sync(hostPorts));
+    const sync = this.portTunnelSync.then(async (): Promise<(PortTunnelSyncResult & { revision: number }) | null> => {
+      while (this.activeClient === client && this.portTunnel === tunnel) {
+        const revision = this.portModeRevision;
+        const result = await tunnel.sync(hostPorts);
+        if (this.activeClient !== client || this.portTunnel !== tunnel) return null;
+        if (revision !== this.portModeRevision) continue;
+        return { ...result, revision };
+      }
+      return null;
+    });
     this.portTunnelSync = sync.catch(error => console.warn('[Pane port tunnel] sync_failed:', error));
-    const localPorts = await sync;
+    const result = await sync;
+    if (!result || this.activeClient !== client || this.portTunnel !== tunnel || result.revision !== this.portModeRevision) return null;
     const tunnelled: ListeningPortsSnapshot = {
       ...snapshot,
       ports: snapshot.ports.map(port => {
-        const localPort = localPorts.get(port.port);
-        return localPort === undefined ? port : { ...port, localPort };
+        const undecorated: ListeningPort = { ...port };
+        delete undecorated.localPort;
+        delete undecorated.forwardingError;
+        const localPort = result.localPorts.get(port.port);
+        const forwardingError = result.errors.get(port.port);
+        if (localPort !== undefined) undecorated.localPort = localPort;
+        if (forwardingError) undecorated.forwardingError = forwardingError;
+        return undecorated;
       }),
     };
-    if (this.activeClient === client) this.tunnelledSnapshot = tunnelled;
+    this.tunnelledSnapshot = tunnelled;
     return tunnelled;
   }
 
@@ -1133,13 +1164,17 @@ export class RemotePaneClientController extends EventEmitter {
       this.portsListRetry.unref?.();
       return this.tunnelledSnapshot ?? { host: client.profile.label, ports: [] };
     }
-    return await this.tunnelPorts(client, listed) ?? listed;
+    return await this.tunnelPorts(client, listed) ?? { host: client.profile.label, ports: [] };
   }
 
   private async publishTunnelledPorts<Value>(client: RemotePaneClient, value: Value): Promise<void> {
+    const revision = this.portModeRevision;
+    const tunnel = this.portTunnel;
     try {
       const snapshot = await this.tunnelPorts(client, value);
-      if (snapshot && this.activeClient === client) this.rendererEventSink.send(PORTS_CHANGED_CHANNEL, snapshot);
+      if (snapshot && this.activeClient === client && this.portTunnel === tunnel && this.portModeRevision === revision) {
+        this.rendererEventSink.send(PORTS_CHANGED_CHANNEL, snapshot);
+      }
     } catch (error) {
       console.warn('[Pane port tunnel] publish_failed:', error);
     }
@@ -1147,9 +1182,13 @@ export class RemotePaneClientController extends EventEmitter {
 
   /** Tunnels the host's ports on every (re)connect, before any tab asks for them. */
   private async refreshTunnelledPorts(client: RemotePaneClient): Promise<void> {
+    const revision = this.portModeRevision;
+    const tunnel = this.portTunnel;
     try {
       const snapshot = decodeListeningPortsSnapshot(await this.listTunnelledPorts(client));
-      if (snapshot && this.activeClient === client) this.rendererEventSink.send(PORTS_CHANGED_CHANNEL, snapshot);
+      if (snapshot && this.activeClient === client && this.portTunnel === tunnel && this.portModeRevision === revision) {
+        this.rendererEventSink.send(PORTS_CHANGED_CHANNEL, snapshot);
+      }
     } catch (error) {
       console.warn('[Pane port tunnel] list_failed:', error);
     }

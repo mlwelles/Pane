@@ -137,6 +137,14 @@ Each of these is a small thing. Together they compound fast.
 
 ---
 
+## Port discovery
+
+Pane checks local listeners to fill the browser's Ports list. By default, **Active** sends an HTTP `HEAD` request to identify web servers and checks TCP connections when choosing local ports for remote forwarding. In **Settings > General > Port discovery**, choose **Passive** to list listeners without those automatic connections. The change takes effect immediately for this Pane instance and survives a restart. An in-progress request that already reached a service cannot be recalled; opening a listed port still contacts that service.
+
+Passive is available on macOS and Linux. On Windows, FreeBSD, or another unsupported or unidentified operating system, Settings disables Passive and explains why. A headless instance can set `"portDiscoveryMode": "passive"` in its `config.json`; an invalid value is rejected. An unsupported instance with Passive already saved stays probe-free. If it acts as a desktop client, local forwarding reports unavailable. Each host and desktop client has its own setting: set both to Passive when a remote desktop must avoid automatic connections at either end. See [remote port discovery and forwarding](docs/SELF_HOSTED_REMOTE_DAEMON.md#port-discovery-on-each-machine) for unchecked ports, phone previews, forwarding failures and limits.
+
+---
+
 ## SSH hosts
 
 Pane lists every host in your SSH config (`~/.ssh/config`, or `C:\Users\<you>\.ssh\config` on Windows, plus the files it `Include`s) under **SSH hosts** in the sidebar. Click one and a terminal tab opens with `ssh <host>`, using your own `ssh`, keys and agent. It needs no project, and Pane never reads or copies your keys. Edit the config and the list follows. See [SSH hosts](docs/SSH_HOSTS.md).

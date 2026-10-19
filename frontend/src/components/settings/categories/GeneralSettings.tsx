@@ -9,15 +9,22 @@ import type { VersionInfo } from '../../../types/session';
 import { API } from '../../../utils/api';
 import type { HtmlFileOpenMode } from '../../../types/config';
 import { htmlFileOpenModeOf } from '../../../stores/configStore';
+import { supportsPassivePortDiscovery, type PortDiscoveryMode } from '../../../../../shared/types/listeningPorts';
 
 interface GeneralSettingsProps {
   persistence: SettingsPersistence;
   onUpdate: (versionInfo: VersionInfo) => void;
   onSendFeedback: () => void;
+  localPlatform?: string;
 }
 
-export function GeneralSettings({ persistence, onUpdate, onSendFeedback }: GeneralSettingsProps) {
+export function GeneralSettings({ persistence, onUpdate, onSendFeedback, localPlatform }: GeneralSettingsProps) {
   const config = persistence.config!;
+  const passiveSupported = supportsPassivePortDiscovery(localPlatform);
+  const identifiedUnsupportedPlatform = ['aix', 'android', 'freebsd', 'haiku', 'netbsd', 'openbsd', 'sunos', 'win32', 'cygwin'].includes(localPlatform ?? '');
+  const passiveUnavailableReason = identifiedUnsupportedPlatform
+    ? 'Passive is unavailable on this operating system because Pane cannot verify local forwarding ports without probing them.'
+    : 'Passive is unavailable because Pane has not identified this computer’s operating system.';
   const [updateInfo, setUpdateInfo] = useState<VersionInfo | null>(null);
   const [updateResult, setUpdateResult] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
@@ -41,7 +48,29 @@ export function GeneralSettings({ persistence, onUpdate, onSendFeedback }: Gener
   };
 
   return (
-    <SettingsPage title="General" description="Application startup, update, feedback, and file-opening behavior.">
+    <SettingsPage title="General" description="Application startup, update, feedback, port discovery, and file-opening behavior.">
+      <SettingsSection title="Port discovery" description="Each Pane instance has its own setting. This controls this local instance, including while viewing a remote host; the remote host has its own configuration.">
+        <SettingRow
+          settingId="port-discovery-mode"
+          label="Port discovery"
+          description="Active sends requests to identify web servers and checks connections when choosing local forwarding ports. Passive lists ports without probing them. Use it when discovery interferes with sign-in callbacks or other services. Opening a port still contacts it."
+          saveState={persistence.saveStates['port-discovery-mode']}
+        >
+          <SegmentedControl<PortDiscoveryMode>
+            label="Port discovery"
+            value={config.portDiscoveryMode ?? 'active'}
+            options={[
+              { id: 'active', label: 'Active' },
+              {
+                id: 'passive', label: 'Passive', disabled: !passiveSupported,
+                disabledReason: passiveSupported ? undefined : passiveUnavailableReason,
+              },
+            ]}
+            onChange={mode => { void persistence.saveConfig('port-discovery-mode', { portDiscoveryMode: mode }); }}
+          />
+        </SettingRow>
+      </SettingsSection>
+
       <SettingsSection title="Updates" description="Keep Pane current with release checks from GitHub.">
         <SettingRow
           settingId="automatic-updates"

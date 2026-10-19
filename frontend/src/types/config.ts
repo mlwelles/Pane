@@ -5,6 +5,7 @@ import type { VoiceTranscriptionMode } from '../../../shared/types/voiceTranscri
 import type { WorktreeFileSyncEntry } from '../../../shared/types/worktreeFileSync';
 import type { ApnsCredentialConfig, SharedCredentialId, SharedCredentialMeta } from '../../../shared/types/sharedCredentials';
 import type { AppearanceMode, DarkTheme, LightTheme, Theme } from '../../../shared/types/appearance';
+import type { PortDiscoveryMode } from '../../../shared/types/listeningPorts';
 
 export interface TerminalShortcut {
   id: string;
@@ -57,6 +58,7 @@ interface AnalyticsConfig {
 export type HtmlFileOpenMode = 'preview' | 'source';
 
 export interface AppConfig {
+  portDiscoveryMode?: PortDiscoveryMode;
   verbose?: boolean;
   anthropicApiKey?: string;
   openaiApiKey?: string;
@@ -182,6 +184,7 @@ export type PreferredShell = NonNullable<AppConfig['preferredShell']>;
 export type PreferredTerminalPowerMode = NonNullable<AppConfig['terminalPowerMode']>;
 
 export interface UpdateConfigRequest {
+  portDiscoveryMode?: PortDiscoveryMode;
   verbose?: boolean;
   anthropicApiKey?: string;
   openaiApiKey?: string;

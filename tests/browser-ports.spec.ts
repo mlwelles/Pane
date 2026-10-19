@@ -124,3 +124,78 @@ test.describe('a remote desktop loading a host page', () => {
     await expect(page.getByText('on old host')).toHaveCount(0);
   });
 });
+
+const passiveSnapshot = (localPort?: number): ListeningPortsSnapshot => ({
+  host: 'devbox', discoveryMode: 'passive',
+  ports: [{ port: 5173, pid: 123, process: 'callback-service', group: 'pane-terminal', paneName: 'Feature work', kind: 'tcp', probeStatus: 'unchecked', localPort }],
+});
+
+test('Passive lists unchecked ownership and opens locally from the keyboard without a probe', async ({ page }) => {
+  await openBrowserPanel(page);
+  await loadConfig(page, 'local');
+  await answerConnectionState(page, 'local');
+  await answerPortsList(page, passiveSnapshot());
+  await expect(page.getByText('Passive discovery', { exact: true })).toBeVisible();
+  await expect(page.getByText('unchecked', { exact: true })).toBeVisible();
+  await expect(page.getByText('callback-service')).toBeVisible();
+  await expect(page.getByText('From Pane terminals')).toBeVisible();
+  await expect(page.getByText('Feature work')).toBeVisible();
+  await expect(page.locator('[title*="does not answer HTTP"]')).toHaveCount(0);
+  await page.getByTitle('Open localhost:5173').focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('webview')).toHaveAttribute('src', 'http://localhost:5173');
+  expect(await page.evaluate(() => window.portsTest.invocations)).toEqual(['ports:list']);
+});
+
+test('empty Passive snapshots still identify the discovery mode', async ({ page }) => {
+  await openBrowserPanel(page);
+  await answerPortsList(page, { host: 'devbox', ports: [], discoveryMode: 'passive' });
+  await expect(page.getByText('Passive discovery', { exact: true })).toBeVisible();
+  await expect(page.getByText('No listening ports on devbox')).toBeVisible();
+});
+
+test('remote unchecked ports require a local forward and keep HTTP failure tooltips absent', async ({ page }) => {
+  await openBrowserPanel(page);
+  await loadConfig(page, 'remote');
+  await answerConnectionState(page, 'remote');
+  await answerPortsList(page, passiveSnapshot());
+  await expect(page.getByText('unchecked', { exact: true })).toBeVisible();
+  await expect(page.getByTitle('Open localhost:5173')).toHaveCount(0);
+  await expect(page.locator('[title*="does not answer HTTP"]')).toHaveCount(0);
+  await emitPorts(page, passiveSnapshot(15173));
+  await page.getByTitle('Open localhost:5173').click();
+  await expect(page.locator('webview')).toHaveAttribute('src', 'http://localhost:15173/');
+  expect(await page.evaluate(() => window.portsTest.invocations)).toEqual(['ports:list']);
+});
+
+test('Retry reloads a failed forward while the successful port stays openable', async ({ page }) => {
+  await openBrowserPanel(page);
+  await loadConfig(page, 'remote');
+  await answerConnectionState(page, 'remote');
+  const ports = passiveSnapshot();
+  ports.ports[0].forwardingError = {
+    code: 'PORT_FORWARDING_UNAVAILABLE', message: 'Port 5173 has no verified local forwarding address.', next: 'Retry this port in the Ports list.',
+  };
+  ports.ports.push({ port: 5174, pid: 124, process: 'node', group: 'other', kind: 'tcp', probeStatus: 'unchecked', localPort: 15174 });
+  await answerPortsList(page, ports);
+  await expect(page.getByText('Port 5173 has no verified local forwarding address.')).toBeVisible();
+  await expect(page.getByText('Retry this port in the Ports list.')).toBeVisible();
+  await expect(page.getByTitle('Open localhost:5174')).toBeVisible();
+  await page.getByRole('button', { name: 'Retry forwarding port 5173' }).click();
+  await expect(page.getByTitle('Open localhost:5174')).toBeVisible();
+  const retried = passiveSnapshot(15173);
+  retried.ports.push(ports.ports[1]);
+  await answerPortsList(page, retried);
+  await expect(page.getByTitle('Open localhost:5173')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Retry forwarding/ })).toHaveCount(0);
+  expect(await page.evaluate(() => window.portsTest.invocations)).toEqual(['ports:list', 'ports:list']);
+});
+
+test('ordinary Active TCP rows retain their classification and cannot open', async ({ page }) => {
+  await openBrowserPanel(page);
+  await answerConnectionState(page, 'local');
+  await answerPortsList(page, { host: 'devbox', ports: [{ port: 5432, pid: 20, process: 'postgres', group: 'other', kind: 'tcp' }] });
+  await expect(page.getByText('tcp', { exact: true })).toBeVisible();
+  await expect(page.getByTitle('5432 does not answer HTTP')).toBeVisible();
+  await expect(page.getByTitle('Open localhost:5432')).toHaveCount(0);
+});

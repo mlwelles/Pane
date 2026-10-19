@@ -1,5 +1,6 @@
 import { validateCustomCommandResume } from '../../../shared/types/customCommandResume';
 import { EventEmitter } from 'events';
+import { PaneError } from '../../../shared/paneError';
 import type { AnalyticsIdentity, AppConfig } from '../types/config';
 import { DEFAULT_PANE_CHAT_AGENT, normalizePaneChatAgent } from '../../../shared/types/paneChat';
 import { createDefaultRemoteDaemonConfig, normalizeRemoteDaemonConfig } from '../../../shared/types/remoteDaemon';
@@ -8,6 +9,7 @@ import { DEFAULT_WORKTREE_FILE_SYNC_ENTRIES } from '../../../shared/types/worktr
 import fs from 'fs/promises';
 import { watch, type FSWatcher } from 'fs';
 import path from 'path';
+import { readPortDiscoveryMode } from './portDiscoveryMode';
 import { randomUUID } from 'crypto';
 import { HOME_GIT_SCAN_WARNING, isHomeDirectory } from '../utils/gitScanSafety';
 import { getAppDirectory } from '../utils/appDirectory';
@@ -29,6 +31,14 @@ const DEFAULT_POSTHOG_HOST = 'https://runpane.com/api/c';
 /** Bump when agentContext defaults change for existing configs (2: repo AGENTS.md off). */
 export const AGENT_CONTEXT_DEFAULTS_VERSION = 2;
 
+type WatchConfigDirectory = (
+  directory: string,
+  onChange: (eventType: string, filename: string | Buffer | null) => void,
+) => FSWatcher;
+
+const watchConfigDirectory: WatchConfigDirectory = (directory, onChange) =>
+  watch(directory, { persistent: false }, onChange);
+
 function defaultAnalyticsConfig(): NonNullable<AppConfig['analytics']> {
   return {
     enabled: true,
@@ -42,10 +52,12 @@ export class ConfigManager extends EventEmitter {
   private configPath: string;
   private configDir: string;
   private fileWatcher: FSWatcher | null = null;
+  private watcherReload: ReturnType<typeof setTimeout> | null = null;
+  private watching = false;
   private lastConfigJson: string = '';
   private saveConfigQueue: Promise<void> = Promise.resolve();
 
-  constructor(defaultGitPath?: string) {
+  constructor(defaultGitPath?: string, private readonly watchDirectory = watchConfigDirectory) {
     super();
     this.configDir = getAppDirectory();
     this.configPath = path.join(this.configDir, 'config.json');
@@ -53,6 +65,7 @@ export class ConfigManager extends EventEmitter {
       gitRepoPath: defaultGitPath || '',
       usePtyHost: process.platform === 'win32',
       verbose: false,
+      portDiscoveryMode: 'active',
       anthropicApiKey: undefined,
       falApiKey: undefined,
       openRouterApiKey: undefined,
@@ -136,17 +149,19 @@ export class ConfigManager extends EventEmitter {
   }
 
   async initialize(): Promise<void> {
-    await this.enqueueConfigWrite(() => this.initializeFromDisk());
+    await this.enqueueConfigWrite(() => this.initializeFromDisk(false));
   }
 
-  private async initializeFromDisk(): Promise<void> {
+  private async initializeFromDisk(strict: boolean): Promise<void> {
     // Ensure the config directory exists
     await fs.mkdir(this.configDir, { recursive: true });
     
     try {
       const data = await fs.readFile(this.configPath, 'utf-8');
+      const wasAccepted = data === this.lastConfigJson;
       // SAFETY: initialize immediately normalizes boundary-sensitive fields before assigning the parsed config.
       const loadedConfig = JSON.parse(data) as AppConfig;
+      const portDiscoveryMode = readPortDiscoveryMode(loadedConfig.portDiscoveryMode);
       // Drop keys from the removed Stravu integration so they leave the file on the next save.
       for (const legacyKey of ['stravuApiKey', 'stravuServerUrl']) {
         Reflect.deleteProperty(loadedConfig, legacyKey);
@@ -176,9 +191,10 @@ export class ConfigManager extends EventEmitter {
         : this.config.notifications!;
 
       // Merge loaded config with defaults, ensuring nested settings exist
-      this.config = {
+      const candidate: AppConfig = {
         ...this.config,
         ...loadedConfig,
+        portDiscoveryMode,
         ...normalizedAppearance.appearance,
         notifications: migratedNotifications,
         sessionCreationPreferences: {
@@ -214,7 +230,7 @@ export class ConfigManager extends EventEmitter {
 
       let shouldPersistMigration = normalizedAppearance.migrated;
       if (loadedConfig.agentContext?.registerMcp === undefined) {
-        this.config.agentContext = { ...this.config.agentContext, registerMcp: true };
+        candidate.agentContext = { ...candidate.agentContext, registerMcp: true };
         shouldPersistMigration = true;
         console.log('[ConfigManager] Pane now registers its MCP server with Claude Code, Codex, and Cursor.');
       }
@@ -223,28 +239,31 @@ export class ConfigManager extends EventEmitter {
         // the old default carry managedAgentsMd: true without the user choosing
         // it, so turn it off once; the caller then removes Pane's section from
         // repos exactly as the settings toggle does. A later opt-in sticks.
-        this.config.agentContext = {
-          ...this.config.agentContext,
+        candidate.agentContext = {
+          ...candidate.agentContext,
           managedAgentsMd: false,
           defaultsVersion: AGENT_CONTEXT_DEFAULTS_VERSION,
           cleanupPending: true,
         };
         shouldPersistMigration = true;
       }
-      if (this.config.analytics?.posthogHost === LEGACY_POSTHOG_HOST) {
-        this.config.analytics.posthogHost = DEFAULT_POSTHOG_HOST;
+      if (candidate.analytics?.posthogHost === LEGACY_POSTHOG_HOST) {
+        candidate.analytics.posthogHost = DEFAULT_POSTHOG_HOST;
         shouldPersistMigration = true;
       }
-      const restamped = restampSharedCredentials(this.config, 'untimed');
+      const restamped = restampSharedCredentials(candidate, 'untimed');
       if (restamped) {
-        this.config.sharedCredentials = restamped;
+        candidate.sharedCredentials = restamped;
         shouldPersistMigration = true;
       }
       if (shouldPersistMigration) {
-        await this.writeConfigToDisk(this.config);
+        await this.writeConfigToDisk(candidate);
       }
-      // Lets key sharing pick up a key edited by hand.
-      if (restamped) this.emit('config-updated', this.config);
+      const changed = !wasAccepted || Boolean(restamped);
+      this.config = candidate;
+      if (!shouldPersistMigration) this.lastConfigJson = data;
+      if (strict && changed) this.emit('config-updated', this.config);
+      if (!strict && restamped) this.emit('config-updated', this.config);
     } catch (error: unknown) {
       let errorCode: string | undefined;
       try {
@@ -256,12 +275,15 @@ export class ConfigManager extends EventEmitter {
       }
       const isNotFound = errorCode === 'ENOENT';
       if (isNotFound) {
-        // Config file doesn't exist — create with defaults
+        if (strict) throw new PaneError('CONFIG_READ_FAILED', 'Could not reload port discovery settings because config.json is missing; the current mode was retained.', 'Restore config.json and reload settings.');
         await this.writeConfigToDisk(this.config);
       } else {
-        // Config exists but is corrupted — log and keep defaults in memory
-        // Do NOT overwrite the file (user might want to recover it)
-        console.error('[ConfigManager] Failed to parse config file, using defaults:', error);
+        if (strict) {
+          if (error instanceof PaneError) throw error;
+          throw new PaneError('CONFIG_READ_FAILED', `Could not reload config.json: ${error instanceof Error ? error.message : String(error)}. The current mode was retained.`, 'Correct config.json and reload settings.');
+        }
+        this.config = { ...this.config, portDiscoveryMode: 'passive' };
+        console.error('[ConfigManager] Failed to load config file; port probes disabled until corrected:', error);
       }
     }
   }
@@ -300,7 +322,7 @@ export class ConfigManager extends EventEmitter {
    * may have modified the config file.
    */
   async reloadFromDisk(): Promise<AppConfig> {
-    await this.initialize();
+    await this.enqueueConfigWrite(() => this.initializeFromDisk(true));
     console.log('[ConfigManager] Reloaded config from disk');
     return this.config;
   }
@@ -310,54 +332,39 @@ export class ConfigManager extends EventEmitter {
    * Emits 'config-updated' when the file changes.
    */
   startWatching(): void {
-    if (this.fileWatcher) return; // Already watching
+    if (this.watching) return;
+    this.watching = true;
 
     try {
-      this.lastConfigJson = JSON.stringify(this.config);
-
       const handleFileChange = async () => {
         try {
-          // Small delay to let the file finish writing
-          await new Promise(resolve => setTimeout(resolve, 100));
-
+          if (!this.watching) return;
           const data = await fs.readFile(this.configPath, 'utf-8');
-
-          // Only emit if content actually changed
           if (data !== this.lastConfigJson) {
-            this.lastConfigJson = data;
-            await this.initialize();
+            await this.reloadFromDisk();
             console.log('[ConfigManager] Config file changed externally, reloaded');
-            this.emit('config-updated', this.config);
           }
         } catch (err) {
           console.error('[ConfigManager] Error reloading config after file change:', err);
         }
       };
 
-      const setupWatcher = () => {
-        if (this.fileWatcher) {
-          this.fileWatcher.close();
-        }
-
-        this.fileWatcher = watch(this.configPath, { persistent: false }, async (eventType) => {
-          // Handle both 'change' and 'rename' events
-          // 'rename' occurs when using atomic writes (tmp + mv pattern)
-          if (eventType === 'change' || eventType === 'rename') {
-            await handleFileChange();
-
-            // On rename, the watched inode may have changed, so reattach the watcher
-            if (eventType === 'rename') {
-              console.log('[ConfigManager] Config file renamed/replaced, reattaching watcher');
-              // Small delay before reattaching to let filesystem settle
-              setTimeout(() => setupWatcher(), 200);
-            }
-          }
-        });
-      };
-
-      setupWatcher();
+      // The directory watch survives atomic replacement and temporary removal of config.json.
+      this.fileWatcher = this.watchDirectory(this.configDir, (_eventType, filename) => {
+        if (filename !== null && filename.toString() !== path.basename(this.configPath)) return;
+        if (this.watcherReload) clearTimeout(this.watcherReload);
+        this.watcherReload = setTimeout(() => {
+          this.watcherReload = null;
+          void handleFileChange();
+        }, 100);
+      });
+      this.fileWatcher.on('error', (err) => {
+        console.error('[ConfigManager] Config file watcher failed:', err);
+        this.stopWatching();
+      });
       console.log('[ConfigManager] Watching config file for external changes');
     } catch (err) {
+      this.watching = false;
       console.error('[ConfigManager] Failed to start file watcher:', err);
     }
   }
@@ -366,6 +373,9 @@ export class ConfigManager extends EventEmitter {
    * Stop watching config file.
    */
   stopWatching(): void {
+    this.watching = false;
+    if (this.watcherReload) clearTimeout(this.watcherReload);
+    this.watcherReload = null;
     if (this.fileWatcher) {
       this.fileWatcher.close();
       this.fileWatcher = null;
@@ -402,6 +412,7 @@ export class ConfigManager extends EventEmitter {
           ? normalizeRemoteDaemonConfig(updates.remoteDaemon)
           : this.config.remoteDaemon,
       };
+      next.portDiscoveryMode = readPortDiscoveryMode(next.portDiscoveryMode);
 
       if (updates.agentContext !== undefined) {
         decodeBoundary(updates.agentContext, boundary.object({
