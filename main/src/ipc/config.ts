@@ -78,7 +78,7 @@ export function registerConfigHandlers(
       return { success: true, data: config };
     } catch (error) {
       console.error('Failed to get config:', error);
-      return { success: false, error: 'Failed to get config' };
+      return { success: false, error: paneErrorText(error instanceof Error ? error : { message: String(error) }) };
     }
   });
 

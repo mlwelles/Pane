@@ -7,6 +7,10 @@ import {
   getMinimumContrastRatio,
   DEFAULT_TERMINAL_FONT_FAMILY,
 } from '../utils/terminalTheme';
+import { handleMissionControlTerminalKey } from '../utils/terminalKeyHandling';
+import { isHotkeyEnabledForEvent, useHotkeyStore } from '../stores/hotkeyStore';
+import { copyTerminalText } from '../utils/terminalClipboard';
+import { isMac } from '../utils/platformUtils';
 import { useConfigStore } from '../stores/configStore';
 import { useTheme } from '../contexts/ThemeContext';
 import {
@@ -243,6 +247,8 @@ export function useMissionControlTerminal({
   const fontFamily = buildTerminalFontFamily(userFont);
   // The same setting `TerminalPanel` reads. A program that asked for enhanced
   // key reporting must get the same encoding whichever renderer it is typed in.
+  const terminalKeyboardPreset = useConfigStore(state => state.config?.terminalKeyboardPreset ?? 'standard');
+  const terminalKeyboardPresetRef = useCommittedRef(terminalKeyboardPreset);
   const kittyKeyboardEnabled = useConfigStore(state => state.config?.kittyKeyboardEnabled !== false);
   const { highContrast } = useTheme();
   // Read inside the persistent onData handler so toggling interactivity does
@@ -386,6 +392,7 @@ export function useMissionControlTerminal({
       // No `convertEol`: a tile replays and then follows the same byte stream
       // the real panel does, and rewriting bare LFs as CRLF shifts every line a
       // TUI paints without one.
+      macOptionIsMeta: terminalKeyboardPresetRef.current === 'readline-friendly',
       cursorBlink: startsInteractive,
       disableStdin: !startsInteractive,
       scrollOnUserInput: true,
@@ -413,14 +420,23 @@ export function useMissionControlTerminal({
     syncHelperTextareaFocusability(container, startsInteractive);
     if (startsInteractive) terminal.focus();
 
-    // Escape leaves typing mode by default; the agent only receives it when the
-    // user has explicitly asked for that. Handled here rather than on `onData`
-    // so xterm never writes the sequence in the first place.
-    terminal.attachCustomKeyEventHandler(event => {
-      if (event.key !== 'Escape' || !interactiveRef.current || sendEscapeRef.current) return true;
-      if (event.type === 'keydown') escapeExitRef.current?.();
-      return false;
-    });
+    terminal.attachCustomKeyEventHandler(event => handleMissionControlTerminalKey(
+      event,
+      useConfigStore.getState().config ?? {},
+      {
+        copy: () => {
+          if (terminal.hasSelection()) {
+            void copyTerminalText(terminal.getSelection()).catch(() => setError('Could not copy terminal selection. Try copying again.'));
+          }
+        },
+        openPalette: () => {
+          if (isHotkeyEnabledForEvent(event)) useHotkeyStore.getState().hotkeys.get('open-command-palette')?.action();
+        },
+        leaveTyping: () => escapeExitRef.current?.(),
+        hasHotkey: () => isHotkeyEnabledForEvent(event),
+      },
+      { isMac: isMac(), interactive: interactiveRef.current, sendEscape: sendEscapeRef.current },
+    ));
 
     let disposed = false;
     /** True while the user is reading further up; suppresses auto-scroll. */
@@ -643,7 +659,7 @@ export function useMissionControlTerminal({
     // terminal — see the note on charWidthRatio.
   }, [
     panelId, geometry, measured, interactiveRef, sendEscapeRef, escapeExitRef,
-    fontFamilyRef, highContrastRef, kittyKeyboardRef, fitHeightRef, matchPtyExactlyRef,
+    fontFamilyRef, highContrastRef, kittyKeyboardRef, terminalKeyboardPresetRef, fitHeightRef, matchPtyExactlyRef,
   ]);
 
   // A font or theme change is an option flip too: rebuilding every live tile
@@ -651,12 +667,13 @@ export function useMissionControlTerminal({
   useEffect(() => {
     const terminal = terminalRef.current;
     if (!terminal) return;
+    terminal.options.macOptionIsMeta = terminalKeyboardPreset === 'readline-friendly';
     terminal.options.fontFamily = fontFamily;
     terminal.options.minimumContrastRatio = getMinimumContrastRatio(highContrast);
     // vtExtensions is read per key event rather than at construction, so the
     // setting takes effect on a live tile without a rebuild.
     terminal.options.vtExtensions = { ...terminal.options.vtExtensions, kittyKeyboard: kittyKeyboardEnabled };
-  }, [fontFamily, highContrast, kittyKeyboardEnabled]);
+  }, [fontFamily, highContrast, kittyKeyboardEnabled, terminalKeyboardPreset]);
 
   // Collapsing back to preview size drops any growth the expanded view needed,
   // rather than leaving the tile tall until the rebuilt terminal measures again.

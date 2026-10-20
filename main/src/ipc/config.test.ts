@@ -111,6 +111,20 @@ function createServicesStub(projects: Project[]): AppServices {
 }
 
 describe('config IPC handlers', () => {
+  it('returns an actionable error when a changed config file is invalid', async () => {
+    const services = createServicesStub([]);
+    vi.spyOn(services.configManager, 'reloadFromDisk').mockRejectedValueOnce(new PaneError(
+      'INVALID_PORT_DISCOVERY_MODE', 'Port discovery mode is invalid.', 'Set the value to active or passive.',
+    ));
+    const ipcMain = createIpcMainStub();
+    // SAFETY: The stub implements the IpcMain handle surface exercised by registerConfigHandlers.
+    registerConfigHandlers(ipcMain as IpcMain, services);
+    await expect(ipcMain.handlers.get('config:get')?.({})).resolves.toEqual({
+      success: false,
+      error: 'Port discovery mode is invalid. Next: Set the value to active or passive.',
+    });
+  });
+
   it.each([
     { platform: 'darwin', agents: ['claude', 'codex', 'cursor'] },
     { platform: 'linux', agents: ['claude', 'codex', 'cursor'] },

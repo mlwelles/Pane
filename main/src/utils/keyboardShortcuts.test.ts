@@ -24,51 +24,91 @@ describe('terminal keyboard policy', () => {
     expect(resolveTerminalKeyboardEvent(ctrlW, readline, true, true)).toBe('terminal');
   });
 
-  it.each([true, false])('uses the platform default escape with exact modifiers, mac=%s', (isMac) => {
-    const escape = defaultTerminalEscapeShortcut(isMac);
-    expect(escape).toEqual({ code: 'KeyP', ctrlKey: !isMac, metaKey: isMac, altKey: false, shiftKey: true });
-    expect(resolveTerminalKeyboardEvent(escape, readline, true, isMac)).toBe('palette');
-    for (const modifier of ['ctrlKey', 'metaKey', 'altKey', 'shiftKey'] as const) {
-      expect(resolveTerminalKeyboardEvent({ ...escape, [modifier]: !escape[modifier] }, readline, true, isMac)).toBe('terminal');
-    }
-    expect(resolveTerminalKeyboardEvent({ ...escape, code: 'KeyQ' }, readline, true, isMac)).toBe('terminal');
+  it.each([true, false])('uses Command/Super+Shift+P for the terminal palette, mac=%s', isMac => {
+    expect(defaultTerminalEscapeShortcut(isMac)).toEqual({ code: 'KeyP', ctrlKey: false, metaKey: true, altKey: false, shiftKey: true });
+    expect(resolveTerminalKeyboardEvent(defaultTerminalEscapeShortcut(isMac), readline, true, isMac)).toBe('palette');
   });
 
-  it('keeps Ctrl and Command distinct in a custom macOS binding', () => {
-    const config = { ...readline, terminalEscapeShortcut: ctrlW };
-    expect(resolveTerminalKeyboardEvent(ctrlW, config, true, true)).toBe('palette');
-    expect(resolveTerminalKeyboardEvent({ ...ctrlW, ctrlKey: false, metaKey: true }, config, true, true)).toBe('terminal');
+  it.each([
+    { code: 'KeyK', ctrlKey: true },
+    { code: 'KeyP', ctrlKey: true, shiftKey: true },
+    { code: 'KeyX', ctrlKey: true },
+    { code: 'Escape' },
+    { code: 'Digit1', ctrlKey: true },
+    { code: 'KeyB', altKey: true },
+    { code: 'KeyF', altKey: true, shiftKey: true },
+    { code: 'KeyK', ctrlKey: true, altKey: true },
+    { code: 'ArrowLeft', ctrlKey: true, altKey: true },
+    { code: 'Digit1', ctrlKey: true, altKey: true },
+    { code: 'Space', ctrlKey: true },
+    { code: 'Slash', ctrlKey: true },
+    { code: 'BracketLeft', ctrlKey: true },
+    { code: 'Backslash', ctrlKey: true },
+    { code: 'Minus', ctrlKey: true, shiftKey: true },
+    { code: 'Backspace', altKey: true },
+    { code: 'Minus', altKey: true, shiftKey: true },
+    { code: 'Semicolon', altKey: true, shiftKey: true },
+  ])('protects standard editing and prefix input: %j', input => {
+    const event = { ...ctrlW, code: 'KeyK', ctrlKey: false, ...input };
+    expect(resolveTerminalKeyboardEvent(event, readline, true, true)).toBe('terminal');
+    expect(resolveTerminalKeyboardEvent(event, { ...readline, terminalEscapeShortcut: event }, true, true)).toBe('terminal');
+  });
+
+  it.each([
+    { code: 'KeyK', metaKey: true }, { code: 'KeyF', metaKey: true },
+    { code: 'KeyW', metaKey: true }, { code: 'KeyT', metaKey: true },
+    { code: 'KeyN', metaKey: true }, { code: 'KeyB', metaKey: true },
+    { code: 'ArrowLeft', metaKey: true, altKey: true },
+    { code: 'Backslash', metaKey: true },
+    { code: 'KeyK', metaKey: true, altKey: true },
+    { code: 'KeyZ', ctrlKey: true, altKey: true },
+    { code: 'Tab', ctrlKey: true }, { code: 'ArrowUp', shiftKey: true },
+    { code: 'Enter', shiftKey: true }, { code: 'F6' },
+    { code: 'Equal', altKey: true, shiftKey: true },
+  ])('retains nonconflicting Pane shortcuts: %j', input => {
+    expect(resolveTerminalKeyboardEvent({ ...ctrlW, ctrlKey: false, ...input }, readline, true, true)).toBe('standard');
+  });
+
+  it('matches a nonconflicting recorded palette shortcut with exact modifiers', () => {
+    const shortcut = { ...ctrlW, code: 'F6' };
+    const config = { ...readline, terminalEscapeShortcut: shortcut };
+    expect(resolveTerminalKeyboardEvent(shortcut, config, true, true)).toBe('palette');
+    for (const modifier of ['ctrlKey', 'metaKey', 'altKey', 'shiftKey'] as const) {
+      expect(resolveTerminalKeyboardEvent({ ...shortcut, [modifier]: !shortcut[modifier] }, config, true, true)).toBe('standard');
+    }
   });
 
   it.each([
     { keyboardShortcutsEnabled: true, commandPaletteShortcutEnabled: false, want: 'palette' },
     { keyboardShortcutsEnabled: false, commandPaletteShortcutEnabled: true, want: 'palette' },
     { keyboardShortcutsEnabled: false, commandPaletteShortcutEnabled: undefined, want: 'palette' },
-    { keyboardShortcutsEnabled: false, commandPaletteShortcutEnabled: false, want: 'terminal' },
-  ])('keeps the palette escape available according to the global switches: %j', ({ want, ...switches }) => {
+    { keyboardShortcutsEnabled: false, commandPaletteShortcutEnabled: false, want: 'standard' },
+  ])('honors the global palette switches: %j', ({ want, ...switches }) => {
     expect(resolveTerminalKeyboardEvent(defaultTerminalEscapeShortcut(true), { ...readline, ...switches }, true, true)).toBe(want);
   });
 
-  it.each([true, false])('preserves only exact platform clipboard chords, mac=%s', (isMac) => {
-    const base = { ctrlKey: !isMac, metaKey: isMac, altKey: false, shiftKey: !isMac };
+  it.each([true, false])('preserves exact platform clipboard chords, mac=%s', isMac => {
     for (const [code, decision] of [['KeyC', 'copy'], ['KeyV', 'paste']] as const) {
-      const clipboard = { code, ...base };
+      const clipboard = { code, ctrlKey: !isMac, metaKey: isMac, altKey: false, shiftKey: !isMac };
       expect(resolveTerminalKeyboardEvent(clipboard, readline, true, isMac)).toBe(decision);
-      expect(resolveTerminalKeyboardEvent(clipboard, { ...readline, terminalEscapeShortcut: clipboard }, true, isMac)).toBe(decision);
-      for (const modifier of ['ctrlKey', 'metaKey', 'altKey', 'shiftKey'] as const) {
-        expect(resolveTerminalKeyboardEvent({ ...clipboard, [modifier]: !clipboard[modifier] }, readline, true, isMac)).toBe('terminal');
-      }
-      expect(resolveTerminalKeyboardEvent({ code, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }, readline, true, isMac)).toBe('terminal');
+      expect(resolveTerminalKeyboardEvent({ ...clipboard, altKey: true }, readline, true, isMac)).not.toBe(decision);
+      expect(resolveTerminalKeyboardEvent({ ...ctrlW, code }, readline, true, isMac)).toBe('terminal');
     }
   });
 
+  it('does not treat unreported AltGr character output as a configured shortcut', () => {
+    const shortcut = { code: 'KeyZ', ctrlKey: true, metaKey: false, altKey: true, shiftKey: false };
+    const config = { ...readline, terminalEscapeShortcut: shortcut };
+    const event = { ...shortcut, key: 'Ω' };
+    expect(resolveTerminalKeyboardEvent(event, config, true, false)).toBe('terminal');
+    expect(resolveTerminalKeyboardEvent({ ...event, key: 'z' }, config, true, false)).toBe('palette');
+  });
+
   it('never claims composition or AltGraph input', () => {
-    const escape = { code: 'KeyB', ctrlKey: true, metaKey: false, altKey: true, shiftKey: false };
-    const config = { ...readline, terminalEscapeShortcut: escape };
-    expect(resolveTerminalKeyboardEvent({ ...escape, isComposing: true }, config, true, true)).toBe('terminal');
-    expect(resolveTerminalKeyboardEvent({ ...escape, getModifierState: (key) => key === 'AltGraph' }, config, true, false)).toBe('terminal');
-    expect(resolveTerminalKeyboardEvent({ ...escape, getModifierState: () => false }, config, true, false)).toBe('palette');
-    expect(resolveTerminalKeyboardEvent({ code: 'KeyV', ctrlKey: false, metaKey: true, altKey: false, shiftKey: false, isComposing: true }, readline, true, true)).toBe('terminal');
+    const escape = defaultTerminalEscapeShortcut(true);
+    expect(resolveTerminalKeyboardEvent({ ...escape, isComposing: true }, readline, true, true)).toBe('terminal');
+    expect(resolveTerminalKeyboardEvent({ ...escape, getModifierState: key => key === 'AltGraph' }, readline, true, false)).toBe('terminal');
+    expect(resolveTerminalKeyboardEvent({ ...escape, getModifierState: () => false }, readline, true, false)).toBe('palette');
   });
 
   it.each(['KeyA', 'KeyZ', 'Digit0', 'Digit9', 'F1', 'F24', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Insert', 'Delete', 'Backspace', 'Enter', 'Tab', 'Escape', 'Space', 'Minus', 'Equal', 'BracketLeft', 'BracketRight', 'Backslash', 'Semicolon', 'Quote', 'Backquote', 'Comma', 'Period', 'Slash', 'IntlBackslash', 'IntlRo', 'IntlYen'])('accepts a recognized nonmodifier physical code: %s', (code) => {
@@ -93,7 +133,7 @@ describe('terminal keyboard policy', () => {
   it('normalizes fields independently and preserves global switches', () => {
     expect(normalizeTerminalKeyboardConfig({ keyboardShortcutsEnabled: false, commandPaletteShortcutEnabled: false }, false)).toEqual({
       terminalKeyboardPreset: 'standard',
-      terminalEscapeShortcut: { code: 'KeyP', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true },
+      terminalEscapeShortcut: { code: 'KeyP', ctrlKey: false, metaKey: true, altKey: false, shiftKey: true },
       keyboardShortcutsEnabled: false, commandPaletteShortcutEnabled: false,
     });
     // SAFETY: Malformed disk fields exercise normalization below the compile-time config contract.

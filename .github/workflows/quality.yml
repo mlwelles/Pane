@@ -96,6 +96,41 @@ jobs:
       if: ${{ !cancelled() }}
       run: scripts/ci-background.sh wait lint
 
+  native-passive-ports:
+    name: Native Passive Ports (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Setup Node.js and pnpm
+      uses: ./.github/actions/setup-pnpm
+
+    - name: Install Linux socket tools
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y iproute2
+
+    - name: Install dependencies
+      run: pnpm install --ignore-scripts
+
+    - name: Rebuild native modules for Node tests
+      run: pnpm rebuild better-sqlite3-multiple-ciphers
+
+    - name: Verify native socket reads, post-bind forwarding and one-shot listeners
+      run: >-
+        pnpm --filter main exec vitest run
+        src/services/listeningSockets.test.ts
+        src/daemon/client/portTunnel.test.ts
+        src/services/passivePortDiscovery.integration.test.ts
+        -t 'Linux live socket reads|Darwin occupancy attribution|native passive forwarding post-bind|native passive discovery and forwarding'
+      env:
+        PANE_DIR: ${{ runner.temp }}/pane-native-ports
+        OPENROUTER_API_KEY: ''
+
   # Offline check of relative links and #anchors in every tracked markdown file.
   # External URLs are not fetched, so the check never flakes on the network.
   markdown-links:
@@ -282,7 +317,7 @@ jobs:
   # cancelled ones fail it.
   ci-result:
     name: CI result
-    needs: [changes, quality-checks, functional-smoke, runpane-wrapper-tests, cross-os-main-tests]
+    needs: [changes, quality-checks, native-passive-ports, functional-smoke, runpane-wrapper-tests, cross-os-main-tests]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

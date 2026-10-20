@@ -25,6 +25,7 @@ function answeredByTest<T>() {
 }
 
 export interface PortsTest {
+  invocations: string[];
   answerPortsList(snapshot: ListeningPortsSnapshot): void;
   answerConnectionState(mode: 'local' | 'remote'): void;
   /** Delivers a `ports:changed` event. */
@@ -44,6 +45,7 @@ const connectionStates = answeredByTest<RemotePaneConnectionState>();
 let emitPorts: (snapshot: ListeningPortsSnapshot) => void = () => {};
 
 const portsTest: PortsTest = {
+  invocations: [],
   answerPortsList: portLists.answer,
   answerConnectionState: mode => connectionStates.answer({
     mode, status: mode === 'remote' ? 'connected' : 'local', activeProfileId: null, activeProfileLabel: null,
@@ -59,9 +61,10 @@ const portsTest: PortsTest = {
 Object.assign(window, {
   portsTest,
   electronAPI: {
-    invoke: (channel: string) => channel === 'ports:list'
-      ? portLists.request()
-      : Promise.resolve(undefined),
+    invoke: (channel: string) => {
+      portsTest.invocations.push(channel);
+      return channel === 'ports:list' ? portLists.request() : Promise.resolve(undefined);
+    },
     events: {
       onListeningPortsChanged: (callback: typeof emitPorts) => {
         emitPorts = callback;

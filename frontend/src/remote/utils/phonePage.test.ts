@@ -24,6 +24,22 @@ describe('phonePage', () => {
     expect(phonePage('http://[::1]:5173', ports, 'panel-1')).toMatchObject({ src: 'https://mac.tail3c2c57.ts.net:44301/' });
   });
 
+  it('requests an unchecked listener only when opening its URL', () => {
+    const unchecked: ListeningPortsSnapshot = { ...ports,
+      discoveryMode: 'passive', ports: [{ ...ports.ports[1], kind: 'tcp', probeStatus: 'unchecked' }],
+    };
+    expect(phonePage('http://localhost:3000/app', unchecked, 'panel-1')).toMatchObject({ kind: 'unavailable', request: 3000 });
+  });
+
+  it.each(['web', 'tcp'] as const)('uses an existing phone address for a %s listener before considering classification', kind => {
+    const retained: ListeningPortsSnapshot = { ...ports, ports: [{ ...ports.ports[0], kind }] };
+    expect(phonePage('http://localhost:5173/app?x=1#top', retained, 'panel-1')).toMatchObject({
+      kind: 'frame', src: 'https://mac.tail3c2c57.ts.net:44301/app?x=1#top',
+    });
+    expect(phonePage('http://localhost:5173/', { ...retained, phone: { state: 'off', reason: 'access denied' } }, 'panel-1')).toMatchObject({ kind: 'unavailable' });
+    expect(phonePage('http://localhost:5173/', { ...retained, ports: [] }, 'panel-1')).toMatchObject({ kind: 'unavailable' });
+  });
+
   it('opens a host HTML file from the files address, by the panel that holds it', () => {
     expect(phonePage('file:///Users/me/repo/report%20v2.html', ports, 'panel-1')).toEqual({
       kind: 'frame',

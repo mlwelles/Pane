@@ -91,6 +91,18 @@ describe('window terminal keyboard ownership', () => {
     f.dispose();
   });
 
+  it('keeps Command+W and native menus available while protecting Control+W', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    const f = fixture();
+    f.focus(true);
+    expect(f.key({ control: false, meta: true }).preventDefault).toHaveBeenCalledOnce();
+    expect(f.contents.send).toHaveBeenCalledOnce();
+    expect(f.contents.setIgnoreMenuShortcuts).toHaveBeenLastCalledWith(false);
+    expect(f.key().preventDefault).not.toHaveBeenCalled();
+    expect(f.contents.setIgnoreMenuShortcuts).toHaveBeenLastCalledWith(true);
+    f.dispose();
+  });
+
   it('lets Ctrl+W reach the focused terminal without a synthetic renderer event', () => {
     const f = fixture();
     f.focus(true);

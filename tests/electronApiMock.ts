@@ -854,6 +854,8 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
             panelId,
             text: `snapshot for ${panelId}`,
             lineCount: 1,
+            cols: 80,
+            rows: 24,
             isAlternateScreen: false,
             isLive: true,
             lastActivityAt: null,

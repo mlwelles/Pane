@@ -1,14 +1,17 @@
+import childProcess from 'child_process';
 import fs from 'fs/promises';
 import http from 'http';
 import os from 'os';
 import path from 'path';
 import type { AddressInfo } from 'net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PaneCommandRegistry } from './commandRegistry';
 import { PaneWorkspaceHostController } from './workspaceHost';
 import { PhonePreviewHost } from './phonePreviews';
+import { createListeningPortMonitor } from '../services/listeningPorts';
 import { createFakeTailscale, TAILNET_B } from './__fixtures__/fakeTailscale';
 import { hashWorkspacePassword } from './workspacePassword';
+import type { RemoteSetupCommandRunner } from './remote-setup-command';
 import type { WorkspaceAccessConfig } from '../../../shared/types/workspaceAccess';
 import type { ListeningPort, ListeningPortsSnapshot } from '../../../shared/types/listeningPorts';
 
@@ -32,7 +35,7 @@ function snapshot(ports: ListeningPort[]): ListeningPortsSnapshot {
 
 async function startHost(
   tailscale: ReturnType<typeof createFakeTailscale>,
-  options: { paneDir?: string; enabled?: boolean; workspaces?: WorkspaceAccessConfig; onChange?: () => void } = {},
+  options: { paneDir?: string; enabled?: boolean; workspaces?: WorkspaceAccessConfig; onChange?: () => void; run?: RemoteSetupCommandRunner } = {},
 ) {
   const workspace = new PaneWorkspaceHostController(
     new PaneCommandRegistry(),
@@ -44,7 +47,7 @@ async function startHost(
     workspace,
     paneDir: options.paneDir ?? '/Users/owner/.pane',
     files: NO_FILES,
-    run: tailscale.run,
+    run: options.run ?? tailscale.run,
     onChange: options.onChange,
   });
   await workspace.start();
@@ -86,6 +89,214 @@ async function visit(targets: Record<string, string>, phoneUrl: string, path = '
 }
 
 describe('phone previews', () => {
+  it.skipIf(process.platform !== 'darwin')('revokes an explicit grant when discovery publishes an empty listener snapshot', async () => {
+    const tailscale = createFakeTailscale();
+    const upstream = http.createServer((_request, response) => response.end('opened'));
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    let listening = true;
+    cleanups.push(async () => {
+      if (listening) await new Promise<void>(resolve => upstream.close(() => resolve()));
+    });
+    // SAFETY: this server has completed a TCP listen.
+    const address = upstream.address() as AddressInfo;
+    let lsofReads = 0;
+    const commands = vi.spyOn(childProcess, 'execFile').mockImplementation((...args: unknown[]) => {
+      const command = String(args[0]);
+      // SAFETY: the socket reader passes the completion callback last.
+      const callback = args.at(-1) as (error: Error | null, stdout: string, stderr: string) => void;
+      if (command === 'lsof') {
+        lsofReads++;
+        if (lsofReads === 1) callback(null, `p${process.pid}\ncnode\nf10\ntIPv4\nn127.0.0.1:${address.port}\n`, '');
+        else callback(Object.assign(new Error('no matches'), { code: 1 }), '', '');
+      } else if (command === '/usr/sbin/netstat') {
+        callback(null, 'Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address Foreign Address (state)\n', '');
+      } else throw new Error(`Unexpected socket command: ${command}`);
+      return new childProcess.ChildProcess();
+    });
+    cleanups.push(async () => { commands.mockRestore(); });
+    const { previews } = await startHost(tailscale);
+    const published: ListeningPortsSnapshot[] = [];
+    const updates: Promise<void>[] = [];
+    const monitor = createListeningPortMonitor({
+      mode: 'passive', terminalPanes: () => [], readProcessTable: async () => [],
+      onChange(current) {
+        published.push(current);
+        updates.push(previews.update(current));
+      },
+    });
+    cleanups.push(async () => { monitor.stop(); });
+
+    await monitor.refresh();
+    await Promise.all(updates);
+    expect(monitor.snapshot().ports).toMatchObject([{ port: address.port, probeStatus: 'unchecked' }]);
+    await previews.request(address.port);
+    const phoneUrl = previews.decorate(monitor.snapshot()).ports[0].phoneUrl ?? '';
+    const targets = await serveTargets(tailscale);
+    expect((await visit(targets, phoneUrl)).body).toBe('opened');
+
+    await new Promise<void>(resolve => upstream.close(() => resolve()));
+    listening = false;
+    await monitor.refresh();
+    await Promise.all(updates);
+    expect(published.at(-1)?.ports).toEqual([]);
+    expect(monitor.snapshot().ports).toEqual([]);
+    expect((await visit(targets, phoneUrl)).status).toBe(404);
+    expect(Object.values(await serveTargets(tailscale)).some(target => target.endsWith(`/${address.port}`))).toBe(false);
+  });
+
+  it('creates no mapping or probe until an unchecked port is explicitly requested', async () => {
+    const tailscale = createFakeTailscale();
+    const upstream = http.createServer((_request, response) => response.end('opened'));
+    let connections = 0;
+    upstream.on('connection', () => { connections += 1; });
+    await new Promise<void>(resolve => upstream.listen(0, 'localhost', resolve));
+    cleanups.push(() => new Promise<void>(resolve => upstream.close(() => resolve())));
+    // SAFETY: a listening TCP server reports an AddressInfo.
+    const address = upstream.address() as AddressInfo;
+    const unchecked = { ...port(address.port, 'tcp'), probeStatus: 'unchecked' as const };
+    const { previews } = await startHost(tailscale);
+    const before = await serveTargets(tailscale);
+    const writes = tailscale.serveCalls().length;
+
+    await previews.update(snapshot([unchecked]));
+
+    expect(previews.decorate(snapshot([unchecked])).ports[0].phoneUrl).toBeUndefined();
+    expect(await serveTargets(tailscale)).toEqual(before);
+    expect(tailscale.serveCalls()).toHaveLength(writes);
+    expect(connections).toBe(0);
+    await previews.request(address.port);
+    const phoneUrl = previews.decorate(snapshot([unchecked])).ports[0].phoneUrl ?? '';
+    expect(phoneUrl).toMatch(/^https:/u);
+    expect(connections).toBe(0);
+    expect((await visit(await serveTargets(tailscale), phoneUrl)).body).toBe('opened');
+    expect(connections).toBe(1);
+  });
+
+  it('retains a web grant through unchecked and TCP classification and revokes it on disappearance', async () => {
+    const tailscale = createFakeTailscale();
+    const upstream = http.createServer((_request, response) => response.end('retained'));
+    await new Promise<void>(resolve => upstream.listen(0, 'localhost', resolve));
+    cleanups.push(() => new Promise<void>(resolve => upstream.close(() => resolve())));
+    // SAFETY: a listening TCP server reports an AddressInfo.
+    const address = upstream.address() as AddressInfo;
+    const web = port(address.port);
+    const { previews } = await startHost(tailscale);
+    await previews.update(snapshot([web]));
+    await previews.request(web.port);
+    const phoneUrl = previews.decorate(snapshot([web])).ports[0].phoneUrl;
+    const targets = await serveTargets(tailscale);
+    for (const entry of [{ ...web, kind: 'tcp' as const, probeStatus: 'unchecked' as const }, { ...web, kind: 'tcp' as const }]) {
+      await previews.update(snapshot([entry]));
+      expect(previews.decorate(snapshot([entry])).ports[0].phoneUrl).toBe(phoneUrl);
+      expect((await visit(targets, phoneUrl ?? '')).body).toBe('retained');
+    }
+    await previews.update(snapshot([]));
+    expect((await visit(targets, phoneUrl ?? '')).status).toBe(404);
+    expect(Object.values(await serveTargets(tailscale)).some(target => target.endsWith(`/${web.port}`))).toBe(false);
+    await previews.update(snapshot([web]));
+    expect(previews.decorate(snapshot([web])).ports[0].phoneUrl).toBeUndefined();
+    await previews.request(web.port);
+    expect(previews.decorate(snapshot([web])).ports[0].phoneUrl).toMatch(/^https:/u);
+  });
+
+  it('revokes a phone preview when another process takes over the same port', async () => {
+    const tailscale = createFakeTailscale();
+    const web = port(5173);
+    const { previews } = await startHost(tailscale);
+    await previews.update(snapshot([web]));
+    await previews.request(web.port);
+    const phoneUrl = previews.decorate(snapshot([web])).ports[0].phoneUrl ?? '';
+    const targets = await serveTargets(tailscale);
+
+    const replacement = { ...web, pid: 9999, process: 'replacement', kind: 'tcp' as const, probeStatus: 'unchecked' as const };
+    await previews.update(snapshot([replacement]));
+    expect(previews.decorate(snapshot([replacement])).ports[0].phoneUrl).toBeUndefined();
+    expect((await visit(targets, phoneUrl)).status).toBe(404);
+
+    await previews.request(web.port);
+    expect(previews.decorate(snapshot([replacement])).ports[0].phoneUrl).toMatch(/^https:/u);
+  });
+
+  it.each(['password', 'disabled'] as const)('revokes grants on %s denial and requires a fresh request after access returns', async denial => {
+    const tailscale = createFakeTailscale();
+    const workspaces: WorkspaceAccessConfig = { enabled: true };
+    const { workspace, previews } = await startHost(tailscale, { workspaces });
+    const current = snapshot([port(5173)]);
+    await previews.update(current);
+    await previews.request(5173);
+    const phoneUrl = previews.decorate(current).ports[0].phoneUrl ?? '';
+    const targets = await serveTargets(tailscale);
+    expect((await visit(targets, phoneUrl, '/', 'stranger@example.com')).status).toBe(403);
+
+    if (denial === 'password') workspaces.password = hashWorkspacePassword('test password');
+    else workspaces.enabled = false;
+    expect((await visit(targets, phoneUrl)).status).toBe(403);
+    expect(previews.decorate(current).ports[0].phoneUrl).toBeUndefined();
+    await workspace.sync();
+    await previews.update(current);
+    expect(Object.values(await serveTargets(tailscale)).some(target => target.endsWith('/5173'))).toBe(false);
+    await previews.request(5173);
+    delete workspaces.password;
+    workspaces.enabled = true;
+    await workspace.sync();
+    await previews.update(current);
+    expect(previews.decorate(current).ports[0].phoneUrl).toBeUndefined();
+    await previews.request(5173);
+    expect(previews.decorate(current).ports[0].phoneUrl).toMatch(/^https:/u);
+  });
+
+  it.each(['removed', 'password', 'disabled'] as const)('does not publish a handler if %s while Serve creation is pending', async denial => {
+    const tailscale = createFakeTailscale();
+    const workspaces: WorkspaceAccessConfig = { enabled: true };
+    let entered!: () => void;
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { entered = resolve; });
+    const resumed = new Promise<void>(resolve => { release = resolve; });
+    const run: RemoteSetupCommandRunner = async (command, args, options) => {
+      const result = await tailscale.run(command, args, options);
+      if (args[0] === 'serve' && args.includes('--bg') && args.at(-1)?.endsWith('/5173')) {
+        entered();
+        await resumed;
+      }
+      return result;
+    };
+    const published: Array<string | undefined> = [];
+    const current = snapshot([port(5173)]);
+    const onChange = vi.fn();
+    const { previews } = await startHost(tailscale, { workspaces, run, onChange });
+    onChange.mockImplementation(() => { published.push(previews.decorate(current).ports[0].phoneUrl); });
+    await previews.update(current);
+    const opening = previews.request(5173);
+    await pending;
+    let removing: Promise<void> | undefined;
+    if (denial === 'removed') removing = previews.update(snapshot([]));
+    else if (denial === 'password') workspaces.password = hashWorkspacePassword('test password');
+    else workspaces.enabled = false;
+    release();
+    await opening;
+    await removing;
+    expect(published.filter(Boolean)).toEqual([]);
+    expect(previews.decorate(current).ports[0].phoneUrl).toBeUndefined();
+    expect(Object.values(await serveTargets(tailscale)).some(target => target.endsWith('/5173'))).toBe(false);
+  });
+
+  it('preserves discovery, forwarding and phone metadata when decorating unchecked ports', async () => {
+    const tailscale = createFakeTailscale();
+    const { previews } = await startHost(tailscale);
+    const current: ListeningPortsSnapshot = {
+      ...snapshot([{ ...port(5173, 'tcp'), probeStatus: 'unchecked', localPort: 55173,
+        forwardingError: { code: 'PORT_FORWARDING_UNAVAILABLE', message: 'No local address', next: 'Retry' } }]),
+      discoveryMode: 'passive',
+    };
+    await previews.update(current);
+    await previews.request(5173);
+    const decorated = previews.decorate(current);
+    expect(decorated).toMatchObject(current);
+    expect(decorated.phone).toMatchObject({ state: 'on', filesUrl: expect.stringMatching(/^https:/u) });
+    expect(decorated.ports[0].phoneUrl).toMatch(/^https:/u);
+    expect(previews.decorate(decorated)).toEqual(decorated);
+  });
+
   it('gives a web port a phone address on this machine\'s tailnet name once a phone asks, and tcp ports none', async () => {
     const tailscale = createFakeTailscale();
     const { previews } = await startHost(tailscale);

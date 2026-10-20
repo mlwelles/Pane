@@ -21,7 +21,6 @@ import {
 } from '../../utils/terminalKeyHandling';
 import { isMac } from '../../utils/platformUtils';
 import { resolveTerminalKeyboardEvent } from '../../../../shared/utils/terminalKeyboardPolicy';
-import { focusedSurfaceScroll } from '../../services/focusedSurfaceScroll';
 import { copyTerminalText, decodeOsc52Write, isTerminalCopyShortcut } from '../../utils/terminalClipboard';
 import { sendTerminalInput } from '../../utils/terminalInput';
 import { registerRemoteTerminalRestore } from '../../utils/remoteRestoration';
@@ -257,7 +256,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [windowFocused, setWindowFocused] = useState(true);
   const interceptorRef = useRef<TerminalInterceptor | null>(null);
-  const skipNextInterceptRef = useRef(false); // set by AltGr @ detection
+  const skipNextInterceptRef = useRef(false);
+  const terminalPrefixPendingRef = useRef(false);
   const terminalPowerMode = useConfigStore((state) => state.config?.terminalPowerMode ?? 'performance');
   const keyboardShortcutsEnabled = useConfigStore((state) => areKeyboardShortcutsEnabled(state.config));
   const keyboardShortcutsEnabledRef = useRef(keyboardShortcutsEnabled);
@@ -330,13 +330,10 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
 
   useLayoutEffect(() => {
     terminalKeyboardPresetRef.current = terminalKeyboardPreset;
+    skipNextInterceptRef.current = false;
+    terminalPrefixPendingRef.current = false;
     const protectedInput = terminalKeyboardPreset === 'readline-friendly';
     if (xtermRef.current) xtermRef.current.options.macOptionIsMeta = protectedInput;
-    if (protectedInput) {
-      interceptorRef.current?.forceCancel();
-      skipNextInterceptRef.current = false;
-      focusedSurfaceScroll.stop();
-    }
   }, [terminalKeyboardPreset]);
 
   const terminalScrollSurfaceRef = useScrollSurface<HTMLDivElement>({
@@ -911,6 +908,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
       devLog.debug('[TerminalPanel] Missing terminal ref, skipping initialization');
       return;
     }
+    skipNextInterceptRef.current = false;
+    terminalPrefixPendingRef.current = false;
     setInitError(null);
     setIsInitialized(false);
     needsFullActivationRefreshRef.current = true;
@@ -1057,6 +1056,19 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
 
         // Intercept app-level shortcuts before xterm consumes them
         terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+          if (e.type === 'keydown' && terminalKeyboardPresetRef.current === 'readline-friendly'
+            && !['Control', 'Meta', 'Alt', 'Shift', 'AltGraph'].includes(e.key)) {
+            if (terminalPrefixPendingRef.current) skipNextInterceptRef.current = true;
+            terminalPrefixPendingRef.current = !e.metaKey && !e.altKey
+              && ((!e.ctrlKey && !e.shiftKey && e.code === 'Escape')
+                || (e.ctrlKey && ['KeyX', 'KeyQ', 'KeyV', 'BracketLeft'].includes(e.code))
+                || (e.ctrlKey && !e.shiftKey && e.code === 'Digit3'));
+          }
+          // AltGr can produce @ through Ctrl+Alt; do not open the terminal picker.
+          if (e.key === '@' && (e.getModifierState('AltGraph') || (e.ctrlKey && e.altKey))) {
+            skipNextInterceptRef.current = true;
+          }
+
           const presetHandling = handleTerminalKeyboardPresetEvent(e, useConfigStore.getState().config ?? {}, {
             copy: () => {
               if (terminal?.hasSelection()) {
@@ -1098,6 +1110,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
             }
             return !isHotkeyEnabledForEvent(e);
           }
+
+          if (terminalKeyboardPresetRef.current === 'readline-friendly' && isHotkeyEnabledForEvent(e)) return false;
 
           // Ctrl/Cmd+K: clear xterm scrollback without writing ^K to the PTY.
           if (ctrlOrMeta && e.key.toLowerCase() === 'k') {
@@ -1200,13 +1214,6 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           if (ctrlOrMeta && e.shiftKey && e.key.toLowerCase() === 'z') return false;
           // Directional group focus: Mod+Alt+Arrows (all four directions)
           if (ctrlOrMeta && e.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return false;
-
-          // Detect AltGr+key producing '@' (e.g. German AltGr+Q) — set flag so the
-          // interceptor skips activation for this keystroke. AltGr sets both ctrlKey+altKey
-          // on Windows/Linux, or e.getModifierState('AltGraph') on some platforms.
-          if (e.key === '@' && (e.getModifierState('AltGraph') || (e.ctrlKey && e.altKey))) {
-            skipNextInterceptRef.current = true;
-          }
 
           // Right Alt: let OS/browser handle (e.g. voice transcription, IME)
           // Use e.code for physical key (e.key may report 'AltGraph' on some layouts)
@@ -1799,17 +1806,14 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           // Handle terminal input — route through interceptor first
           const handleInput = (data: string) => {
             if (data === '\r' && isCliPanelRef.current) startSendPrompt(panel.id);
-            if (terminalKeyboardPresetRef.current === 'readline-friendly') {
-              sendTerminalInput(panel.id, data);
-              return;
-            }
-            // Skip interception for AltGr-produced @ (e.g. German keyboard)
+            // Bypass one input after an editing prefix or for AltGr text.
             if (skipNextInterceptRef.current) {
               skipNextInterceptRef.current = false;
               sendTerminalInput(panel.id, data);
               return;
             }
             const result = interceptor.handleInput(data);
+            if (result.consumed) terminalPrefixPendingRef.current = false;
             if (!result.consumed) {
               sendTerminalInput(panel.id, data);
             }
@@ -1873,6 +1877,8 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
     // Not when just switching tabs
     return () => {
       disposed = true;
+      skipNextInterceptRef.current = false;
+      terminalPrefixPendingRef.current = false;
       if (toastClearTimer) clearTimeout(toastClearTimer);
       resizeObserver?.disconnect();
       resizeObserver = null;

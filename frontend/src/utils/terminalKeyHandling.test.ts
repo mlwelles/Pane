@@ -3,6 +3,7 @@ import {
   isFineSurfaceScrollKey,
   isTerminalInputTarget,
   handleTerminalKeyboardPresetEvent,
+  handleMissionControlTerminalKey,
   isPageSurfaceScrollKey,
   resolveTerminalKeyHandling,
   shouldOpenTerminalSearch,
@@ -56,7 +57,7 @@ describe('Readline-friendly xterm event routing', () => {
   it('opens the palette only on keydown and blocks terminal encoding on every event', () => {
     const callbacks = actions();
     for (const type of ['keydown', 'keypress', 'keyup']) {
-      const input = event({ code: 'KeyP', ctrlKey: true, shiftKey: true, type });
+      const input = event({ code: 'KeyP', metaKey: true, shiftKey: true, type });
       expect(handleTerminalKeyboardPresetEvent(input, config, callbacks, false)).toBe(false);
       expect(input.preventDefault).toHaveBeenCalledOnce();
       expect(input.stopPropagation).toHaveBeenCalledOnce();
@@ -81,6 +82,30 @@ describe('Readline-friendly xterm event routing', () => {
     expect(handleTerminalKeyboardPresetEvent(input, {}, actions(), false)).toBeUndefined();
     expect(handleTerminalKeyboardPresetEvent(event({ target: new EventTarget() }), config, actions(), false)).toBeUndefined();
     expect(input.stopPropagation).not.toHaveBeenCalled();
+  });
+});
+
+describe('Mission Control terminal editing', () => {
+  it.each(['Escape', 'KeyX', 'KeyK'])('keeps %s and subsequent input in typing mode', code => {
+    const target = Object.assign(new EventTarget(), { matches: () => true });
+    const rawEvent = Object.assign(new Event('keydown'), key({ code, key: code === 'Escape' ? 'Escape' : code.slice(3).toLowerCase(), ctrlKey: code !== 'Escape' }));
+    Object.defineProperty(rawEvent, 'target', { value: target });
+    // SAFETY: The event supplies the keyboard fields and xterm target read by the routing helpers.
+    const event = rawEvent as KeyboardEvent;
+    const actions = { copy: vi.fn(), openPalette: vi.fn(), leaveTyping: vi.fn(), hasHotkey: () => true };
+    expect(handleMissionControlTerminalKey(event, { terminalKeyboardPreset: 'readline-friendly' }, actions,
+      { isMac: true, interactive: true, sendEscape: false })).toBe(true);
+    expect(actions.leaveTyping).not.toHaveBeenCalled();
+    expect(actions.openPalette).not.toHaveBeenCalled();
+  });
+
+  it('retains Standard Escape-to-leave behavior', () => {
+    // SAFETY: Standard routing reads only the key and type on this event.
+    const event = { ...key({ key: 'Escape', code: 'Escape' }), type: 'keydown' } as KeyboardEvent;
+    const actions = { copy: vi.fn(), openPalette: vi.fn(), leaveTyping: vi.fn(), hasHotkey: () => false };
+    expect(handleMissionControlTerminalKey(event, {}, actions,
+      { isMac: true, interactive: true, sendEscape: false })).toBe(false);
+    expect(actions.leaveTyping).toHaveBeenCalledOnce();
   });
 });
 

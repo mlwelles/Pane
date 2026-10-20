@@ -39,17 +39,38 @@ test.describe('Settings', () => {
     await expect(presets.getByRole('radio', { name: 'Readline-friendly' })).toHaveAttribute('aria-checked', 'true');
     const record = page.getByRole('button', { name: 'Record terminal palette shortcut' });
     await record.click();
-    await page.keyboard.press('Control+Alt+k');
-    await expect(record).toHaveText(isMac ? 'Ctrl+Option+K' : 'Ctrl+Alt+K');
+    await page.keyboard.press('Control+F6');
+    await expect(record).toHaveText('Ctrl+F6');
     await expect(page.getByRole('dialog')).toHaveCount(0);
     await page.getByRole('button', { name: 'Back', exact: true }).click();
     await page.getByRole('button', { name: 'Settings', exact: true }).first().click();
-    await expect(record).toHaveText(isMac ? 'Ctrl+Option+K' : 'Ctrl+Alt+K');
+    await expect(record).toHaveText('Ctrl+F6');
     await expect(presets.getByRole('radio', { name: 'Readline-friendly' })).toHaveAttribute('aria-checked', 'true');
     await page.getByRole('button', { name: 'Restore default', exact: true }).click();
-    await expect(record).toHaveText(isMac ? 'Command+Shift+P' : 'Ctrl+Shift+P');
+    await expect(record).toHaveText(isMac ? 'Command+Shift+P' : 'Super+Shift+P');
     await presets.getByRole('radio', { name: 'Standard', exact: true }).click();
     await expect(presets.getByRole('radio', { name: 'Standard', exact: true })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  test('preserves saved editing conflicts, rejects new ones, and resets to a safe default', async ({ page }) => {
+    await page.addInitScript(() => Object.defineProperty(navigator, 'platform', { configurable: true, get: () => 'Linux' }));
+    await bootSettings(page, { platform: 'linux', initialConfig: {
+      terminalKeyboardPreset: 'readline-friendly',
+      terminalEscapeShortcut: { code: 'KeyK', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false },
+    } });
+    await page.getByRole('button', { name: 'Shortcuts', exact: true }).click();
+    const record = page.getByRole('button', { name: 'Record terminal palette shortcut' });
+    await expect(record).toHaveText('Ctrl+K');
+    await expect(page.getByRole('alert')).toContainText('saved shortcut is reserved for terminal editing');
+    await record.click();
+    await page.keyboard.press('Control+Shift+p');
+    await expect(record).toHaveText('Press a key combination');
+    await expect(page.getByRole('alert').first()).toContainText('reserved for terminal editing');
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(record).toHaveText('Ctrl+K');
+    await page.getByRole('button', { name: 'Restore default', exact: true }).click();
+    await expect(record).toHaveText('Super+Shift+P');
+    await expect(page.getByRole('alert')).toHaveCount(0);
   });
 
   test('rejects invalid terminal palette chords and cancels recording', async ({ page }) => {
@@ -63,7 +84,7 @@ test.describe('Settings', () => {
     await page.keyboard.press('Control+Shift+v');
     await expect(page.getByRole('alert')).toContainText('reserved for terminal clipboard');
     await page.getByRole('button', { name: 'Cancel', exact: true }).click();
-    await expect(record).toHaveText('Ctrl+Shift+P');
+    await expect(record).toHaveText('Super+Shift+P');
     // SAFETY: installElectronApiMock installs this typed fixture bridge before navigation.
     const updates = await page.evaluate(() => (
       window as typeof window & { __paneTestElectronMock: SettingsMock }
@@ -152,7 +173,7 @@ test.describe('Settings', () => {
     const previous = await record.textContent();
     await failSave();
     await record.click();
-    await page.keyboard.press('Control+Alt+k');
+    await page.keyboard.press('Control+F6');
     await expect(page.getByRole('alert').last()).toContainText('Keyboard config is read-only');
     await expect(record).toHaveText(previous ?? '');
   });

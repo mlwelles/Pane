@@ -8,6 +8,7 @@ import type { WorktreeFileSyncEntry } from '../../../shared/types/worktreeFileSy
 import type { ApnsCredentialConfig, SharedCredentialId, SharedCredentialMeta } from '../../../shared/types/sharedCredentials';
 import type { AppearanceMode, DarkTheme, LightTheme, Theme } from '../../../shared/types/appearance';
 import type { TerminalEscapeShortcut, TerminalKeyboardPreset } from '../../../shared/utils/terminalKeyboardPolicy';
+import type { PortDiscoveryMode } from '../../../shared/types/listeningPorts';
 
 interface TerminalShortcut {
   id: string;
@@ -46,6 +47,7 @@ export interface AnalyticsIdentity {
 type HtmlFileOpenMode = 'preview' | 'source';
 
 export interface AppConfig {
+  portDiscoveryMode?: PortDiscoveryMode;
   verbose?: boolean;
   anthropicApiKey?: string;
   openaiApiKey?: string;
@@ -186,6 +188,7 @@ export interface AppConfig {
 }
 
 export interface UpdateConfigRequest {
+  portDiscoveryMode?: PortDiscoveryMode;
   verbose?: boolean;
   anthropicApiKey?: string;
   openaiApiKey?: string;

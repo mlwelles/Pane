@@ -34,7 +34,9 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
   const [devToolsOpen, setDevToolsOpen] = useState(false);
   const [fileSession, setFileSession] = useState<{ panelId: string; partition: string | null } | null>(null);
   const [copied, setCopied] = useState(false);
-  const ports = useListeningPorts();
+  const [portsRefreshKey, setPortsRefreshKey] = useState(0);
+  const ports = useListeningPorts(portsRefreshKey);
+  const retryPorts = () => setPortsRefreshKey(key => key + 1);
   // Null until the config loads: until then this desktop may be remote.
   const remoteMode = useConfigStore((state) => (state.config ? state.config.remoteDaemon?.client.mode === 'remote' : null));
   const isRemoteMode = remoteMode === true;
@@ -599,6 +601,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
                 snapshot={ports}
                 currentPort={loopbackPortOf(inputUrl)}
                 canOpen={onHost}
+                onRetry={retryPorts}
                 onOpen={port => {
                   close();
                   openPort(port);
@@ -644,7 +647,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({ panel, isActive }) => {
                 : 'Open a web port here, or enter a URL above.'}
             </p>
             <div className="mt-2">
-              <PortsList snapshot={ports} canOpen={onHost} onOpen={openPort} />
+              <PortsList snapshot={ports} canOpen={onHost} onOpen={openPort} onRetry={retryPorts} />
             </div>
           </div>
         </div>

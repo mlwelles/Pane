@@ -1,6 +1,6 @@
 {
   "name": "Pane",
-  "version": "2.4.185-mlwelles.pre.1",
+  "version": "2.4.185-mlwelles.1.1.1",
   "private": true,
   "description": "Pane - Terminal-first AI code assistant manager with Windows support",
   "author": {
@@ -100,6 +100,7 @@
     "test:ci": "playwright test --config=playwright.ci.config.ts",
     "test:ci:minimal": "playwright test --config=playwright.ci.minimal.config.ts",
     "test:renderer-selection": "pnpm --filter frontend exec tsc --noEmit -p ../tests/renderer/tsconfig.json && playwright test --config=tests/renderer/playwright.config.ts",
+    "test:terminal-keyboard:renderer": "playwright test --config=tests/playwright.terminal-keyboard.config.ts settings.spec.ts terminal-keyboard-input.spec.ts",
     "test:terminal-keyboard": "pnpm run build:main && playwright test --config=tests/playwright.terminal-keyboard.config.ts",
     "test:ui": "playwright test --ui",
     "test:headed": "playwright test --headed"

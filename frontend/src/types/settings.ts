@@ -21,6 +21,7 @@ export type SettingsSettingId =
   | 'start-on-login'
   | 'keep-awake'
   | 'html-file-open-mode'
+  | 'port-discovery-mode'
   | 'theme'
   | 'appearance-mode'
   | 'system-light-theme'

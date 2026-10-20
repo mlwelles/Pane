@@ -37,7 +37,7 @@ export function installWindowKeyboardRouting(
     }
     const config = getConfig();
     const decision = resolveTerminalKeyboardEvent({
-      code: input.code, ctrlKey: input.control, metaKey: input.meta,
+      key: input.key, code: input.code, ctrlKey: input.control, metaKey: input.meta,
       altKey: input.alt, shiftKey: input.shift, isComposing: input.isComposing,
     }, config, terminalInputFocused, process.platform === 'darwin');
     const protectedTerminal = decision !== 'standard';

@@ -70,3 +70,30 @@ describe('GeneralSettings Open HTML files row', () => {
     expect(markup).toMatch(/aria-checked="true"[^>]*>Edit source</);
   });
 });
+
+describe('GeneralSettings port discovery', () => {
+  it('registers port discovery under General with search aliases', () => {
+    const general = SETTINGS_CATEGORIES.find(category => category.id === 'general');
+    expect(general?.settingIds).toContain('port-discovery-mode');
+    expect(general?.aliases).toEqual(expect.arrayContaining(['ports', 'passive', 'probes', 'forwarding']));
+  });
+
+  it.each([undefined, 'win32', 'unknown'])('keeps saved Passive selected but disabled on %s', localPlatform => {
+    const markup = renderToStaticMarkup(
+      <GeneralSettings localPlatform={localPlatform} persistence={createPersistence({ portDiscoveryMode: 'passive' })} onUpdate={vi.fn()} onSendFeedback={vi.fn()} />,
+    );
+    expect(markup).toContain(`id="${settingDomId('port-discovery-mode')}"`);
+    expect(markup).toMatch(/aria-checked="true" disabled=""[^>]*>Passive</);
+    expect(markup).toMatch(/aria-checked="false"[^>]*>Active</);
+    expect(markup).toContain('Passive is unavailable');
+  });
+
+  it.each(['darwin', 'linux'])('offers Passive on supported local %s with Active as the default', localPlatform => {
+    const markup = renderToStaticMarkup(
+      <GeneralSettings localPlatform={localPlatform} persistence={createPersistence()} onUpdate={vi.fn()} onSendFeedback={vi.fn()} />,
+    );
+    expect(markup).toMatch(/aria-checked="true"[^>]*>Active</);
+    expect(markup).toMatch(/aria-checked="false"[^>]*>Passive</);
+    expect(markup).not.toContain('Passive is unavailable');
+  });
+});

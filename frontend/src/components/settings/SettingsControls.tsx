@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { Toggle } from '../ui/Toggle';
 import { cn } from '../../utils/cn';
 
@@ -37,6 +37,8 @@ interface SegmentedOption<T extends string | number> {
   id: T;
   label: string;
   description?: string;
+  disabled?: boolean;
+  disabledReason?: string;
 }
 
 interface SegmentedControlProps<T extends string | number> {
@@ -54,6 +56,7 @@ export function SegmentedControl<T extends string | number>({
   label,
   columns = 2,
 }: SegmentedControlProps<T>) {
+  const id = useId();
   return (
     <div
       role="radiogroup"
@@ -71,10 +74,12 @@ export function SegmentedControl<T extends string | number>({
           type="button"
           role="radio"
           aria-checked={value === option.id}
+          disabled={option.disabled}
+          aria-describedby={option.disabledReason ? `${id}-${option.id}` : undefined}
           title={option.description}
           onClick={() => onChange(option.id)}
           className={cn(
-            'min-h-8 rounded px-2 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring-subtle',
+            'min-h-8 rounded px-2 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring-subtle disabled:cursor-not-allowed disabled:opacity-60',
             value === option.id
               ? 'bg-surface-primary text-text-primary shadow-sm'
               : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary',
@@ -82,6 +87,11 @@ export function SegmentedControl<T extends string | number>({
         >
           {option.label}
         </button>
+      ))}
+      {options.filter(option => option.disabledReason).map(option => (
+        <p key={option.id} id={`${id}-${option.id}`} className="col-span-full max-w-xs px-1 text-xs text-text-tertiary">
+          {option.disabledReason}
+        </p>
       ))}
     </div>
   );

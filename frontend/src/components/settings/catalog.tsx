@@ -29,10 +29,10 @@ export const SETTINGS_CATEGORIES: readonly SettingsCategoryDefinition[] = [
   {
     id: 'general',
     label: 'General',
-    description: 'Startup, application updates, feedback, and opening files.',
+    description: 'Startup, application updates, feedback, port discovery, and opening files.',
     icon: Settings,
-    settingIds: ['automatic-updates', 'check-updates-now', 'send-feedback', 'start-on-login', 'keep-awake', 'html-file-open-mode'],
-    aliases: ['startup', 'updates', 'feedback', 'bug report', 'feature request', 'github issue', 'login', 'sleep', 'caffeinate', 'awake', 'power', 'html', 'preview', 'open html', 'explorer', 'source'],
+    settingIds: ['automatic-updates', 'check-updates-now', 'send-feedback', 'start-on-login', 'keep-awake', 'html-file-open-mode', 'port-discovery-mode'],
+    aliases: ['startup', 'updates', 'feedback', 'bug report', 'feature request', 'github issue', 'login', 'sleep', 'caffeinate', 'awake', 'power', 'html', 'preview', 'open html', 'explorer', 'source', 'ports', 'discovery', 'active', 'passive', 'probes', 'forwarding'],
   },
   {
     id: 'appearance',

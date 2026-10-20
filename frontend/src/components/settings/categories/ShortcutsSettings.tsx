@@ -10,14 +10,14 @@ import type { TerminalShortcut } from '../../../types/config';
 import { formatKeyDisplay } from '../../../utils/hotkeyUtils';
 import { isMac } from '../../../utils/platformUtils';
 import {
-  defaultTerminalEscapeShortcut, isValidTerminalEscapeShortcut,
+  defaultTerminalEscapeShortcut, isValidTerminalEscapeShortcut, isTerminalEditingShortcut,
   normalizeTerminalKeyboardConfig, resolveTerminalKeyboardEvent,
   type TerminalEscapeShortcut,
 } from '../../../../../shared/utils/terminalKeyboardPolicy';
 
 function displayEscapeShortcut(shortcut: TerminalEscapeShortcut): string {
   const key = shortcut.code.replace(/^(Key|Digit)/, '');
-  return [shortcut.ctrlKey && 'Ctrl', shortcut.metaKey && 'Command',
+  return [shortcut.ctrlKey && 'Ctrl', shortcut.metaKey && (isMac() ? 'Command' : 'Super'),
     shortcut.altKey && (isMac() ? 'Option' : 'Alt'), shortcut.shiftKey && 'Shift', key]
     .filter(Boolean).join('+');
 }
@@ -149,7 +149,7 @@ export function ShortcutsSettings({ persistence, onDirtyChange, onShowKeyboardSh
         <SettingRow
           settingId="terminal-keyboard-preset"
           label="Terminal keyboard preset"
-          description="Readline-friendly passes editing keys to the terminal. Snippet shortcuts and the @ terminal picker do not intercept input. On macOS, Option sends Meta keys instead of special characters while terminal input has focus."
+          description="Readline-friendly reserves standard Emacs and Readline editing keys for terminal input. Other Pane shortcuts and snippets remain available. On macOS, Option sends terminal Meta keys."
           saveState={persistence.saveStates['terminal-keyboard-preset']}
         >
           <SegmentedControl
@@ -167,7 +167,7 @@ export function ShortcutsSettings({ persistence, onDirtyChange, onShowKeyboardSh
         <SettingRow
           settingId="terminal-escape-shortcut"
           label="Open command palette from terminal"
-          description="In Readline-friendly, this shortcut opens Pane's command palette. Record one key combination containing Ctrl, Command, or Alt/Option; terminal clipboard shortcuts are reserved."
+          description="In Readline-friendly, this shortcut opens Pane's command palette. Record one key combination containing Ctrl, Command/Super, or Alt/Option. Editing and clipboard shortcuts are reserved. Your desktop may intercept Super shortcuts; record another combination if needed."
           saveState={persistence.saveStates['terminal-escape-shortcut']}
         >
           <div className="space-y-2">
@@ -193,6 +193,10 @@ export function ShortcutsSettings({ persistence, onDirtyChange, onShowKeyboardSh
                   setRecordError(clipboard === 'copy' || clipboard === 'paste'
                     ? 'This combination is reserved for terminal clipboard operations.'
                     : 'Use Ctrl, Command, or Alt with a key. Shift alone is not enough.');
+                  return;
+                }
+                if (isTerminalEditingShortcut(shortcut)) {
+                  setRecordError('This combination is reserved for terminal editing. Choose another combination.');
                   return;
                 }
                 pendingShortcut.current = { shortcut, commandReleased: false };
@@ -227,6 +231,11 @@ export function ShortcutsSettings({ persistence, onDirtyChange, onShowKeyboardSh
               </Button>
             </div>
             {recordError && <p role="alert" className="text-xs text-status-error">{recordError}</p>}
+            {config.terminalKeyboardPreset === 'readline-friendly' && isTerminalEditingShortcut(escapeShortcut) && (
+              <p role="alert" className="text-xs text-status-error">
+                The saved shortcut is reserved for terminal editing and cannot open the palette here. Record another combination or restore the default.
+              </p>
+            )}
           </div>
         </SettingRow>
         {config.keyboardShortcutsEnabled === false && config.commandPaletteShortcutEnabled === false && (
