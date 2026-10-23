@@ -112,6 +112,15 @@ export class ArchiveProcessTracker {
     this.save(this.identities);
   }
 
+  /** Observe descendants without adopting a reused root PID. */
+  async refresh(): Promise<void> {
+    if (this.identities.length === 0) return;
+    const table = await this.read();
+    const matching = this.identities.filter(identity => table.some(item =>
+      item.pid === identity.pid && item.started === identity.started && !item.exited));
+    this.captureTable(table, new Set(matching.map(identity => identity.pid)));
+  }
+
   async terminateSurvivors(): Promise<void> {
     if (this.identities.length === 0) return;
     const table = await this.read();

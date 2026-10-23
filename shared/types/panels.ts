@@ -1,3 +1,4 @@
+import type { AgentChatPanelState } from './agentChat';
 import type { CustomCommandResume } from './customCommandResume';
 import type { DiffScope } from './gitDiff';
 import { boundary, decodeOptionalBoundary } from '../validation/boundaryDecoder';
@@ -33,6 +34,12 @@ export type TerminalAgentDetection = 'declared' | 'command' | 'process' | 'scree
 /** What a worker says about its task when it runs `runpane report`. */
 export type TerminalAgentReportState = 'ready' | 'blocked' | 'failed' | 'done';
 
+/** A report the sender of a panel's work is waiting for (`--expect-report`); kept in `expected-reports.json`. */
+export interface TerminalExpectedReport {
+  /** When the work was sent; a report at or after this time fulfils it. */
+  since: string;
+}
+
 /** The latest `runpane report` from an agent panel, kept in its custom state so it survives restarts. */
 export interface TerminalAgentReport {
   state: TerminalAgentReportState;
@@ -51,6 +58,8 @@ export interface TerminalAgentReport {
 }
 
 export interface TerminalPanelState {
+  /** Host-owned chat runtime identity and handoff journal. Viewers cannot mutate it. */
+  agentChat?: AgentChatPanelState;
   // Basic state (implemented in Phase 1-2)
   isInitialized?: boolean;       // Whether PTY process has been started
   cwd?: string;                  // Current working directory
@@ -112,8 +121,16 @@ export interface TerminalPanelState {
   orchestrationSessionId?: string;
   /** Session-owned working directory, also used by legacy shared terminal owners. */
   orchestrationWorkspace?: string;
+  /**
+   * The folder a resumed Codex conversation is pinned to with `--cd`, because the
+   * conversation was recorded in another checkout or machine. Quoted for the
+   * terminal's own shell at launch.
+   */
+  resumeDirectory?: string;
   /** Applied when the terminal next starts, not while its agent is running. */
   orchestrationProfile?: string;
+  /** Folder of the Session this worker's Pane belongs to, as the agent sees it; exported as PANE_SESSION_DIR. */
+  sessionFolder?: string;
   /** Wrapper/custom commands own their flags and resume behavior. */
   preserveLaunchCommand?: boolean;
   customResume?: CustomCommandResume | null;

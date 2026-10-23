@@ -30,7 +30,7 @@ const ENV_OPTIONS_WITH_SEPARATE_OPERAND = new Set([
 const ENV_FLAGS = new Set(['-i', '--ignore-environment', '-0', '--null', '-v', '--debug']);
 const MAX_ENV_SPLIT_EXPANSIONS = 16;
 
-function tokenizeShellCommand(command: string, platformHint: NodeJS.Platform, spans?: Array<{ start: number; end: number }>): string[] | undefined {
+export function tokenizeShellCommand(command: string, platformHint: NodeJS.Platform, spans?: Array<{ start: number; end: number }>): string[] | undefined {
   const tokens: string[] = [];
   let token = '';
   let tokenStarted = false;

@@ -1,3 +1,4 @@
+import { agentChatManager } from '../services/agentChat/agentChatManager';
 import { UpdatePanelRestorer } from '../services/updateRestoration';
 import { getPaneEventSink } from '../core/runtime';
 import { beginUpdateShutdown } from '../services/updateShutdown';
@@ -107,12 +108,13 @@ export function registerUpdateOperationHandlers(services: AppServices, registry:
   const restorer = new UpdatePanelRestorer(directory, bootId, {
     getPanel: id => panelManager.getPanel(id),
     updatePanel: async (id, update) => { await panelManager.updatePanel(id, update); },
-    isInitialized: id => terminalPanelManager.isTerminalInitialized(id),
+    isInitialized: id => terminalPanelManager.isAgentRuntimeInitialized(id),
     initialize: async (panel, cwd, operationId) => {
+      if (agentChatManager.manages(panel.id)) return agentChatManager.restoreAfterUpdate(panel.id, operationId);
       const context = services.sessionManager.getProjectContext(panel.sessionId)?.commandRunner.wslContext;
       await terminalPanelManager.initializeTerminal(panel, cwd, context, 1, undefined, operationId);
     },
-    verify: (panelId, resumeId) => terminalPanelManager.verifyUpdateResume(panelId, resumeId),
+    verify: async (panelId, resumeId) => agentChatManager.manages(panelId) ? agentChatManager.verifyNativeResume(panelId, resumeId) : terminalPanelManager.verifyUpdateResume(panelId, resumeId),
   });
   registry.register('runpane:update:restore', async (value: PaneCommandValue) => {
     if (isRemotePaneCommand()) throw new PaneError('ERR_UPDATE_LOCAL_ONLY', 'Update restoration requires a local command.', 'Run it on the owning machine.');

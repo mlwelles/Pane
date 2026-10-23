@@ -1,3 +1,4 @@
+import { registerAgentChatHandlers } from './agentChat';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
 import type { PaneCommandValue } from '../daemon/commandRegistry';
 import { ipcMain, powerMonitor } from 'electron';
@@ -26,6 +27,7 @@ import { registerSpotlightHandlers } from './spotlight';
 import { registerJourneyTimingHandlers } from './journeyTimings';
 import { registerRemoteDaemonHandlers } from './remoteDaemon';
 import { registerRunpaneHandlers } from './runpane';
+import { registerDesktopAlertHandlers } from './desktopAlerts';
 import { registerClipboardHandlers } from './clipboard';
 import { registerResourceMonitorHandlers } from './resourceMonitor';
 import { registerOnboardingHandlers } from './onboarding';
@@ -111,6 +113,7 @@ export function registerIpcHandlers(services: AppServices): PaneCommandRegistry 
   registerRemoteDaemonHandlers(ipcMain, services);
   registerWorkspaceAccessHandlers(ipcMain, services, commandRegistry);
   registerRunpaneHandlers(ipcMain, services, commandRegistry);
+  registerDesktopAlertHandlers(ipcMain, services);
   registerPaneLinkHandler(commandRegistry, {
     repoExists: (repoId) => Boolean(services.databaseService.getProject(repoId)),
     navigate: (target) => {
@@ -128,6 +131,7 @@ export function registerIpcHandlers(services: AppServices): PaneCommandRegistry 
   registerAgentUsageHandlers(ipcMain, services, commandRegistry);
   registerVoiceHandlers(ipcMain, services, commandRegistry);
   registerPaneChatHandlers(ipcMain, services, commandRegistry);
+  registerAgentChatHandlers(ipcMain, commandRegistry);
   registerSshHostHandlers(ipcMain, services, commandRegistry);
   registerOrchestrationSessionHandlers(ipcMain, services, commandRegistry);
   registerUsageHandlers(ipcMain, commandRegistry);

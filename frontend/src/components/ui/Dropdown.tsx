@@ -43,6 +43,8 @@ export interface DropdownProps {
   
   // Optional footer content (e.g., settings button)
   footer?: ReactNode | ((controls: { close: () => void }) => ReactNode);
+  /** Accessible name for a footer-only form; exposes a nonmodal dialog. */
+  formLabel?: string;
   
   // Custom styles
   className?: string;
@@ -92,6 +94,7 @@ export function Dropdown({
   separateVariants = true,
   onOpenChange,
   footer,
+  formLabel,
   className,
   menuClassName,
   itemClassName,
@@ -326,7 +329,7 @@ export function Dropdown({
         ref={triggerRef}
         onClick={handleToggle}
         className={triggerClassName}
-        aria-haspopup="menu"
+        aria-haspopup={formLabel ? 'dialog' : 'menu'}
         aria-expanded={isOpen}
         aria-controls={isOpen ? menuId : undefined}
         onKeyDown={(e) => {
@@ -344,8 +347,9 @@ export function Dropdown({
         <div
           id={menuId}
           ref={contentRef}
-          role="menu"
-          aria-orientation="vertical"
+          role={formLabel ? 'dialog' : 'menu'}
+          aria-label={formLabel}
+          aria-orientation={formLabel ? undefined : 'vertical'}
           onKeyDown={handleMenuKeyDown}
           className={cn(
             'z-[10000] pointer-events-auto',

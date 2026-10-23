@@ -311,18 +311,97 @@ test.describe('Settings', () => {
     expect(writes.preferences).toContainEqual({ key: 'sidebar_pane_row_layout', value: 'two-row' });
   });
 
-  test('persists the keep-awake toggle to config', async ({ page }) => {
+  test('persists the keep-awake toggle and its power options to config', async ({ page }) => {
     await bootSettings(page, { initialConfig: { keepAwakeWhileSessionsActive: true } });
 
-    await page.getByRole('switch', { name: 'Keep computer awake while sessions are active' }).click();
-    await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+    const master = page.getByRole('switch', { name: 'Keep awake while sessions are active' });
+    const pluggedIn = page.getByRole('checkbox', { name: /While plugged in/ });
+    const onBattery = page.getByRole('checkbox', { name: /While on battery/ });
+    await expect(master).toHaveAttribute('aria-checked', 'true');
+    await expect(pluggedIn).toBeChecked();
+    await expect(onBattery).not.toBeChecked();
+
+    await onBattery.check();
+    await pluggedIn.uncheck();
+    await master.click();
+    await expect(pluggedIn).toBeDisabled();
+    await expect(onBattery).toBeDisabled();
+    await expect(pluggedIn).not.toBeChecked();
+    await expect(onBattery).toBeChecked();
 
     // SAFETY: installElectronApiMock defines this test-only bridge before the page loads.
-    const updates = await page.evaluate(() => (
+    await expect.poll(() => page.evaluate(() => (
       window as typeof window & { __paneTestElectronMock: SettingsMock }
-    ).__paneTestElectronMock.getConfigUpdates());
-    expect(updates).toContainEqual({ keepAwakeWhileSessionsActive: false });
+    ).__paneTestElectronMock.getConfigUpdates())).toEqual([
+      { keepAwakeOnBattery: true },
+      { keepAwakeWhilePluggedIn: false },
+      { keepAwakeWhileSessionsActive: false },
+    ]);
   });
+
+  test('a failed keep-awake option save shows the error and the saved value', async ({ page }) => {
+    await bootSettings(page);
+    await page.evaluate(() => {
+      // SAFETY: installElectronApiMock defines this test-only bridge before the page loads.
+      (window as typeof window & { __paneTestElectronMock: SettingsMock }).__paneTestElectronMock.failNextConfigUpdate('Disk is read-only');
+    });
+
+    const onBattery = page.getByRole('checkbox', { name: /While on battery/ });
+    await onBattery.click();
+
+    await expect(page.getByRole('alert')).toContainText('Disk is read-only');
+    await expect(onBattery).not.toBeChecked();
+    await expect(onBattery).toBeEnabled();
+  });
+
+  test('keep-awake options start open and the chevron hides them', async ({ page }) => {
+    await bootSettings(page);
+
+    const chevron = page.getByRole('button', { name: 'Keep-awake options' });
+    await expect(chevron).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.getByRole('checkbox', { name: /While plugged in/ })).toBeVisible();
+
+    await chevron.click();
+    await expect(chevron).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.getByRole('checkbox', { name: /While plugged in/ })).toBeHidden();
+    await expect(page.getByRole('checkbox', { name: /While on battery/ })).toBeHidden();
+
+    await chevron.click();
+    await expect(page.getByRole('checkbox', { name: /While on battery/ })).toBeVisible();
+  });
+
+  for (const { platform, battery, lid, otherLids } of [
+    {
+      platform: 'Win32',
+      battery: 'Keeps the screen on and stops auto-lock. Uses more battery.',
+      lid: 'Closing the lid still puts your PC to sleep.',
+      otherLids: ['Closing the lid still puts your Mac to sleep', 'Closing the lid still suspends most systems.'],
+    },
+    {
+      platform: 'MacIntel',
+      battery: 'Keeps the screen on. Uses more battery.',
+      lid: 'Closing the lid still puts your Mac to sleep',
+      otherLids: ['Closing the lid still puts your PC to sleep.', 'Closing the lid still suspends most systems.'],
+    },
+    {
+      platform: 'Linux x86_64',
+      battery: 'Keeps the screen on. Uses more battery.',
+      lid: 'Closing the lid still suspends most systems.',
+      otherLids: ['Closing the lid still puts your PC to sleep.', 'Closing the lid still puts your Mac to sleep'],
+    },
+  ]) {
+    test(`keep-awake shows only the ${platform} battery line and lid hint`, async ({ page }) => {
+      await page.addInitScript((value) => {
+        Object.defineProperty(Navigator.prototype, 'platform', { get: () => value, configurable: true });
+      }, platform);
+      await bootSettings(page);
+
+      const options = page.locator('[data-setting-id="keep-awake"]');
+      await expect(options.getByText(battery, { exact: true })).toBeVisible();
+      await expect(options.getByText(lid)).toBeVisible();
+      for (const other of otherLids) await expect(options.getByText(other)).toHaveCount(0);
+    });
+  }
 
   test('announces a failed save and restores the authoritative value', async ({ page }) => {
     await bootSettings(page, { initialConfig: { autoCheckUpdates: true } });

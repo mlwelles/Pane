@@ -1,3 +1,4 @@
+import type { AgentChatEvent, AgentChatView, AgentChatSend, AgentInterface } from '../../shared/types/agentChat';
 import { contextBridge, ipcRenderer } from 'electron';
 import { isDaemonOwnedChannel } from '../../shared/types/daemon';
 import {
@@ -273,6 +274,13 @@ try {
       console.error('Failed to dispatch browser-panel:popup-requested to window:', e);
     }
   });
+  ipcRenderer.on('browser-panel:file-refused', (_event: Electron.IpcRendererEvent, data: { panelId: string; message: string }) => {
+    try {
+      window.dispatchEvent(new CustomEvent('browser-panel:file-refused', { detail: data }));
+    } catch (e) {
+      console.error('Failed to dispatch browser-panel:file-refused to window:', e);
+    }
+  });
 } catch {
   // Ignore if IPC is not available for some reason
 }
@@ -396,6 +404,33 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }): Promise<IPCResponse> => invokeIpc('diagnostics:renderer-fatal', payload),
   },
 
+  agentChat: {
+    onReconnect: (callback: () => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, state: RemotePaneConnectionState) => { if (state.status === 'connected') callback(); };
+      ipcRenderer.on('remote-daemon:connection-state-changed', listener);
+      return () => ipcRenderer.removeListener('remote-daemon:connection-state-changed', listener);
+    },
+    get: (panelId: string) => invokeIpc('agent-chat:get', panelId),
+    setup: () => invokeIpc('agent-chat:setup'),
+    switch: (panelId: string, mode: AgentInterface, generation: number) => invokeIpc('agent-chat:switch', panelId, mode, generation),
+    recover: (panelId: string, mode: AgentInterface, generation: number) => invokeIpc('agent-chat:recover', panelId, mode, generation),
+    send: (panelId: string, request: AgentChatSend) => invokeIpc('agent-chat:send', panelId, request),
+    receipt: (panelId: string, operationId: string) => invokeIpc('agent-chat:receipt', panelId, operationId),
+    configure: (panelId: string, generation: number, configId: string, value: string) => invokeIpc('agent-chat:configure', panelId, generation, configId, value),
+    cancel: (panelId: string, generation: number) => invokeIpc('agent-chat:cancel', panelId, generation),
+    permission: (panelId: string, generation: number, requestId: string, optionId: string) => invokeIpc('agent-chat:permission', panelId, generation, requestId, optionId),
+    stop: (panelId: string) => invokeIpc('agent-chat:stop', panelId),
+    onEvent: (callback: (event: AgentChatEvent) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, event: AgentChatEvent) => callback(event);
+      ipcRenderer.on('agent-chat:event', listener);
+      return () => ipcRenderer.removeListener('agent-chat:event', listener);
+    },
+    onState: (callback: (state: AgentChatView) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, state: AgentChatView) => callback(state);
+      ipcRenderer.on('agent-chat:state', listener);
+      return () => ipcRenderer.removeListener('agent-chat:state', listener);
+    },
+  },
   paneChat: {
     getOrCreate: (): Promise<IPCResponse> => invokeIpc('pane-chat:get-or-create'),
     setAgent: (agent: 'claude' | 'codex' | 'cursor'): Promise<IPCResponse> => invokeIpc('pane-chat:set-agent', agent),
@@ -1150,9 +1185,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
       invokeIpc('agent-usage:get', force),
   },
 
+  // Whether Dictate's watcher shows Pane's alerts, so Pane skips its desktop notification
+  notifications: {
+    isHandedOff: async (): Promise<boolean> => decodeBoundary(await invokeIpc('notifications:handed-off'), boundary.boolean),
+  },
+
   // Window state queries (invoke, not event subscriptions)
   window: {
     isFocused: async (): Promise<boolean> => decodeBoundary(await invokeIpc('window:is-focused'), boundary.boolean),
+    openPaneLink: async (link: string): Promise<void> => {
+      await invokeIpc('window:open-pane-link', link);
+    },
   },
 
   // ptyHost: typed wrapper over the per-window MessagePort. The raw port is

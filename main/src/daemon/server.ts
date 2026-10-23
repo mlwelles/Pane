@@ -15,6 +15,7 @@ import { serializeJsonTransport } from './jsonTransport';
 import { toPaneDaemonError } from '../../../shared/paneError';
 
 const DAEMON_EVENT_PREFIXES = [
+  'agent-chat:',
   'archive:',
   'folder:',
   'panel:',

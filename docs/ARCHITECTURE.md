@@ -214,3 +214,12 @@ destination instead of claiming delivery. There is no cross-machine sync.
   `\\wsl$`.
 - Production builds must never include React Scan (`pnpm perf:scan` is dev
   only).
+
+### Agent Chat
+
+[Agent Chat](AGENT_CHAT.md) adds a host-owned ACP runtime to eligible agent tabs.
+The same panel keeps its exact provider conversation and a durable ownership
+generation when switching between ACP and a native terminal. Desktop and remote
+viewers share the command registry and ordered projection events; viewer lifetime
+does not control the agent process. See the compatibility and recovery limits in
+the linked guide.

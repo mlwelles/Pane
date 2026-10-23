@@ -47,6 +47,8 @@ type HtmlFileOpenMode = 'preview' | 'source';
 
 export interface AppConfig {
   portDiscoveryMode?: PortDiscoveryMode;
+  agentChatEnabled?: boolean;
+  defaultAgentInterface?: 'terminal' | 'chat';
   verbose?: boolean;
   anthropicApiKey?: string;
   openaiApiKey?: string;
@@ -77,8 +79,11 @@ export interface AppConfig {
   autoCheckUpdates?: boolean;
   // Start Pane automatically when the user logs in
   autoStartOnBoot?: boolean;
-  // Prevent idle sleep while Pane sessions are active
+  // Master toggle: prevent idle sleep while Pane sessions are active
   keepAwakeWhileSessionsActive?: boolean;
+  // Under the master toggle: hold keep-awake on AC power (default on) and on battery (default off)
+  keepAwakeWhilePluggedIn?: boolean;
+  keepAwakeOnBattery?: boolean;
   // Theme preference
   appearanceMode?: AppearanceMode;
   theme?: Theme;
@@ -206,6 +211,8 @@ export interface UpdateConfigRequest {
   autoCheckUpdates?: boolean;
   autoStartOnBoot?: boolean;
   keepAwakeWhileSessionsActive?: boolean;
+  keepAwakeWhilePluggedIn?: boolean;
+  keepAwakeOnBattery?: boolean;
   appearanceMode?: AppearanceMode;
   theme?: Theme;
   systemLightTheme?: LightTheme;

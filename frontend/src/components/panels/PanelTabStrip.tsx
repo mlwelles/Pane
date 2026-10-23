@@ -1,3 +1,5 @@
+import { openAgentViewMenu } from '../agentChat/openAgentViewMenu';
+import { AgentViewMenu } from '../agentChat/AgentViewMenu';
 /**
  * PanelTabStrip: renders a horizontal strip of panel tab items.
  *
@@ -380,7 +382,9 @@ export const PanelTabStrip: React.FC<PanelTabStripProps> = React.memo(({
                   ? "text-text-muted opacity-50"
                   : "text-text-tertiary hover:text-text-primary hover:bg-surface-hover",
               isDragged && "opacity-50",
+              panel.type === 'terminal' && !isEditing && "pr-14",
             )}
+            onContextMenu={panel.type === 'terminal' ? openAgentViewMenu : undefined}
             draggable={!isEditing && !isDisabled}
             onDragStart={(e) => handleDragStart(e, panel.id)}
             onDragEnd={handleDragEnd}
@@ -432,6 +436,8 @@ export const PanelTabStrip: React.FC<PanelTabStripProps> = React.memo(({
                 <span className={cn("min-w-0 truncate", compact && isPrimary && "font-semibold", isPreviewTab && "italic")}>{displayTitle}</span>
               </span>
             )}
+
+            {panel.type === 'terminal' && !isEditing && <AgentViewMenu panelId={panel.id} title={displayTitle} client={window.electronAPI.agentChat} className="absolute right-7 top-1/2 z-20 -translate-y-1/2" />}
 
             {!isPermanent && !isEditing && (
               <button

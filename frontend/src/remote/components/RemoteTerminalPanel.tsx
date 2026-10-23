@@ -1,3 +1,4 @@
+import { AgentPanelSurface } from '../../components/agentChat/AgentPanelSurface';
 import type { ToolPanel } from '../../../../shared/types/panels';
 import type {
   RemotePaneConnectionStatus,
@@ -20,7 +21,11 @@ interface RemoteTerminalPanelProps {
   onRefreshShortcuts: () => void;
 }
 
-export function RemoteTerminalPanel({
+export function RemoteTerminalPanel(props: RemoteTerminalPanelProps) {
+  return <AgentPanelSurface panel={props.panel} client={props.adapter.agentChat} connected={props.connectionStatus === 'connected'}><NativeRemoteTerminalPanel {...props} /></AgentPanelSurface>;
+}
+
+function NativeRemoteTerminalPanel({
   adapter,
   panel,
   sessionId,

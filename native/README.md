@@ -62,6 +62,25 @@ maestro --device <simulator-udid> test -e CONNECTION_CODE="$(cat ~/.pane_rn_dev/
 
 `terminal.yaml` needs a host whose first pane has a plain `Terminal` tab and a `Claude Code` tab, which is what `runpane panes create --agent claude` gives you. On a busy machine, set `MAESTRO_DRIVER_STARTUP_TIMEOUT=240000` if Maestro reports that the iOS driver was not ready in time.
 
+## Agent Chat
+
+Compatible agent panels offer **Chat** and **Terminal** below the tab strip. Both
+continue the exact conversation on the host. Chat uses `@assistant-ui/react-native`
+with the default appearance, adapted to theme tokens and a virtualized Legend
+List. There is no model process or chat cloud on the phone. See
+[Agent Chat](../docs/AGENT_CHAT.md) for host compatibility and recovery.
+
+Chat supports streamed Markdown, reasoning, expandable tools/diffs, the host’s
+permission choices, images up to 5 MiB, and advertised model/mode/effort settings.
+Its Send and Cancel controls dispatch semantic host commands; Terminal retains
+its keyboard, controller and upload behavior. Switching during work waits for a
+checkpoint and can be cancelled. A stopped conversation offers explicit recovery
+in Terminal. Disconnecting or leaving the screen never stops the host agent.
+
+Draft text uses the existing per-host/pane/panel device storage. Uncertain sends
+retain their operation ID during navigation/reconnect and require **Check
+delivery** or **Retry same delivery**; no mutation is replayed automatically.
+
 ## The terminal page
 
 The pane screen runs xterm in a WebView. The page source is `terminal-web/page.ts`. `pnpm build:terminal-web` bundles it, with xterm and its CSS, into `src/features/terminal/terminalHtml.generated.ts`, so the WebView needs no network. Run it after changing the page or upgrading xterm, and commit the generated file. The page and the screen talk through the messages in `src/features/terminal/bridge.ts`. The scroll joystick scrolls the page's own buffer, except when a full-screen app is on the alternate screen or has asked for mouse events (Claude Code with `"tui": "fullscreen"`, less, vim, tmux): those keep no scrollback here, so the page sends them wheel input instead, as xterm does for a desktop mouse wheel.

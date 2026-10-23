@@ -1,3 +1,5 @@
+import { agentChatManager } from '../services/agentChat/agentChatManager';
+import { assertRawTerminal, chatLastMessage, chatText, submitChat, waitForChat } from './runpaneChat';
 import { paneCommandSignal } from '../daemon/commandRegistry';
 import { MAX_WORKSPACE_WAIT_TIMEOUT_MS, WorkspaceWatchCancelledError, WorkspaceWatchLeases } from '../services/workspaceWatchLeases';
 import { failureDetails, FailureLimiter } from '../utils/failureTelemetry';
@@ -29,9 +31,11 @@ import { assertNewBranchName } from '../services/worktreeManager';
 import { queuedSetupMessage } from '../services/taskQueue';
 import { assessComposerEvidence, hasConfiguredCodexScreen, isSlashCommandInput, looksLikePendingComposer } from './runpaneComposerEvidence';
 import { presentStoppedPanel, projectWorkspaceEntry } from '../services/workspaceJournal';
+import { SessionInbox } from '../services/sessionInbox';
+import { ExpectedReportTracker, MAX_MISSING_REPORT_OUTPUT_LENGTH, type PanelLastOutput } from '../services/expectedReports';
 import { detectAgentState } from '../services/agentStatus/manifestEngine';
 import { getManifestForAgent, CURSOR_MANIFEST } from '../services/agentStatus/manifests';
-import { detectAgentComposer, detectAgentFromScreen, screenShowsQueuedMessage } from '../services/agents/agentScreenSignature';
+import { detectAgentBackgroundWork, detectAgentComposer, detectAgentFromScreen, screenShowsQueuedMessage } from '../services/agents/agentScreenSignature';
 import { agentTranscripts, type TranscriptLocator } from '../services/agentTranscript';
 import {
   AGENT_REPORT_STATES,
@@ -39,7 +43,7 @@ import {
   normalizeAgentReport,
   readPanelAgentReport,
 } from '../services/agentReport';
-import { resolveAgentTypeFromCommand } from '../services/agents/agentIdentity';
+import { isCliAgentType, resolveAgentTypeFromCommand } from '../services/agents/agentIdentity';
 import { assertDirectOpenCodeLaunchCommand, isValidOpenCodeSessionId } from '../services/agents/opencodeLaunch';
 import {
   bracketedPaste,
@@ -49,7 +53,9 @@ import {
   normalizePromptNewlines,
   promptFileShellWord,
   stripTrailingNewlines,
+  writeAgentPromptFile,
   writePromptFile,
+  type AgentPromptFile,
 } from '../services/agents/promptDelivery';
 import type { ArchiveProgressManager } from '../services/archiveProgressManager';
 import type { ArchiveProgressTask } from '../../../shared/types/archiveProgress';
@@ -57,8 +63,11 @@ import { classifyWorktree } from '../services/worktreeTrash';
 import type { CommandRunner } from '../utils/commandRunner';
 import type { Project } from '../database/models';
 import type { Session, SessionOutput } from '../types/session';
-import type { BrowserPanelState, CreatePanelRequest, EditorPanelState, TerminalAgentReport, TerminalPanelState, ToolPanel } from '../../../shared/types/panels';
+import type { BrowserPanelState, CreatePanelRequest, EditorPanelState, TerminalAgentReport, TerminalExpectedReport, TerminalPanelState, ToolPanel } from '../../../shared/types/panels';
 import { RUNPANE_CONTRACT } from '../../../shared/types/generatedRunpaneContract';
+import { withSessionFolderAccess } from '../services/agents/sessionFolderAccess';
+import { sessionWorkspacePath } from '../services/sessionWorkspace';
+import { RUNPANE_DAEMON_FEATURES } from '../../../shared/types/runpaneOrchestration';
 import { isAgentSupportedOnPlatform } from '../../../shared/constants/agentLaunchPresets';
 import { getDockTerminalPanel } from '../../../shared/utils/terminalDock';
 import {
@@ -169,6 +178,8 @@ import type {
   RunpaneWorkspaceStateResult,
   RunpaneWorkspaceWaitRequest,
   RunpaneWorkspaceWaitResult,
+  RunpaneInboxAckResult,
+  RunpaneInboxListResult,
   RunpaneSessionListResult,
   RunpaneSessionResult,
   RunpaneSessionOverviewResult,
@@ -324,6 +335,7 @@ const orchestrationSessionCreateSchema = boundary.object({
   isPinned: boundary.optional(boundary.boolean),
   agent: boundary.optional(boundary.enumeration('claude', 'codex', 'cursor')),
   launchCommand: boundary.optional(orchestrationTextSchema),
+  resume: boundary.optional(boundary.nonEmptyString),
   profile: boundary.optional(orchestrationTextSchema),
   goal: boundary.optional(orchestrationTextSchema),
   context: boundary.optional(orchestrationTextSchema),
@@ -369,6 +381,14 @@ const lockReleaseRequestSchema = boundary.object({
   sessionId: boundary.optional(boundary.nonEmptyString),
   owner: lockOwnerInputSchema,
 });
+const inboxListRequestSchema = boundary.object({
+  session: boundary.nonEmptyString,
+});
+const inboxAckRequestSchema = boundary.object({
+  ids: boundary.optional(boundary.array(boundary.string)),
+  session: boundary.optional(boundary.nonEmptyString),
+  all: boundary.optional(boundary.boolean),
+});
 const lockListRequestSchema = boundary.object({
   sessionId: boundary.optional(boundary.nonEmptyString),
 });
@@ -394,6 +414,27 @@ export function registerRunpaneHandlers(
   services.workspaceJournal = workspaceJournal;
   services.workspaceStateReader = workspaceStateReader;
   services.workspaceCursorStore = workspaceCursorStore;
+  if (!services.sessionInbox) {
+    const sessionInbox = new SessionInbox(path.join(getAppDirectory(), 'session-inbox.json'), {
+      sessionIdsFor: (paneId, panelId) => services.orchestrationSessionManager?.memberSessionIds(paneId, panelId) ?? [],
+    });
+    sessionInbox.attach(workspaceJournal);
+    services.sessionInbox = sessionInbox;
+    services.expectedReportTracker = new ExpectedReportTracker({
+      journal: workspaceJournal,
+      filePath: path.join(getAppDirectory(), 'expected-reports.json'),
+      panelExists: panelId => panelManager.getPanel(panelId) !== undefined,
+      lastReportAt: panelId => readPanelAgentReport(panelManager.getPanel(panelId))?.reportedAt,
+      lastOutput: panelId => readPanelLastOutput(panelId, sessionManager),
+      backgroundWork: readPanelBackgroundWork,
+      subscribeDelivery: listener => {
+        terminalPanelManager.on('initial-input-delivery', listener);
+        return () => { terminalPanelManager.off('initial-input-delivery', listener); };
+      },
+      log: (message, error) => console.warn(message, error),
+    });
+  }
+  const sessionInbox = services.sessionInbox;
 
   commandRegistry.register('runpane:doctor', async (): Promise<RunpaneDoctorResult> => {
     return withRunpaneAction(services, 'doctor', {}, async () => {
@@ -411,6 +452,7 @@ export function registerRunpaneHandlers(
         },
         daemon: {
           channels: [...runpaneDaemonChannels()],
+          features: [...RUNPANE_DAEMON_FEATURES],
           executableHealth: await collectRemoteDaemonExecutableHealthAsync(getAppDirectory()),
         },
         repos: {
@@ -842,6 +884,8 @@ export function registerRunpaneHandlers(
             readyTimeoutMs: normalized.readyTimeoutMs,
             activate: resolvePaneCreateActivation(normalized, item),
             associateSession: normalized.associateSession,
+            expectReport: normalized.expectReport,
+            source: normalized.source,
           });
           if (normalized.focus === true) requestHostDesktopFocus(created);
           return created;
@@ -879,12 +923,7 @@ export function registerRunpaneHandlers(
             throw new Error(`Worktree path is already registered by pane "${existing.name}" (${existing.id})`);
           }
           const tool = resolveToolSpec(item.tool, new PathResolver(repo).environment);
-          if (item.resume && tool.launchMode === 'wrapped') {
-            throw new Error('--resume needs a built-in agent command; a wrapper command resumes its own way.');
-          }
-          if (item.resume !== undefined && tool.agent === 'opencode' && !isValidOpenCodeSessionId(item.resume)) {
-            throw new Error('OpenCode --resume must match the required ses_* format (^ses_[A-Za-z0-9]+$).');
-          }
+          assertResumableTool(tool, item.resume);
           if (normalized.dryRun) {
             items.push({ ok: true, index, name: item.name, pinned: item.pinned !== false, worktreePath: storedWorktreePath, tool: describeTool(tool) });
             continue;
@@ -1067,11 +1106,15 @@ export function registerRunpaneHandlers(
         throw new Error(`No Pane repo found for pane ${pane.id}`);
       }
       const tool = resolveToolSpec(normalized.tool, new PathResolver(repo).environment);
-      const { panel, readiness, initialInput, promptFile, warnings } = await createTerminalPanelForSession(services, pane, tool, {
+      assertResumableTool(tool, normalized.resume);
+      const { panel, readiness, initialInput, promptFile, attachments, warnings } = await createTerminalPanelForSession(services, pane, tool, {
+        expectReport: shouldExpectReport(normalized, Boolean(tool.initialInput)),
         activate: resolvePanelCreateActivation(normalized, tool),
+        agentSessionId: normalized.resume,
         waitReady: normalized.waitReady,
         readyTimeoutMs: normalized.readyTimeoutMs,
       });
+      const expectedReport = services.expectedReportTracker?.expectation(panel.id);
 
       return {
         ok: Boolean((!readiness || readiness.ok) && isInitialInputDelivered(initialInput, readiness)),
@@ -1084,7 +1127,9 @@ export function registerRunpaneHandlers(
         readiness,
         initialInput,
         promptFile,
+        attachments,
         warnings,
+        expectedReport,
         nextCommand: initialInput?.nextCommand ?? readiness?.nextCommand ?? panelOutputCommand(panel.id),
       };
     }, result => ({
@@ -1161,6 +1206,11 @@ export function registerRunpaneHandlers(
       const normalized = parsePanelOutputRequest(request);
       const panel = resolvePanel(normalized.panelId);
       const limit = normalized.limit ?? DEFAULT_PANEL_OUTPUT_LIMIT;
+      if (agentChatManager.mode(panel.id) === 'chat') {
+        const full = chatText(agentChatManager.view(panel.id));
+        const text = full.slice(-Math.min(limit * 1000, 200_000));
+        return { ok: true, panelId: panel.id, paneId: panel.sessionId, limit, returnedCount: text ? 1 : 0, hasMore: text.length < full.length, outputs: text ? [{ type: 'acp-transcript', data: text, timestamp: new Date().toISOString() }] : [], text };
+      }
       const scrollbackResult = panel.type === 'terminal' ? await panelScrollbackOutput(panel, limit) : null;
 
       if (scrollbackResult) {
@@ -1209,6 +1259,7 @@ export function registerRunpaneHandlers(
     return withRunpaneAction(services, 'panels:input', {}, () => {
       const normalized = parsePanelInputRequest(request);
       const panel = resolvePanel(normalized.panelId);
+      assertRawTerminal(panel.id);
 
       if (panel.type !== 'terminal') {
         throw new Error(`Panel ${panel.id} is a ${panel.type} panel, not a terminal panel`);
@@ -1325,6 +1376,7 @@ export function registerRunpaneHandlers(
     return withRunpaneAction(services, 'panels:screen', {}, async () => {
       const normalized = parsePanelScreenRequest(request);
       const panel = resolveTerminalPanel(normalized.panelId);
+      assertRawTerminal(panel.id);
       return await buildPanelScreenResult(panel, normalized.limit ?? DEFAULT_PANEL_SCREEN_LIMIT);
     }, result => ({
       paneId: result.paneId,
@@ -1338,163 +1390,37 @@ export function registerRunpaneHandlers(
     return withRunpaneAction(services, 'panels:submit', {}, async () => {
       const normalized = parsePanelSubmitRequest(request);
       const panel = resolveTerminalPanel(normalized.panelId);
+      const mode = agentChatManager.mode(panel.id);
+      if (mode && mode !== 'terminal') {
+        if (normalized.source === 'user') getMobilePushSender(configManager).arm(panel.id);
+        const pointer = normalized.asFilePointer ? await writeAgentPromptFile(panel.sessionId, normalized.input, {
+          worktreePath: localWorktreePath(services, panel.sessionId, sessionWslContext(services, panel.sessionId)), attachments: normalized.attachments,
+        }) : undefined;
+        const expected = shouldExpectReport(normalized, true) ? services.expectedReportTracker?.arm(panel.id, new Date().toISOString(), true) : undefined;
+        try {
+          const result = await submitChat(panel, pointer ? pointerLine(pointer, sessionWslContext(services, panel.sessionId)) : normalized.input, normalized.interrupt ?? false, normalized.operationId);
+          if (expected) { services.expectedReportTracker?.delivered(panel.id); result.expectedReport = { since: expected.since }; }
+          return { ...result, ...pointerResultFields(pointer) };
+        } catch (error) { if (expected) services.expectedReportTracker?.cancelPending(panel.id, expected); throw error; }
+      }
       if (!terminalPanelManager.isTerminalInitialized(panel.id)) {
         throw new Error(`Terminal panel ${panel.id} is not initialized`);
       }
       if (normalized.source === 'user') getMobilePushSender(configManager).arm(panel.id);
-
-      const blocked = (message: string): RunpanePanelSubmitResult => ({
-        ok: false, panelId: panel.id, paneId: panel.sessionId, inputBytes: 0,
-        enter: 'cr', sequenceName: 'enter-cr', verifiedSubmitted: false,
-        sentAt: new Date().toISOString(),
-        blocked: { kind: 'agent-prompt', message, suggestedCommand: panelScreenCommand(panel.id) },
-        nextCommand: panelScreenCommand(panel.id),
-      });
-      if (normalized.interrupt && !normalized.input.trim()) return blocked('An interrupt submission needs replacement text; no input was sent.');
-
-      let beforeScreen = await buildPanelScreenResult(panel, DEFAULT_PANEL_SCREEN_LIMIT);
-      const promptFile = normalized.asFilePointer
-        ? await writePromptFile(panel.sessionId, stripTrailingNewlines(normalizePromptNewlines(normalized.input)))
-        : undefined;
-      const submittedText = promptFile
-        ? filePointerPrompt(agentVisiblePath(promptFile, sessionWslContext(services, panel.sessionId)))
-        : normalized.input;
-      // A CR inside the text would be Enter to an agent composer.
-      const stagedInput = stripTrailingNewlines(normalizePromptNewlines(submittedText));
-      const agentType = screenAgentType(beforeScreen);
-      if (normalized.interrupt) {
-        const ready = (screen: RunpanePanelScreenResult): boolean =>
-          screenAgentType(screen) === agentType && screen.state.activityStatus === 'idle' &&
-          (agentType === 'cursor'
-            ? detectAgentState(CURSOR_MANIFEST, { screen: screen.text, oscTitle: '', oscProgress: '' }).visibleIdle === true &&
-              /^\s*→\s+(?:Add a follow-up|Plan, search, build anything)\s*$/imu.test(screen.text)
-            : screen.composer.isPresent && !screen.composer.hasUndeliveredText);
-        if (agentType !== 'codex' && agentType !== 'claude' && agentType !== 'cursor') {
-          return blocked('Pane cannot safely interrupt this agent: composer readiness is not supported. No input was sent.');
-        }
-        if (beforeScreen.composer.hasUndeliveredText) {
-          return blocked('The composer already contains text. Resolve it before using --interrupt; no input was sent.');
-        }
-        if (beforeScreen.state.activityStatus === 'active') {
-          terminalPanelManager.writeToTerminal(panel.id, agentType === 'cursor' ? '\x03' : '\x1b');
-          // Activity stays working for 10 seconds after the final interrupt redraw.
-          beforeScreen = await waitForPanelScreen(panel, ready, DEFAULT_PANEL_WAIT_TIMEOUT_MS);
-        }
-        if (!ready(beforeScreen)) {
-          return blocked('The agent did not reach an empty idle composer. The replacement text was not sent; inspect the screen before retrying.');
-        }
-        if (agentType === 'cursor') {
-          const generation = terminalPanelManager.getOutputGeneration(panel.id);
-          const input = ensureSubmitEnter(stagedInput);
-          terminalPanelManager.writeToTerminal(panel.id, input);
-          const screen = await waitForPanelScreen(panel, current =>
-            panelHasFreshOutputSince(panel.id, generation) &&
-            detectAgentState(CURSOR_MANIFEST, { screen: current.text, oscTitle: '', oscProgress: '' }).visibleWorking === true,
-          );
-          const taken = panelHasFreshOutputSince(panel.id, generation) &&
-            detectAgentState(CURSOR_MANIFEST, { screen: screen.text, oscTitle: '', oscProgress: '' }).visibleWorking === true;
-          return {
-            ...blocked('Pane sent the replacement, but could not verify that Cursor started it. Inspect the screen before retrying.'),
-            ok: taken, verifiedSubmitted: taken, inputBytes: Buffer.byteLength(input, 'utf8'),
-            delivery: { state: taken ? 'taken' : 'unknown', evidence: 'screen' },
-            blocked: taken ? undefined : { kind: 'submission_unverified', message: 'Pane sent the replacement but could not verify that Cursor started it. Inspect the screen before retrying.' },
-            promptFile,
-          };
-        }
+      const since = new Date().toISOString();
+      let expectedReport: TerminalExpectedReport | undefined;
+      try {
+        const result = await submitToPanel(normalized, panel, screen => {
+          const toAgent = screen.state.agentType !== undefined || panelLaunchCommand(panel) !== undefined;
+          if (shouldExpectReport(normalized, toAgent)) expectedReport = services.expectedReportTracker?.arm(panel.id, since, true);
+        }, () => { if (expectedReport) services.expectedReportTracker?.delivered(panel.id); });
+        if (result.inputBytes === 0 && expectedReport) services.expectedReportTracker?.cancelPending(panel.id, expectedReport);
+        else if (expectedReport) result.expectedReport = { since: expectedReport.since };
+        return result;
+      } catch (error) {
+        if (expectedReport) services.expectedReportTracker?.cancelPending(panel.id, expectedReport);
+        throw error;
       }
-      const warnings = agentType === 'claude' ? claudePromptWarnings(stagedInput) : undefined;
-      // Claude reads text and Enter arriving in one read as a paste and keeps
-      // the Enter as a newline. Terminal readiness can precede Claude drawing
-      // its UI or reading input, so wait while it is still drawing for its
-      // composer, then for the staged text to show, before sending Enter alone.
-      // Claude draws its UI on the alternate screen, so a quiet alternate
-      // screen without a composer is a menu or picker and gets the plain
-      // write. Startup can pause for seconds before the first frame.
-      if (stagedInput.length > 0 && agentType === 'claude' && !beforeScreen.composer.isPresent) {
-        beforeScreen = await waitForPanelScreen(
-          panel,
-          screen => screen.composer.isPresent ||
-            (screen.state.isAlternateScreen === true && !panelHasOutputWithin(panel.id, CLAUDE_UI_QUIET_MS)),
-        );
-      }
-      const stagesComposer = beforeScreen.composer.isPresent && (agentType === 'claude' ||
-        agentType === 'codex');
-      if (stagedInput.length > 0 && stagesComposer && (agentType === 'claude' || agentType === 'codex')) {
-        // Claude takes a separately written Enter while it works (it queues
-        // the message), so staging never waits for it to be idle.
-        const staged = await stageComposerText(panel, agentType, stagedInput);
-        const submission = await submitComposerForPanel(panel, normalized.interrupt ? 'enter' : 'auto', {
-          cwd: sessionManager.getSession(panel.sessionId)?.worktreePath,
-          text: stagedInput,
-        });
-        return {
-          ok: normalized.interrupt ? submission.delivery?.state === 'taken' : submission.ok,
-          panelId: panel.id,
-          paneId: panel.sessionId,
-          inputBytes: staged.inputBytes + submission.inputBytes,
-          enter: submission.strategy === 'tab' ? 'tab' : 'cr',
-          sequenceName: submission.sequenceName,
-          verifiedSubmitted: submission.verifiedSubmitted,
-          verification: submission.verification,
-          delivery: submission.delivery,
-          sentAt: submission.sentAt,
-          blocked: submission.blocked,
-          promptFile,
-          warnings,
-          nextCommand: submission.nextCommand,
-        };
-      }
-
-      if (stagedInput.length > 0 && isComposerUnknown(panel, beforeScreen, agentType)) {
-        const suggestedCommand = panelScreenCommand(panel.id);
-        return {
-          ok: false,
-          panelId: panel.id,
-          paneId: panel.sessionId,
-          inputBytes: 0,
-          enter: 'cr',
-          sequenceName: 'enter-cr',
-          verifiedSubmitted: false,
-          sentAt: new Date().toISOString(),
-          blocked: {
-            kind: 'composer-unknown',
-            message: `Pane could not find the ${agentType === 'codex' ? 'Codex' : 'Claude'} composer in this panel, so it sent nothing. The agent may still be starting, or showing a view without its prompt. Check the screen, then submit again or use \`panels input\`.`,
-            suggestedCommand,
-          },
-          promptFile,
-          warnings,
-          nextCommand: suggestedCommand,
-        };
-      }
-
-      // An agent's CRs inside the text would each be an Enter; a shell keeps its bytes.
-      const input = ensureSubmitEnter(agentType === 'claude' || agentType === 'codex' ? stagedInput : submittedText);
-      // A busy Codex takes text and Enter in one write and holds the message
-      // for its next turn; its transcript or queue hint says where it went.
-      const probeBase = agentType === 'codex' && beforeScreen.composer.isPresent && stagedInput.length > 0
-        ? composerDeliveryProbe(panel, sessionManager.getSession(panel.sessionId)?.worktreePath, agentType, stagedInput)
-        : undefined;
-      const probe = probeBase ? { ...probeBase, sentAtMs: Date.now() } : undefined;
-      const outputGenerationBeforeWrite = terminalPanelManager.getOutputGeneration(panel.id);
-      terminalPanelManager.writeToTerminal(panel.id, input);
-      const verification = probe
-        ? await verifyComposerSubmitted(panel, beforeScreen, outputGenerationBeforeWrite, probe)
-        : undefined;
-
-      return {
-        ok: true,
-        panelId: panel.id,
-        paneId: panel.sessionId,
-        inputBytes: Buffer.byteLength(input, 'utf8'),
-        enter: 'cr',
-        sequenceName: 'enter-cr',
-        verifiedSubmitted: verification?.verifiedSubmitted ?? false,
-        delivery: verification?.delivery,
-        sentAt: new Date().toISOString(),
-        promptFile,
-        warnings,
-        nextCommand: panelWaitCommand(panel.id),
-      };
     }, result => ({
       paneId: result.paneId,
       panelId: result.panelId,
@@ -1502,10 +1428,174 @@ export function registerRunpaneHandlers(
     }));
   });
 
+  async function submitToPanel(normalized: RunpanePanelSubmitRequest, panel: ToolPanel, reserve: (screen: RunpanePanelScreenResult) => void, beforeDelivery: () => void): Promise<RunpanePanelSubmitResult> {
+    const blocked = (message: string): RunpanePanelSubmitResult => ({
+      ok: false, panelId: panel.id, paneId: panel.sessionId, inputBytes: 0,
+      enter: 'cr', sequenceName: 'enter-cr', verifiedSubmitted: false,
+      sentAt: new Date().toISOString(),
+      blocked: { kind: 'agent-prompt', message, suggestedCommand: panelScreenCommand(panel.id) },
+      nextCommand: panelScreenCommand(panel.id),
+    });
+    if (normalized.interrupt && !normalized.input.trim()) return blocked('An interrupt submission needs replacement text; no input was sent.');
+
+    let beforeScreen = await buildPanelScreenResult(panel, DEFAULT_PANEL_SCREEN_LIMIT);
+    reserve(beforeScreen);
+    const wslContext = sessionWslContext(services, panel.sessionId);
+    const pointer = normalized.asFilePointer
+      ? await writeAgentPromptFile(panel.sessionId, stripTrailingNewlines(normalizePromptNewlines(normalized.input)), {
+        worktreePath: localWorktreePath(services, panel.sessionId, wslContext),
+        attachments: normalized.attachments,
+      })
+      : undefined;
+    const promptFields = pointerResultFields(pointer);
+    const submittedText = pointer
+      ? pointerLine(pointer, wslContext)
+      : normalized.input;
+    // A CR inside the text would be Enter to an agent composer.
+    const stagedInput = stripTrailingNewlines(normalizePromptNewlines(submittedText));
+    const agentType = screenAgentType(beforeScreen);
+    if (normalized.interrupt) {
+      const ready = (screen: RunpanePanelScreenResult): boolean =>
+        screenAgentType(screen) === agentType && screen.state.activityStatus === 'idle' &&
+        (agentType === 'cursor'
+          ? detectAgentState(CURSOR_MANIFEST, { screen: screen.text, oscTitle: '', oscProgress: '' }).visibleIdle === true &&
+            /^\s*→\s+(?:Add a follow-up|Plan, search, build anything)\s*$/imu.test(screen.text)
+          : screen.composer.isPresent && !screen.composer.hasUndeliveredText);
+      if (agentType !== 'codex' && agentType !== 'claude' && agentType !== 'cursor') {
+        return blocked('Pane cannot safely interrupt this agent: composer readiness is not supported. No input was sent.');
+      }
+      if (beforeScreen.composer.hasUndeliveredText) {
+        return blocked('The composer already contains text. Resolve it before using --interrupt; no input was sent.');
+      }
+      if (beforeScreen.state.activityStatus === 'active') {
+        terminalPanelManager.writeToTerminal(panel.id, agentType === 'cursor' ? '\x03' : '\x1b');
+        // Activity stays working for 10 seconds after the final interrupt redraw.
+        beforeScreen = await waitForPanelScreen(panel, ready, DEFAULT_PANEL_WAIT_TIMEOUT_MS);
+      }
+      if (!ready(beforeScreen)) {
+        return blocked('The agent did not reach an empty idle composer. The replacement text was not sent; inspect the screen before retrying.');
+      }
+      if (agentType === 'cursor') {
+        const generation = terminalPanelManager.getOutputGeneration(panel.id);
+        const input = ensureSubmitEnter(stagedInput);
+        beforeDelivery();
+        terminalPanelManager.writeToTerminal(panel.id, input);
+        const screen = await waitForPanelScreen(panel, current =>
+          panelHasFreshOutputSince(panel.id, generation) &&
+          detectAgentState(CURSOR_MANIFEST, { screen: current.text, oscTitle: '', oscProgress: '' }).visibleWorking === true,
+        );
+        const taken = panelHasFreshOutputSince(panel.id, generation) &&
+          detectAgentState(CURSOR_MANIFEST, { screen: screen.text, oscTitle: '', oscProgress: '' }).visibleWorking === true;
+        return {
+          ...blocked('Pane sent the replacement, but could not verify that Cursor started it. Inspect the screen before retrying.'),
+          ok: taken, verifiedSubmitted: taken, inputBytes: Buffer.byteLength(input, 'utf8'),
+          delivery: { state: taken ? 'taken' : 'unknown', evidence: 'screen' },
+          blocked: taken ? undefined : { kind: 'submission_unverified', message: 'Pane sent the replacement but could not verify that Cursor started it. Inspect the screen before retrying.' },
+          ...promptFields,
+        };
+      }
+    }
+    const warnings = agentType === 'claude' ? claudePromptWarnings(stagedInput) : undefined;
+    // Claude reads text and Enter arriving in one read as a paste and keeps
+    // the Enter as a newline. Terminal readiness can precede Claude drawing
+    // its UI or reading input, so wait while it is still drawing for its
+    // composer, then for the staged text to show, before sending Enter alone.
+    // Claude draws its UI on the alternate screen, so a quiet alternate
+    // screen without a composer is a menu or picker and gets the plain
+    // write. Startup can pause for seconds before the first frame.
+    if (stagedInput.length > 0 && agentType === 'claude' && !beforeScreen.composer.isPresent) {
+      beforeScreen = await waitForPanelScreen(
+        panel,
+        screen => screen.composer.isPresent ||
+          (screen.state.isAlternateScreen === true && !panelHasOutputWithin(panel.id, CLAUDE_UI_QUIET_MS)),
+      );
+    }
+    const stagesComposer = beforeScreen.composer.isPresent && (agentType === 'claude' ||
+      agentType === 'codex');
+    if (stagedInput.length > 0 && stagesComposer && (agentType === 'claude' || agentType === 'codex')) {
+      // Claude takes a separately written Enter while it works (it queues
+      // the message), so staging never waits for it to be idle.
+      const staged = await stageComposerText(panel, agentType, stagedInput);
+      const submission = await submitComposerForPanel(panel, normalized.interrupt ? 'enter' : 'auto', {
+        cwd: sessionManager.getSession(panel.sessionId)?.worktreePath,
+        text: stagedInput,
+      }, beforeDelivery);
+      return {
+        ok: normalized.interrupt ? submission.delivery?.state === 'taken' : submission.ok,
+        panelId: panel.id,
+        paneId: panel.sessionId,
+        inputBytes: staged.inputBytes + submission.inputBytes,
+        enter: submission.strategy === 'tab' ? 'tab' : 'cr',
+        sequenceName: submission.sequenceName,
+        verifiedSubmitted: submission.verifiedSubmitted,
+        verification: submission.verification,
+        delivery: submission.delivery,
+        sentAt: submission.sentAt,
+        blocked: submission.blocked,
+        ...promptFields,
+        warnings,
+        nextCommand: submission.nextCommand,
+      };
+    }
+
+    if (stagedInput.length > 0 && isComposerUnknown(panel, beforeScreen, agentType)) {
+      const suggestedCommand = panelScreenCommand(panel.id);
+      return {
+        ok: false,
+        panelId: panel.id,
+        paneId: panel.sessionId,
+        inputBytes: 0,
+        enter: 'cr',
+        sequenceName: 'enter-cr',
+        verifiedSubmitted: false,
+        sentAt: new Date().toISOString(),
+        blocked: {
+          kind: 'composer-unknown',
+          message: `Pane could not find the ${agentType === 'codex' ? 'Codex' : 'Claude'} composer in this panel, so it sent nothing. The agent may still be starting, or showing a view without its prompt. Check the screen, then submit again or use \`panels input\`.`,
+          suggestedCommand,
+        },
+        ...promptFields,
+        warnings,
+        nextCommand: suggestedCommand,
+      };
+    }
+
+    // An agent's CRs inside the text would each be an Enter; a shell keeps its bytes.
+    const input = ensureSubmitEnter(agentType === 'claude' || agentType === 'codex' ? stagedInput : submittedText);
+    // A busy Codex takes text and Enter in one write and holds the message
+    // for its next turn; its transcript or queue hint says where it went.
+    const probeBase = agentType === 'codex' && beforeScreen.composer.isPresent && stagedInput.length > 0
+      ? composerDeliveryProbe(panel, sessionManager.getSession(panel.sessionId)?.worktreePath, agentType, stagedInput)
+      : undefined;
+    const probe = probeBase ? { ...probeBase, sentAtMs: Date.now() } : undefined;
+    const outputGenerationBeforeWrite = terminalPanelManager.getOutputGeneration(panel.id);
+    beforeDelivery();
+    terminalPanelManager.writeToTerminal(panel.id, input);
+    const verification = probe
+      ? await verifyComposerSubmitted(panel, beforeScreen, outputGenerationBeforeWrite, probe)
+      : undefined;
+
+    return {
+      ok: true,
+      panelId: panel.id,
+      paneId: panel.sessionId,
+      inputBytes: Buffer.byteLength(input, 'utf8'),
+      enter: 'cr',
+      sequenceName: 'enter-cr',
+      verifiedSubmitted: verification?.verifiedSubmitted ?? false,
+      delivery: verification?.delivery,
+      sentAt: new Date().toISOString(),
+      ...promptFields,
+      warnings,
+      nextCommand: panelWaitCommand(panel.id),
+    };
+  }
+
   commandRegistry.register('runpane:panels:submit-composer', async (request: PaneCommandValue): Promise<RunpanePanelSubmitComposerResult> => {
     return withRunpaneAction(services, 'panels:submit-composer', {}, async () => {
       const normalized = parsePanelSubmitComposerRequest(request);
       const panel = resolveTerminalPanel(normalized.panelId);
+      assertRawTerminal(panel.id);
       if (!terminalPanelManager.isTerminalInitialized(panel.id)) {
         throw new Error(`Terminal panel ${panel.id} is not initialized`);
       }
@@ -1586,6 +1676,30 @@ export function registerRunpaneHandlers(
     });
   }
 
+  commandRegistry.register('runpane:inbox:list', async (request: PaneCommandValue): Promise<RunpaneInboxListResult> => {
+    return withRunpaneAction(services, 'inbox:list', {}, async () => {
+      const { session } = decodeBoundary(request, inboxListRequestSchema);
+      const record = await requireOrchestrationSessionManager(services).get({ sessionId: session });
+      return { ok: true, session: { id: record.id, name: record.name }, items: sessionInbox.list(record.id) };
+    }, result => ({ resultCount: result.items.length }));
+  });
+
+  commandRegistry.register('runpane:inbox:ack', async (request: PaneCommandValue): Promise<RunpaneInboxAckResult> => {
+    return withRunpaneAction(services, 'inbox:ack', {}, async () => {
+      const normalized = decodeBoundary(request, inboxAckRequestSchema);
+      const sessionId = normalized.session
+        ? (await requireOrchestrationSessionManager(services).get({ sessionId: normalized.session })).id
+        : undefined;
+      if (normalized.all) {
+        if (!sessionId) throw new Error('Clearing every inbox item needs a Session: pass session with all.');
+        return { ok: true, acknowledged: sessionInbox.ackAll(sessionId), unknown: [] };
+      }
+      const ids = normalized.ids?.map(id => id.trim()).filter(Boolean) ?? [];
+      if (ids.length === 0) throw new Error('Name the inbox items to clear (ids), or pass all with a session.');
+      return { ok: true, ...sessionInbox.ack(ids, sessionId) };
+    }, result => ({ resultCount: result.acknowledged.length }));
+  });
+
   commandRegistry.register('runpane:workspace:state', async (request: PaneCommandValue = {}): Promise<RunpaneWorkspaceStateResult> => {
     return withRunpaneAction(services, 'workspace:state', {}, () => {
       const normalized = parsePaneListRequest(request);
@@ -1597,7 +1711,8 @@ export function registerRunpaneHandlers(
     }, result => ({ resultCount: result.entries.length }));
   });
 
-  const watchLeases = new WorkspaceWatchLeases();
+  const watchLeases = services.workspaceWatchLeases ?? new WorkspaceWatchLeases();
+  services.workspaceWatchLeases = watchLeases;
   commandRegistry.register('runpane:workspace:wait', async (request: PaneCommandValue = {}): Promise<RunpaneWorkspaceWaitResult> => {
     return withRunpaneAction(services, 'workspace:wait', {}, async () => {
       const normalized = parseWorkspaceWaitRequest(request);
@@ -1943,8 +2058,8 @@ function panelToSummary(panel: ToolPanel, dockPanelId?: string, launchExited = f
     type: panel.type,
     title: panel.title,
     active: Boolean(panel.state.isActive),
-    initialized: panel.type === 'terminal' ? terminalPanelManager.isTerminalInitialized(panel.id) : undefined,
-    running: panel.type === 'terminal' ? terminalPanelManager.isTerminalInitialized(panel.id) && !launchExited : undefined,
+    initialized: panel.type === 'terminal' ? terminalPanelManager.isAgentRuntimeInitialized(panel.id) : undefined,
+    running: panel.type === 'terminal' ? terminalPanelManager.isAgentRuntimeInitialized(panel.id) && !launchExited : undefined,
     agentType,
     agentDetection,
     launchCommand: optionalString(customState.launchCommand) ?? initialCommand,
@@ -1968,6 +2083,40 @@ async function storePanelAgentReport(panel: ToolPanel, report: TerminalAgentRepo
   });
 }
 
+/** What a panel's agent still runs in the background, read from its live screen. */
+function readPanelBackgroundWork(panelId: string): string | undefined {
+  const panel = panelManager.getPanel(panelId);
+  const snapshot = terminalPanelManager.getTerminalSnapshot(panelId);
+  if (!panel || !snapshot?.screenText) return undefined;
+  const agentType = panelStateSummary(panel, snapshot).agentType;
+  return detectAgentBackgroundWork(snapshot.screenText, isCliAgentType(agentType) ? agentType : undefined);
+}
+
+/** At most this many screen lines stand in for an agent's last reply. */
+const LAST_OUTPUT_SCREEN_LINES = 20;
+
+/** What an agent said last: its transcript reply, or else the bottom of its screen. */
+async function readPanelLastOutput(panelId: string, sessionManager: AppServices['sessionManager']): Promise<PanelLastOutput | undefined> {
+  const panel = panelManager.getPanel(panelId);
+  if (!panel) return undefined;
+  const message = await readPanelLastMessage(panel, sessionManager.getSession(panel.sessionId)?.worktreePath, MAX_MISSING_REPORT_OUTPUT_LENGTH);
+  if (message.ok) return { text: message.text, source: 'transcript' };
+  const screenText = terminalPanelManager.getTerminalSnapshot(panelId)?.screenText;
+  if (!screenText) return undefined;
+  const lines = screenText.split('\n').map(line => line.trimEnd()).filter(line => line.trim().length > 0);
+  return { text: lines.slice(-LAST_OUTPUT_SCREEN_LINES).join('\n'), source: 'screen' };
+}
+
+/**
+ * Whether the sender of a panel's work waits for a `runpane report`. `--expect-report` and
+ * `--no-expect-report` decide it; otherwise work sent through runpane expects a report unless a
+ * person sent it (`source: 'user'`, as Pane's own UI does). Typing into a tab never reaches here.
+ */
+function shouldExpectReport(request: { expectReport?: boolean; source?: 'user' | 'agent' }, carriesWork: boolean): boolean {
+  if (request.expectReport !== undefined) return request.expectReport;
+  return carriesWork && request.source !== 'user';
+}
+
 /**
  * The agent's last reply from its transcript, bounded to `limit` characters (the tail is kept).
  * Without a transcript this reports `transcript-unavailable`; it never falls back to the screen.
@@ -1977,6 +2126,7 @@ async function readPanelLastMessage(
   cwd: string | undefined,
   limit: number,
 ): Promise<RunpanePanelLastMessageResult> {
+  if (agentChatManager.mode(panel.id) === 'chat') return chatLastMessage(panel, limit);
   const agentType = panelStateSummary(panel, terminalPanelManager.getTerminalSnapshot(panel.id)).agentType;
   const unavailable = (message: string): RunpanePanelLastMessageResult => ({
     ok: false,
@@ -2011,9 +2161,12 @@ interface PaneCreateItemOptions {
   readyTimeoutMs?: number;
   activate?: boolean;
   associateSession?: string;
+  expectReport?: boolean;
+  source?: 'user' | 'agent';
 }
 
 interface TerminalPanelCreateOptions {
+  expectReport?: boolean;
   activate?: boolean;
   waitReady?: boolean;
   readyTimeoutMs?: number;
@@ -2028,6 +2181,7 @@ interface TerminalPanelCreateResult {
   readiness?: RunpanePaneReadiness;
   initialInput?: RunpaneInitialInputDeliveryResult;
   promptFile?: string;
+  attachments?: string[];
   warnings?: RunpanePromptWarning[];
 }
 
@@ -2039,6 +2193,8 @@ interface PreparedInitialInput {
   initialInputFile?: string;
   /** Prompt file written for `--as-file-pointer`. */
   promptFile?: string;
+  /** Copies of its `--attach` files beside it. */
+  attachments?: string[];
   warnings?: RunpanePromptWarning[];
 }
 
@@ -2062,24 +2218,69 @@ async function prepareInitialInput(
   // Agent composers read CR as Enter; plain terminals keep their bytes.
   let text = tool.agent ? stripTrailingNewlines(normalizePromptNewlines(tool.initialInput)) : tool.initialInput;
   let promptFile: string | undefined;
+  let attachments: string[] | undefined;
   if (tool.initialInputAsFilePointer) {
-    promptFile = await writePromptFile(session.id, text);
-    text = filePointerPrompt(agentVisiblePath(promptFile, wslContext));
+    const pointer = await writeAgentPromptFile(session.id, text, {
+      worktreePath: wslContext ? undefined : session.worktreePath,
+      attachments: tool.initialInputAttachments,
+    });
+    ({ promptFile, attachments } = pointerResultFields(pointer));
+    text = pointerLine(pointer, wslContext);
   }
   const prepared: RunpaneResolvedTool = { ...tool, initialInput: text };
   const warnings = tool.agent === 'claude' ? claudePromptWarnings(text) : undefined;
 
   const useArgumentDelivery = allowArgumentDelivery && shouldUseArgumentDelivery(prepared);
   if (!useArgumentDelivery || !isLongPrompt(text)) {
-    return { tool: prepared, useArgumentDelivery, promptFile, warnings };
+    return { tool: prepared, useArgumentDelivery, promptFile, attachments, warnings };
   }
   if (terminalPanelManager.launchShellReadsPromptFile(wslContext)) {
     const initialInputFile = await writePromptFile(session.id, text);
     if (promptFileShellWord(initialInputFile)) {
-      return { tool: prepared, useArgumentDelivery: true, initialInputFile, promptFile, warnings };
+      return { tool: prepared, useArgumentDelivery: true, initialInputFile, promptFile, attachments, warnings };
     }
   }
-  return { tool: prepared, useArgumentDelivery: false, promptFile, warnings };
+  return { tool: prepared, useArgumentDelivery: false, promptFile, attachments, warnings };
+}
+
+/**
+ * The folder of the Session a worker's Pane belongs to, as its agent sees it,
+ * when that folder exists. Workers read it (dispatch notes, plans) and never
+ * write it; the Session's orchestrator is its only writer.
+ */
+async function workerSessionFolder(services: AppServices, paneId: string, wslContext: WSLContext | null): Promise<string | undefined> {
+  const sessionId = await services.orchestrationSessionManager?.sessionIdForPane(paneId);
+  if (!sessionId) return undefined;
+  const folder = sessionWorkspacePath(sessionId);
+  if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) return undefined;
+  return agentVisiblePath(folder, wslContext);
+}
+
+/**
+ * The pointer line. Files inside the worktree are named relative to it, where
+ * the agent starts: Claude often reads an absolute path with `cd <dir>; cat`,
+ * which its read check cannot verify. Fallback files keep absolute paths.
+ */
+function pointerLine(pointer: AgentPromptFile, wslContext: WSLContext | null): string {
+  const { worktreeRoot } = pointer;
+  const shown = (file: string): string => worktreeRoot ? path.relative(worktreeRoot, file) : agentVisiblePath(file, wslContext);
+  return filePointerPrompt(shown(pointer.file), pointer.attachments.map(shown));
+}
+
+/** `promptFile` and `attachments` result fields for a written prompt file. */
+interface PointerResultFields {
+  promptFile?: string;
+  attachments?: string[];
+}
+
+function pointerResultFields(pointer: AgentPromptFile | undefined): PointerResultFields {
+  if (!pointer) return {};
+  return pointer.attachments.length > 0 ? { promptFile: pointer.file, attachments: pointer.attachments } : { promptFile: pointer.file };
+}
+
+/** The Pane's worktree when Pane can write into it directly; WSL repos keep prompt files in the Pane directory. */
+function localWorktreePath(services: AppServices, paneId: string, wslContext: WSLContext | null): string | undefined {
+  return wslContext ? undefined : services.sessionManager.getSession(paneId)?.worktreePath;
 }
 
 /** A Pane-side file path as the agent's shell sees it (a WSL mount path for WSL repos). */
@@ -2098,14 +2299,20 @@ async function createTerminalPanelForSession(
   options: TerminalPanelCreateOptions,
 ): Promise<TerminalPanelCreateResult> {
   const wslContext = sessionWslContext(services, session.id);
-  const { tool, useArgumentDelivery, initialInputFile, promptFile, warnings } = await prepareInitialInput(
+  const sessionFolder = await workerSessionFolder(services, session.id, wslContext);
+  const prepared = await prepareInitialInput(
     session,
-    requestedTool,
+    sessionFolder ? withSessionFolderAccess(requestedTool, sessionFolder) : requestedTool,
     wslContext,
     !options.agentSessionId,
   );
+  const { tool, useArgumentDelivery, initialInputFile, promptFile, attachments, warnings } = prepared;
   const launch = options.launch !== false;
   const waitReady = launch && options.waitReady;
+  // A resumed Codex conversation records the folder it ran in, which for a carried or migrated
+  // session is another checkout or machine; without --cd, Codex stops to ask which folder to use.
+  const pinsCodexFolder = Boolean(options.agentSessionId) && tool.agent === 'codex' && !wslContext
+    && !/(?:^|\s)(?:--cd|-C)(?:=|\s)/.test(tool.command);
   // A waited create delivers its own typed message, to the declared agent or the one Pane detects.
   const shouldCreateSubmitInitialInput = Boolean(
     waitReady &&
@@ -2120,9 +2327,16 @@ async function createTerminalPanelForSession(
       ? 'codex-ctrl-enter'
       : 'enter',
   };
+  if (sessionFolder) {
+    initialState.sessionFolder = sessionFolder;
+  }
   if (options.agentSessionId) {
     initialState.agentSessionId = options.agentSessionId;
     initialState.hasClaudeSessionId = tool.agent === 'claude';
+  }
+  if (pinsCodexFolder) {
+    // The terminal adds `--cd` when it launches, quoted for its own shell.
+    initialState.resumeDirectory = session.worktreePath;
   }
   if (useArgumentDelivery) {
     initialState.initialInputMode = 'argument';
@@ -2149,25 +2363,32 @@ async function createTerminalPanelForSession(
   }
 
   const panel = await panelManager.createPanel(createRequest);
-  await terminalPanelManager.initializeTerminal(panel, session.worktreePath, wslContext);
-  if (!launch) {
-    await terminalPanelManager.stageInitialCommand(panel.id, tool.command);
+  const reservation = options.expectReport && tool.initialInput
+    ? services.expectedReportTracker?.arm(panel.id, new Date().toISOString(), true) : undefined;
+  try {
+    await terminalPanelManager.initializeTerminal(panel, session.worktreePath, wslContext);
+    if (!launch) {
+      await terminalPanelManager.stageInitialCommand(panel.id, tool.command);
+    }
+
+    const readiness = waitReady
+      ? toPaneReadiness(await waitForPanel(panel, {
+        panelId: panel.id,
+        condition: 'ready',
+        timeoutMs: options.readyTimeoutMs ?? DEFAULT_PANEL_WAIT_TIMEOUT_MS,
+        intervalMs: DEFAULT_PANEL_WAIT_INTERVAL_MS,
+      }))
+      : undefined;
+
+    const initialInput = readiness
+      ? await submitCreateInitialInput(panel, tool, useArgumentDelivery, readiness, session.worktreePath)
+      : unawaitedInitialInput(panel, tool, useArgumentDelivery);
+
+    return { panel, readiness, initialInput, promptFile, attachments, warnings };
+  } catch (error) {
+    if (reservation) services.expectedReportTracker?.cancelPending(panel.id, reservation);
+    throw error;
   }
-
-  const readiness = waitReady
-    ? toPaneReadiness(await waitForPanel(panel, {
-      panelId: panel.id,
-      condition: 'ready',
-      timeoutMs: options.readyTimeoutMs ?? DEFAULT_PANEL_WAIT_TIMEOUT_MS,
-      intervalMs: DEFAULT_PANEL_WAIT_INTERVAL_MS,
-    }))
-    : undefined;
-
-  const initialInput = readiness
-    ? await submitCreateInitialInput(panel, tool, useArgumentDelivery, readiness, session.worktreePath)
-    : unawaitedInitialInput(panel, tool, useArgumentDelivery);
-
-  return { panel, readiness, initialInput, promptFile, warnings };
 }
 
 /**
@@ -2289,6 +2510,7 @@ async function submitCreateInitialInput(
   const agent = tool.agent ?? readiness.state.agentType;
   if (!agent) {
     // A plain terminal with no launch command: its bytes as typed, then Enter.
+    terminalPanelManager.emit('initial-input-delivery', panel.id);
     terminalPanelManager.writeToTerminal(panel.id, ensureSubmitEnter(tool.initialInput));
     return { delivered: true, submitted: true, verifiedSubmitted: false, verification: 'unverifiable', inputBytes, nextCommand: panelScreenCommand(panel.id) };
   }
@@ -2449,6 +2671,7 @@ async function submitCreateComposerInput(
     attempts = attempt;
     const beforeScreen = await buildPanelScreenResult(panel, DEFAULT_PANEL_SCREEN_LIMIT);
     const outputGenerationBeforeSubmit = terminalPanelManager.getOutputGeneration(panel.id);
+    terminalPanelManager.emit('initial-input-delivery', panel.id);
     terminalPanelManager.writeToTerminal(panel.id, submit.input);
     const attemptStartedAt = Date.now();
     let retryConfirmed = false;
@@ -2561,6 +2784,7 @@ async function createPaneItem(
   }
 
   const tool = resolveToolSpec(item.tool, new PathResolver(repo).environment);
+  assertResumableTool(tool, item.resume);
 
   let createdSessionId: string | undefined;
   let createdWorktreePath: string | undefined;
@@ -2599,7 +2823,11 @@ async function createPaneItem(
     const setupPosition = taskQueue.setupQueuePosition(session.id);
     if (setupPosition !== undefined) {
       void taskQueue.waitForSetup(session.id)
-        .then(() => createTerminalPanelForSession(services, session, tool, { activate: options.activate }))
+        .then(async () => {
+          await createTerminalPanelForSession(services, session, tool, {
+            activate: options.activate, agentSessionId: item.resume, expectReport: shouldExpectReport(options, Boolean(tool.initialInput)),
+          });
+        })
         .catch(error => console.error(`[Runpane] Pane ${session.id} did not launch after queued setup:`, error));
       return {
         ok: true,
@@ -2621,11 +2849,14 @@ async function createPaneItem(
     }
     await taskQueue.waitForSetup(session.id, Math.max(0, createDeadline - Date.now()));
 
-    const { panel, readiness, initialInput, promptFile, warnings } = await createTerminalPanelForSession(services, session, tool, {
+    const { panel, readiness, initialInput, promptFile, attachments, warnings } = await createTerminalPanelForSession(services, session, tool, {
+      expectReport: shouldExpectReport(options, Boolean(tool.initialInput)),
       activate: options.activate,
+      agentSessionId: item.resume,
       waitReady: options.waitReady,
       readyTimeoutMs: options.readyTimeoutMs,
     });
+    const expectedReport = services.expectedReportTracker?.expectation(panel.id);
 
     const itemOk = Boolean((!readiness || readiness.ok) && isInitialInputDelivered(initialInput, readiness));
     return {
@@ -2645,8 +2876,10 @@ async function createPaneItem(
       initialInput,
       association,
       promptFile,
+      attachments,
       warnings,
       base: sessionResult.base,
+      expectedReport,
     };
   } catch (error) {
     // Two creates for one branch can both pass the early check; name the Pane that won.
@@ -2789,6 +3022,12 @@ async function resumeTerminalPanel(
       intervalMs: DEFAULT_PANEL_WAIT_INTERVAL_MS,
     }))
     : undefined;
+  const managed = agentChatManager.manages(panel.id) ? agentChatManager.view(panel.id).conversation : undefined;
+  if (managed) {
+    if (managed.active === 'stopped') await agentChatManager.recover(panel.id, 'terminal', managed.generation);
+    const restored = panelManager.getPanel(panel.id) ?? panel;
+    return panelResumeResult(restored, managed.active === 'stopped' ? 'resumed' : 'already-running', 'The exact saved conversation is available in its selected interface.', await waitIfAsked(restored));
+  }
   if (terminalPanelManager.isTerminalInitialized(panel.id)) {
     // The agent exited back to Pane's shell: run its saved command there again, once for overlapping resumes.
     if (await terminalPanelManager.relaunchIfExited(panel.id)) {
@@ -2970,6 +3209,8 @@ function getTerminalCustomState(panel: ToolPanel): TerminalPanelState {
 }
 
 async function waitForPanel(panel: ToolPanel, request: RunpanePanelWaitRequest): Promise<RunpanePanelWaitResult> {
+  const mode = agentChatManager.mode(panel.id);
+  if (mode && mode !== 'terminal') return waitForChat(panel, request);
   const startedAt = Date.now();
   const timeoutMs = request.timeoutMs ?? DEFAULT_PANEL_WAIT_TIMEOUT_MS;
   const intervalMs = request.intervalMs ?? DEFAULT_PANEL_WAIT_INTERVAL_MS;
@@ -3303,6 +3544,7 @@ async function submitComposerForPanel(
   panel: ToolPanel,
   strategy: RunpanePanelSubmitComposerStrategy | undefined,
   delivery: { cwd: string | undefined; text?: string },
+  beforeDelivery?: () => void,
 ): Promise<RunpanePanelSubmitComposerResult> {
   const beforeScreen = await buildPanelScreenResult(panel, DEFAULT_PANEL_SCREEN_LIMIT);
   const agentType = screenAgentType(beforeScreen);
@@ -3310,6 +3552,7 @@ async function submitComposerForPanel(
   const probeBase = composerDeliveryProbe(panel, delivery.cwd, agentType, delivery.text);
   const probe = probeBase ? { ...probeBase, sentAtMs: Date.now() } : undefined;
   const outputGenerationBeforeSubmit = terminalPanelManager.getOutputGeneration(panel.id);
+  beforeDelivery?.();
   terminalPanelManager.writeToTerminal(panel.id, submit.input);
   let inputBytes = Buffer.byteLength(submit.input, 'utf8');
   let verification = await verifyComposerSubmitted(panel, beforeScreen, outputGenerationBeforeSubmit, probe);
@@ -4116,12 +4359,15 @@ const workspaceEntryKindSchema = boundary.enumeration(
   'pr.merged',
   'pr.closed',
   'pr.head',
+  'pr.base_changed',
+  'pr.base_deleted',
   'pr.review',
   'pr.comment',
   'pr.stopped',
   'github.unavailable',
   'github.recovered',
   'agent.report',
+  'agent.report.missing',
 );
 
 function parseWorkspaceKinds(value: PaneCommandValue): RunpaneWorkspaceEntryKind[] | undefined {
@@ -4185,6 +4431,7 @@ function parsePaneCreateRequest(value: PaneCommandValue): RunpanePaneCreateReque
     focus: optionalBoolean(value.focus),
     source: value.source === 'user' || value.source === 'agent' ? value.source : undefined,
     associateSession: optionalString(value.associateSession)?.trim() || undefined,
+    expectReport: optionalBoolean(value.expectReport),
   };
 }
 
@@ -4390,6 +4637,8 @@ function parsePanelCreateRequest(value: PaneCommandValue): RunpanePanelCreateReq
     source: value.source === 'user' || value.source === 'agent' ? value.source : undefined,
     waitReady: optionalBoolean(value.waitReady),
     readyTimeoutMs: parsePositiveInteger(value.readyTimeoutMs, 'readyTimeoutMs'),
+    expectReport: optionalBoolean(value.expectReport),
+    resume: parseResumeId(value.resume, 'Panel create request'),
   };
 }
 
@@ -4639,9 +4888,12 @@ function parsePanelSubmitRequest(value: PaneCommandValue): RunpanePanelSubmitReq
   return {
     panelId,
     input,
+    operationId: optionalString(value.operationId),
     interrupt: optionalBoolean(value.interrupt),
     asFilePointer: optionalBoolean(value.asFilePointer),
+    attachments: parseAttachments(value.attachments, optionalBoolean(value.asFilePointer), 'Panel submit request'),
     source: value.source === 'user' || value.source === 'agent' ? value.source : undefined,
+    expectReport: optionalBoolean(value.expectReport),
   };
 }
 
@@ -5368,7 +5620,26 @@ function parsePaneCreateItem(value: PaneCommandValue, index: number): RunpanePan
     // in the sidebar; the Pane UI create dialog has its own startPinned preference.
     pinned: optionalBoolean(value.pinned) ?? true,
     tool: parseRunpaneToolSpec(value.tool, `Pane create item ${index}`),
+    resume: parseResumeId(value.resume, `Pane create item ${index}`),
   };
+}
+
+function parseResumeId(value: PaneCommandValue | undefined, label: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const resume = optionalString(value)?.trim();
+  if (!resume) throw new Error(`${label} resume must be a non-empty native session id`);
+  return resume;
+}
+
+/** A resume id needs a built-in agent that Pane knows how to resume, as `panes adopt --resume`. */
+function assertResumableTool(tool: RunpaneResolvedTool, resume: string | undefined): void {
+  if (resume === undefined) return;
+  if (tool.launchMode === 'wrapped') {
+    throw new Error('--resume needs a built-in agent command; a wrapper command resumes its own way.');
+  }
+  if (tool.agent === 'opencode' && !isValidOpenCodeSessionId(resume)) {
+    throw new Error('OpenCode --resume must match the required ses_* format (^ses_[A-Za-z0-9]+$).');
+  }
 }
 
 function parseRunpaneToolSpec(value: PaneCommandValue, label: string): RunpaneToolSpec {
@@ -5383,6 +5654,7 @@ function parseRunpaneToolSpec(value: PaneCommandValue, label: string): RunpaneTo
       title: optionalString(value.title),
       initialInput: optionalString(value.initialInput),
       initialInputAsFilePointer: optionalBoolean(value.initialInputAsFilePointer),
+      initialInputAttachments: parseAttachments(value.initialInputAttachments, optionalBoolean(value.initialInputAsFilePointer), label),
     };
   }
 
@@ -5398,10 +5670,30 @@ function parseRunpaneToolSpec(value: PaneCommandValue, label: string): RunpaneTo
       title: optionalString(value.title),
       initialInput: optionalString(value.initialInput),
       initialInputAsFilePointer: optionalBoolean(value.initialInputAsFilePointer),
+      initialInputAttachments: parseAttachments(value.initialInputAttachments, optionalBoolean(value.initialInputAsFilePointer), label),
     };
   }
 
   throw new Error(`${label} tool must include agent or command`);
+}
+
+/** `--attach` files: absolute paths, sent only with a prompt file to list them beside. */
+function parseAttachments(value: PaneCommandValue, asFilePointer: boolean | undefined, label: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  let attachments: string[];
+  try {
+    attachments = decodeBoundary(value, boundary.array(boundary.string));
+  } catch {
+    throw new Error(`${label} attachments must be a list of absolute file paths`);
+  }
+  if (!attachments.every(item => path.isAbsolute(item))) {
+    throw new Error(`${label} attachments must be a list of absolute file paths`);
+  }
+  if (attachments.length === 0) return undefined;
+  if (!asFilePointer) {
+    throw new PaneError('ERR_ATTACHMENT_NEEDS_FILE_POINTER', `${label} has attachments but no prompt file to list them in. Nothing was sent.`, 'Add --as-file-pointer, then retry.');
+  }
+  return attachments;
 }
 
 function parseRepoSelector(value: PaneCommandValue): RunpaneRepoSelector {
@@ -5540,6 +5832,7 @@ function resolveToolSpec(tool: RunpaneToolSpec, environment?: ProjectEnvironment
       agent: tool.agent,
       initialInput: tool.initialInput,
       initialInputAsFilePointer: tool.initialInputAsFilePointer,
+      initialInputAttachments: tool.initialInputAttachments,
     };
   }
 
@@ -5554,6 +5847,7 @@ function resolveToolSpec(tool: RunpaneToolSpec, environment?: ProjectEnvironment
       command: tool.command,
       initialInput: tool.initialInput,
       initialInputAsFilePointer: tool.initialInputAsFilePointer,
+      initialInputAttachments: tool.initialInputAttachments,
     };
   }
 
@@ -5566,6 +5860,7 @@ function resolveToolSpec(tool: RunpaneToolSpec, environment?: ProjectEnvironment
     launchMode: commandAgent === declaredAgent ? undefined : 'wrapped',
     initialInput: tool.initialInput,
     initialInputAsFilePointer: tool.initialInputAsFilePointer,
+    initialInputAttachments: tool.initialInputAttachments,
   };
 }
 
@@ -5685,6 +5980,7 @@ async function withRunpaneAction<T extends { ok: boolean }>(
   try {
     const result = await handler();
     if (generation !== undefined && !('dryRun' in result && result.dryRun === true)) {
+      if (['panes:create', 'panels:create', 'panels:submit'].includes(action)) Object.assign(result, { epoch: services.workspaceJournal?.epoch });
       Object.assign(result, { generation });
     }
     const commandOk = result.ok;
@@ -5792,12 +6088,13 @@ function workspaceIdleCandidates(
   repoId?: number,
 ): WorkspaceIdleCandidate[] {
   return workspaceStateReader.listManagedCliPanels(repoId).flatMap((panel) => {
-    if (panel.agentState !== 'idle' || !panel.agentType) return [];
+    // A wrapper launch whose agent is not identified yet is still an agent panel.
+    if (panel.agentState !== 'idle') return [];
     const snapshotTime = panel.lastActivityTime ? Date.parse(panel.lastActivityTime) : Number.NaN;
     const idleSinceMs = workspaceJournal.readySince(panel.panelId)
       ?? (Number.isFinite(snapshotTime) ? snapshotTime : undefined);
     if (idleSinceMs === undefined) return [];
-    return [{ ...panel, agentType: panel.agentType, idleSinceMs }];
+    return [{ ...panel, idleSinceMs }];
   });
 }
 

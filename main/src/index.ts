@@ -1,14 +1,16 @@
-import { acknowledgeUpdateQuiescence } from './services/updateShutdown';
 // Answer --version before any import below logs or touches the database.
 import './versionQuery';
 // Load ReadableStream polyfill before any other imports
 import './polyfills/readablestream';
+import { agentChatManager } from './services/agentChat/agentChatManager';
+import { acknowledgeUpdateQuiescence } from './services/updateShutdown';
 
 import { hasHeadlessDaemonLaunchArg, hasRemoteSetupLaunchArg } from './utils/runtimeMode';
 import { getAppDirectory } from './utils/appDirectory';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { boundary, decodeBoundary } from '../../shared/validation/boundaryDecoder';
+import type { PaneCommandValue } from './daemon/commandRegistry';
 import type { PaneEventArgument } from './core/eventSink';
 
 const launchHeadlessDaemon = hasHeadlessDaemonLaunchArg();
@@ -1135,7 +1137,7 @@ async function initializeServices() {
   logger = services.logger;
   archiveProgressManager = services.archiveProgressManager;
   analyticsManager = services.analyticsManager;
-  powerSaveManager = new PowerSaveManager(configManager, sessionManager);
+  powerSaveManager = new PowerSaveManager(configManager, sessionManager, terminalPanelManager, { logger });
   powerSaveManager.sync();
 
   leaderboardService = new LeaderboardService(configManager);
@@ -1306,6 +1308,12 @@ if (launchRemoteSetup) {
   // Register before any renderer loads. useNotifications pulls this on mount
   // and will race a late registration inside createWindow/loadURL.
   ipcMain.handle('window:is-focused', () => mainWindow?.isFocused() ?? true);
+  // A clicked desktop notification opens its tab the way an OS pane:// link does.
+  // The window comes forward even when the tab has since been closed.
+  ipcMain.handle('window:open-pane-link', (_event, link: PaneCommandValue) => {
+    showMainWindow();
+    openPaneLink(decodeBoundary(link, boundary.string));
+  });
 
   // Start the ptyHost supervisor before the window opens so the renderer's
   // preload listener for 'ptyHost-port' has a port to receive when the window
@@ -1314,7 +1322,7 @@ if (launchRemoteSetup) {
   // legacy in-main `pty.spawn` path with zero ptyHost code executing.
   if (configManager.getUsePtyHost()) {
     try {
-      ptyHostSupervisor = new PtyHostSupervisor();
+      ptyHostSupervisor = new PtyHostSupervisor((ptyId, data) => terminalPanelManager.authorizePtyHostInput(ptyId, data));
       await ptyHostSupervisor.start();
 
       ptyHostSupervisor.on('renderer-ack', (ptyId: string, bytes: number) => {
@@ -1582,6 +1590,8 @@ if (launchRemoteSetup) {
     // Terminals exiting because Pane is quitting are not owners releasing their
     // named locks; resumed agents still hold them after the restart.
     paneDaemonHost?.services.namedLockService?.suspendAutoRelease();
+
+    await agentChatManager.stopAll();
 
     // Phase 1: Send Ctrl+C to all terminals to gracefully exit Claude instances
     // Claude needs to exit cleanly so it releases the session ID lock, allowing

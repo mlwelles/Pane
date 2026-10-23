@@ -2,6 +2,7 @@ import React, { Suspense, lazy, useEffect, useMemo, useRef } from 'react';
 import { PanelContainerProps } from '../../types/panelComponents';
 import { ErrorBoundary } from 'react-error-boundary';
 import { PanelLoadingFallback } from './PanelLoadingFallback';
+import { AgentPanelSurface } from '../agentChat/AgentPanelSurface';
 import { renderLog } from '../../utils/console';
 
 // Lazy load panel components for better performance
@@ -86,7 +87,7 @@ export const PanelContainer: React.FC<PanelContainerProps> = React.memo(({
       case 'notes':
         return <NotesPanel paneId={panel.sessionId} viewId={panel.id} />;
       case 'terminal':
-        return <TerminalPanel panel={panel} isActive={isActive} autoFocus={autoFocus} />;
+        return <AgentPanelSurface panel={panel} client={window.electronAPI.agentChat}><TerminalPanel panel={panel} isActive={isActive} autoFocus={autoFocus} /></AgentPanelSurface>;
       case 'diff':
         return <DiffPanel panel={panel} isActive={isActive} sessionId={panel.sessionId} isMainRepo={isMainRepo} />;
       case 'explorer':

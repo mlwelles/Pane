@@ -21,7 +21,7 @@ System package installations on Linux require their package manager. App updates
 require platform signature verification on macOS and Windows. The official
 Windows 2.4.182 installer is unsigned and is refused by this verifier.
 
-Install standalone Node 22 or newer and make it available on PATH to the process
+Install standalone patched Node 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x) and make it available on PATH to the process
 starting the update. The helper copies this runtime before shutdown; Electron
 inside the app being replaced is insufficient. npm must also be available when
 updating a JavaScript CLI. The supported CLI owners are:

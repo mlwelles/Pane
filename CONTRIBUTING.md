@@ -10,7 +10,7 @@ Pane is an open source project created by [Dcouple Inc](https://dcouple.ai). Dco
 
 ## Getting Started
 
-You need Node 22.18 or newer (`.nvmrc` pins 22.18.0) and pnpm 10. If you don't
+You need patched Node 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x), and pnpm 10. `.nvmrc` pins 22.23.4. If you don't
 have pnpm 10, `corepack enable` provides the version pinned in `package.json`.
 
 1. Fork the repository on GitHub and clone your fork.
@@ -246,7 +246,8 @@ Releases, CI and deploys are covered in [RUNBOOK.md](RUNBOOK.md).
 ### Manual Testing
 
 Test UI and packaging changes in a packaged build for your platform
-(`pnpm build:mac`, `pnpm build:linux` or `pnpm build:win:x64`; output in
+(`pnpm build:mac`, `pnpm build:linux:x64` on x64 Linux,
+`pnpm build:linux:arm64` on ARM64 Linux, or `pnpm build:win:x64`; output in
 `dist-electron/`). The packaged app can show problems that development mode
 hides. Check that you can create a pane, run an agent, use git operations and
 run scripts, and that settings persist after a restart.
@@ -309,4 +310,4 @@ The rebuild targets the host architecture. Use `npm rebuild
 better-sqlite3-multiple-ciphers` for Node tests, then `pnpm electron:rebuild`
 before running Electron again; only one ABI can be installed at a time.
 
-For native update/reconnect QA, set `PANE_DISABLE_OS_INTEGRATION=1` as well as an isolated `PANE_DIR` and `--user-data-dir`. This disables login-item, URL-protocol, and MCP-registration writes. Use an isolated app/install target; it does not make a real user installation a safe test target. Close every test app and supervisor after collecting evidence.
+For native update/reconnect QA, set `PANE_DISABLE_OS_INTEGRATION=1` as well as an isolated `PANE_DIR` and `--user-data-dir`. This disables login-item, URL-protocol, MCP-registration, and managed home-skill writes (including removal when the setting is off). Use an isolated app/install target; it does not make a real user installation a safe test target. Close every test app and supervisor after collecting evidence.

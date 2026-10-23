@@ -120,7 +120,7 @@ node scripts/generate-notices.js
 ### When to run
 
 - Automatically runs in the `build:mac*`, `build:linux*`, `release:mac*` and
-  `release:linux` scripts, and in `scripts/build-win.js` for Windows builds
+  `release:linux*` scripts, and in `scripts/build-win.js` for Windows builds
 - Should be run by hand whenever dependencies change
 
 ### License compliance

@@ -145,7 +145,7 @@ it up as a Remote Pane host:
    builds you plan to run. It only needs inbound SSH. The daemon listens on
    loopback, and you reach it through Tailscale or an SSH tunnel.
 2. SSH in as a regular user with `sudo`, not as `root`.
-3. Install what your agents need on the VM: `git`, Node.js 20 or newer (for
+3. Install what your agents need on the VM: `git`, patched Node.js 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x) (for
    `npx`), and the agent CLIs you use, such as Claude Code or Codex. Sign in
    to each CLI on the VM. Agents run there, not on your laptop.
 4. Install Tailscale and join your tailnet:
