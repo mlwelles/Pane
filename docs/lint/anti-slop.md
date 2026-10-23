@@ -46,7 +46,6 @@ Any future anti-slop rule must reach a zero baseline for the full scope before
 joining the blocking configuration. Do not silence a class globally to make a
 promotion appear clean.
 
-The root development toolchain requires Node 22.18 or newer because Oxlint's
-TypeScript plugin runs under the developer Node process. This does not change
-Electron 41's bundled Node 24 runtime, and the published `runpane` wrapper keeps
-its Node 20 runtime floor.
+The root development toolchain requires patched Node 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x) for the eMudhra CA
+fix. Oxlint's TypeScript plugin runs under the developer Node process. This does not change
+Electron 43's bundled Node 24 runtime, and the published `runpane` wrapper requires the same patched standalone Node ranges.

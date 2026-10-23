@@ -1,3 +1,6 @@
+import { openAgentViewMenu } from '../../components/agentChat/openAgentViewMenu';
+import type { AgentChatClient } from '../../../../shared/types/agentChat';
+import { AgentViewMenu } from '../../components/agentChat/AgentViewMenu';
 import { ChevronDown, Globe, Plus, TerminalSquare } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -20,6 +23,7 @@ export interface RemoteTerminalCreateOptions {
 }
 
 interface RemotePanelTabsProps {
+  agentChat?: AgentChatClient;
   panels: ToolPanel[];
   selectedPanelId: string | null;
   creating: boolean;
@@ -31,6 +35,7 @@ interface RemotePanelTabsProps {
 
 export function RemotePanelTabs({
   panels: hostPanels,
+  agentChat,
   selectedPanelId,
   creating,
   customCommands,
@@ -123,8 +128,8 @@ export function RemotePanelTabs({
     <div className="flex min-h-12 shrink-0 items-end gap-2 border-b border-border-primary bg-bg-secondary px-2 pt-2">
       <div className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto" role="tablist" aria-label="Remote tool panels">
         {panels.map((panel, index) => (
+          <div key={panel.id} className="relative shrink-0" onContextMenu={panel.type === 'terminal' ? openAgentViewMenu : undefined}>
           <button
-            key={panel.id}
             ref={(element) => { tabRefs.current[index] = element; }}
             type="button"
             role="tab"
@@ -136,7 +141,7 @@ export function RemotePanelTabs({
             onKeyDown={(event) => handleTabKeyDown(event, index)}
             // No transition: the selected tab is how you confirm the switch
             // landed, so it has to be right on the frame you tapped it.
-            className={`relative flex h-10 max-w-[min(12rem,55vw)] shrink-0 items-center gap-2 rounded-t-lg border px-3 text-sm font-medium shadow-sm ${
+            className={`relative flex h-10 max-w-[min(12rem,55vw)] shrink-0 items-center gap-2 rounded-t-lg border px-3 text-sm font-medium shadow-sm ${panel.type === 'terminal' && agentChat ? 'pr-10' : ''} ${
               selectedPanelId === panel.id
                 ? 'border-border-primary border-b-bg-primary bg-bg-primary text-text-primary shadow-[0_-1px_0_rgba(255,255,255,0.04)_inset]'
                 : 'border-border-secondary bg-surface-primary text-text-secondary hover:border-border-primary hover:bg-surface-hover hover:text-text-primary'
@@ -146,6 +151,8 @@ export function RemotePanelTabs({
             <span className="flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden="true">{getPanelIcon(panel.type, panel, 'h-4 w-4')}</span>
             <span className="truncate">{panel.title}</span>
           </button>
+          {panel.type === 'terminal' && agentChat && <AgentViewMenu panelId={panel.id} title={panel.title} client={agentChat} className="absolute right-1 top-1/2 z-20 -translate-y-1/2" />}
+          </div>
         ))}
       </div>
 

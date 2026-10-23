@@ -1,6 +1,8 @@
 // Retry only reviewed reads. A command name or runtime ID cannot prove that
 // replaying it is safe after the host applied it but its response was lost.
 export const REMOTE_READ_CHANNELS = new Set([
+  'agent-chat:get',
+  'agent-chat:receipt',
   'runpane:update:progress',
   'config:get',
   'config:get-session-preferences',

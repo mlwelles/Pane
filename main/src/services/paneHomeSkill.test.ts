@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   PANE_MANAGED_SKILL_MARKER,
   buildPaneHomeSkill,
@@ -22,10 +22,22 @@ describe('Pane home skill', () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await fs.rm(home, { recursive: true, force: true });
   });
 
   const skillPath = (dir: string) => path.join(dir, 'SKILL.md');
+
+  it('does not touch home skills when OS integration is disabled for an isolated runtime', async () => {
+    await fs.mkdir(dirs[0], { recursive: true });
+    const previous = `old managed skill\n${PANE_MANAGED_SKILL_MARKER}\n`;
+    await fs.writeFile(skillPath(dirs[0]), previous);
+    vi.stubEnv('PANE_DISABLE_OS_INTEGRATION', '1');
+    expect(await syncPaneHomeSkill({}, dirs)).toEqual([]);
+    expect(await syncPaneHomeSkill({ agentContext: { homeSkill: false } }, dirs)).toEqual([]);
+    await expect(fs.readFile(skillPath(dirs[0]), 'utf8')).resolves.toBe(previous);
+    await expect(fs.access(dirs[1])).rejects.toThrow();
+  });
 
   it('targets Claude user skills (honoring CLAUDE_CONFIG_DIR) and ~/.agents/skills', () => {
     expect(paneHomeSkillDirs({}, home)).toEqual([
@@ -37,6 +49,11 @@ describe('Pane home skill', () => {
       '\\\\wsl.localhost\\Ubuntu\\home\\anna\\.config\\claude\\skills\\pane',
       '\\\\wsl.localhost\\Ubuntu\\home\\anna\\.agents\\skills\\pane',
     ]);
+  });
+
+  it('points every agent at the bundled orchestrator guide', () => {
+    const skill = buildPaneHomeSkill();
+    expect(skill).toContain('runpane docs read --doc skills/pane-orchestration/SKILL.md');
   });
 
   it('installs a marked skill and rewrites only when it changes', async () => {

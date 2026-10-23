@@ -89,8 +89,12 @@ export class ConfigManager extends EventEmitter {
       defaultPermissionMode: 'ignore',
       defaultModel: 'sonnet',
       defaultOrchestratorAgent: DEFAULT_PANE_CHAT_AGENT,
+      agentChatEnabled: true,
+      defaultAgentInterface: 'terminal',
       autoStartOnBoot: true,
       keepAwakeWhileSessionsActive: true,
+      keepAwakeWhilePluggedIn: true,
+      keepAwakeOnBattery: false,
       notifications: {
         playSound: true,
         enabled: true
@@ -230,6 +234,8 @@ export class ConfigManager extends EventEmitter {
         defaultOrchestratorAgent: normalizePaneChatAgent(
           loadedConfig.defaultOrchestratorAgent ?? this.config.defaultOrchestratorAgent,
         ),
+        agentChatEnabled: loadedConfig.agentChatEnabled !== false,
+        defaultAgentInterface: loadedConfig.defaultAgentInterface === 'chat' ? 'chat' : 'terminal',
         remoteDaemon: normalizeRemoteDaemonConfig(loadedConfig.remoteDaemon),
         // Use !== undefined to distinguish "user cleared all entries" (empty array → preserve)
         // from "field absent in config file" (→ use defaults)
@@ -435,6 +441,7 @@ export class ConfigManager extends EventEmitter {
         defaultOrchestratorAgent: 'defaultOrchestratorAgent' in updates
           ? normalizePaneChatAgent(updates.defaultOrchestratorAgent)
           : this.config.defaultOrchestratorAgent,
+        defaultAgentInterface: 'defaultAgentInterface' in updates ? updates.defaultAgentInterface === 'chat' ? 'chat' : 'terminal' : this.config.defaultAgentInterface,
         remoteDaemon: 'remoteDaemon' in updates
           ? normalizeRemoteDaemonConfig(updates.remoteDaemon)
           : this.config.remoteDaemon,

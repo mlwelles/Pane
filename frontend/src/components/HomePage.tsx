@@ -402,12 +402,12 @@ export function HomePage() {
 
             <div
               className="flex items-center justify-between rounded-lg bg-surface-secondary p-4"
-              title="Prevents the system from idle-sleeping while any session is active. The display can still turn off; closing the lid or choosing Sleep still sleeps the machine."
+              title="Stops idle sleep while an agent is running or waiting. Choose when it applies, plugged in or on battery, in Settings → General → Power."
             >
               <span className="text-text-primary">Keep Awake</span>
               <Toggle
                 checked={config?.keepAwakeWhileSessionsActive !== false}
-                aria-label="Keep computer awake while sessions are active"
+                aria-label="Keep awake while sessions are active"
                 onChange={(value) => void updateConfig({ keepAwakeWhileSessionsActive: value }).catch(() => {})}
               />
             </div>

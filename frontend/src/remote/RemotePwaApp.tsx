@@ -1001,6 +1001,7 @@ export function RemotePwaApp() {
         {openOrchestrationSession && <SessionBlockers sessionId={openOrchestrationSession.session.id} fallback={openOrchestrationSession.session.blockers} />}
 
         <RemotePanelTabs
+          agentChat={adapter.agentChat}
           panels={selectedPanels}
           selectedPanelId={selectedPanel?.id ?? null}
           creating={creatingTerminal}

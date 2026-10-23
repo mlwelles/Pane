@@ -6,15 +6,16 @@ import { ActivityIndicator, Keyboard, KeyboardAvoidingView, Platform, Pressable,
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { OrchestrationSessionView } from '@shared/types/orchestrationSession';
-import type { ToolPanel } from '@shared/types/panels';
+import type { TerminalPanelState, ToolPanel } from '@shared/types/panels';
 import type { RemotePwaAffordances } from '@shared/types/remoteDaemon';
 
 import { useDaemon, useInvokeMutation, useInvokeQuery } from '@/daemon';
 import { useTheme } from '@/theme';
 import { EmptyState, ErrorState, Icon, Text } from '@/ui';
 
-import { draftKey, readDraft, writeDraft } from '../composer/composerDrafts';
-import { insertAtSelection, type Selection } from '../composer/insertText';
+import { AgentConversationSurface } from '../agentChat/AgentConversationSurface';
+import { draftKey } from '../composer/composerDrafts';
+import { useComposerDraft } from '../composer/useComposerDraft';
 import { useAffordances } from '../hosts/hostSettings';
 import { clearPaneNotifications } from '../notifications/device';
 import { useMarkPaneSeen } from '../panes/hooks';
@@ -87,6 +88,8 @@ export function TerminalScreen({ paneId, session }: { paneId: string; session?: 
   const panes = terminalPanels(panelList.data ?? []);
   const panels = session ? sessionWorkspacePanels(session, panes) : panes;
   const panel = pickPanel(panels, panelId ?? null, hostActive.data?.id);
+  const conversation = (panel?.state.customState as TerminalPanelState | undefined)?.agentChat?.conversation;
+  const terminalActive = !!panel && (!conversation || (conversation.active === 'terminal' && !conversation.transition));
   const title = session ? session.session.name || 'Untitled' : pane.data?.name ?? '';
 
   const composer = useComposerDraft(panel ? draftKey(profile.id, paneId, panel.id) : null);
@@ -108,17 +111,17 @@ export function TerminalScreen({ paneId, session }: { paneId: string; session?: 
       behavior="padding"
       style={[styles.fill, { backgroundColor: theme.colors.surface }]}
     >
-      <TerminalTopBar paneName={title} onClearScrollback={panel ? () => terminalActions.current?.clearScrollback() : undefined} />
+      <TerminalTopBar paneName={title} onClearScrollback={terminalActive ? () => terminalActions.current?.clearScrollback() : undefined} />
       <PanelTabs
         panels={panels}
         selectedId={panel?.id ?? null}
         onSelect={selectPanel}
         onAdd={() => router.push({ pathname: '/pane/[paneId]/new-panel', params: session ? { paneId, sessionId: session.session.id } : { paneId } })}
-        onStop={panel ? () => terminalActions.current?.stop() : undefined}
+        onStop={terminalActive ? () => terminalActions.current?.stop() : undefined}
       />
       {panel ? (
+        <AgentConversationSurface key={panel.id} panel={panel} draft={draft} onChangeDraft={setDraft} confirmDraft={composer.confirmDelivery}>
         <TerminalPanel
-          key={panel.id}
           panel={panel}
           actions={terminalActions}
           draft={draft}
@@ -131,6 +134,7 @@ export function TerminalScreen({ paneId, session }: { paneId: string; session?: 
           // Older hosts send no change events, so read the list fresh each time.
           onOpenShortcuts={() => void affordances.refetch()}
         />
+        </AgentConversationSurface>
       ) : (
         <View style={[styles.fill, { backgroundColor: theme.terminal.background }]}>
           {panelList.isPending ? (
@@ -324,49 +328,6 @@ function TerminalPanel({ panel, actions, draft, onChangeDraft, composer, uploads
       <CopySheet visible={showCopy} onClose={() => setShowCopy(false)} panelId={panel.id} screenText={terminal.screenText} />
     </>
   );
-}
-
-function initialDraft(key: string | null): DraftState {
-  return { key, text: key ? readDraft(key) : '', cursor: null, moveTo: undefined };
-}
-
-interface DraftState {
-  /** Where the text is saved; null before a terminal tab is chosen. */
-  key: string | null;
-  text: string;
-  /** Last known cursor; null means the end. */
-  cursor: Selection | null;
-  /** A cursor move the input should apply once, after an insert. */
-  moveTo: Selection | undefined;
-}
-
-/**
- * The draft and its cursor, kept together so uploads, dictation, paste and
- * shortcuts land where the person was typing, even when two arrive at once.
- * Each terminal tab has its own draft, kept on the device under `key` until
- * sent, so it survives leaving the pane and restarting the app.
- */
-function useComposerDraft(key: string | null) {
-  const [state, setState] = useState<DraftState>(() => initialDraft(key));
-  // Switching tabs loads that tab's draft.
-  if (state.key !== key) setState(initialDraft(key));
-  useEffect(() => {
-    if (state.key) writeDraft(state.key, state.text);
-  }, [state.key, state.text]);
-  return {
-    draft: state.text,
-    selection: state.moveTo,
-    setDraft: (next: SetStateAction<string>) => setState(current => {
-      const text = typeof next === 'function' ? next(current.text) : next;
-      return { ...current, text, cursor: text === '' ? null : current.cursor, moveTo: undefined };
-    }),
-    onSelectionChange: (cursor: Selection) => setState(current => ({ ...current, cursor, moveTo: undefined })),
-    insert: (insert: string) => setState(current => {
-      const result = insertAtSelection(current.text, current.cursor, insert);
-      const cursor = { start: result.cursor, end: result.cursor };
-      return { ...current, text: result.text, cursor, moveTo: cursor };
-    }),
-  };
 }
 
 function useKeyboardVisible(): boolean {

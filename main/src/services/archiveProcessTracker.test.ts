@@ -3,6 +3,17 @@ import { once } from 'events';
 import { expect, it, vi } from 'vitest';
 import { ArchiveProcessTracker, readArchiveProcesses, type ArchiveProcessIdentity } from './archiveProcessTracker';
 
+it('retains children born after the initial capture while refreshing only known lifetimes', async () => {
+  const birth = (n: number) => process.platform === 'win32' ? String(100 + n) : `2026-10-03T00:00:0${n}Z`;
+  let saved: ArchiveProcessIdentity[] = [];
+  const tracker = new ArchiveProcessTracker([{ pid: 1000001, parent: 0, started: birth(1) }], items => { saved = items; }, async () => [
+    { pid: 1000001, parent: 0, started: birth(1), exited: false },
+    { pid: 1000002, parent: 1000001, started: birth(2), exited: false },
+  ]);
+  await tracker.refresh();
+  expect(saved.map(item => item.pid)).toEqual([1000001, 1000002]);
+});
+
 it('does not adopt a child whose stale PPID now belongs to a newer parent', async () => {
   const birth = (n: number) => process.platform === 'win32' ? String(100 + n) : `2026-10-03T00:00:0${n}Z`;
   let saved: ArchiveProcessIdentity[] = [];

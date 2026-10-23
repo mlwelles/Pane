@@ -32,7 +32,7 @@ export const SETTINGS_CATEGORIES: readonly SettingsCategoryDefinition[] = [
     description: 'Startup, application updates, feedback, port discovery, and opening files.',
     icon: Settings,
     settingIds: ['automatic-updates', 'check-updates-now', 'send-feedback', 'start-on-login', 'keep-awake', 'html-file-open-mode', 'port-discovery-mode'],
-    aliases: ['startup', 'updates', 'feedback', 'bug report', 'feature request', 'github issue', 'login', 'sleep', 'caffeinate', 'awake', 'power', 'html', 'preview', 'open html', 'explorer', 'source', 'ports', 'discovery', 'active', 'passive', 'probes', 'forwarding'],
+    aliases: ['startup', 'updates', 'feedback', 'bug report', 'feature request', 'github issue', 'login', 'sleep', 'caffeinate', 'awake', 'power', 'battery', 'plugged in', 'lid', 'html', 'preview', 'open html', 'explorer', 'source', 'ports', 'discovery', 'active', 'passive', 'probes', 'forwarding'],
   },
   {
     id: 'appearance',
@@ -55,7 +55,7 @@ export const SETTINGS_CATEGORIES: readonly SettingsCategoryDefinition[] = [
     label: 'AI & Agents',
     description: 'Agent defaults, context, and CLI installations.',
     icon: Bot,
-    settingIds: ['default-pane-chat-agent', 'mcp-registration', 'mcp-toolsets', 'agent-skill', 'agent-context', 'session-defaults', 'claude-executable'],
+    settingIds: ['agent-chat-enabled', 'default-agent-interface', 'default-pane-chat-agent', 'mcp-registration', 'mcp-toolsets', 'agent-skill', 'agent-context', 'session-defaults', 'claude-executable'],
     aliases: ['claude', 'codex', 'cursor', 'pane chat', 'agents.md', 'mcp', 'tools', 'skill'],
   },
   {

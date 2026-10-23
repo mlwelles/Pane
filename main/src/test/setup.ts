@@ -1,4 +1,5 @@
 // Test setup file for Vitest
+import { EventEmitter } from 'events';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -32,6 +33,10 @@ export const powerSaveBlocker = {
   stop: vi.fn(),
   isStarted: vi.fn(() => false),
 };
+
+export const powerMonitor = Object.assign(new EventEmitter(), {
+  isOnBatteryPower: vi.fn(() => false),
+});
 
 export const BrowserWindow = vi.fn();
 

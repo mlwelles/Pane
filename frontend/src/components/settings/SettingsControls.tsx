@@ -33,6 +33,45 @@ export function ImmediateToggle({ value, onSave, label, disabled }: ImmediateTog
   );
 }
 
+interface ImmediateCheckboxProps {
+  value: boolean;
+  onSave: (value: boolean) => Promise<boolean>;
+  label: string;
+  description?: string;
+  disabled?: boolean;
+}
+
+/**
+ * A labelled checkbox that saves on change. It shows the new value while the
+ * save runs, then the saved config's value, so a failed save shows the old one.
+ */
+export function ImmediateCheckbox({ value, onSave, label, description, disabled }: ImmediateCheckboxProps) {
+  const [pendingValue, setPendingValue] = useState<boolean | null>(null);
+
+  return (
+    <label className={cn('flex items-start gap-2.5', disabled ? 'cursor-not-allowed' : 'cursor-default')}>
+      <input
+        type="checkbox"
+        checked={pendingValue ?? value}
+        disabled={disabled || pendingValue !== null}
+        onChange={async (event) => {
+          setPendingValue(event.target.checked);
+          try {
+            await onSave(event.target.checked);
+          } finally {
+            setPendingValue(null);
+          }
+        }}
+        className="mt-0.5 rounded border-border-primary text-interactive focus:ring-interactive"
+      />
+      <span className="min-w-0">
+        <span className="block text-sm text-text-primary">{label}</span>
+        {description && <span className="block text-xs leading-relaxed text-text-tertiary">{description}</span>}
+      </span>
+    </label>
+  );
+}
+
 interface SegmentedOption<T extends string | number> {
   id: T;
   label: string;

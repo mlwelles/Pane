@@ -7,6 +7,17 @@ packages:
   - 'shared'
 minimumReleaseAge: 10080
 minimumReleaseAgeExclude:
+  # Exact ACP and assistant-ui releases validated together by the Chat fixtures.
+  - '@agentclientprotocol/sdk@2.0.1'
+  - '@assistant-ui/react@0.15.31'
+  # Native distribution matching the web runtime's core/store/tap versions.
+  - '@assistant-ui/react-native@0.1.50'
+  - '@assistant-ui/core@0.3.31'
+  - '@assistant-ui/store@0.3.22'
+  - '@assistant-ui/tap@0.9.24'
+  - 'assistant-cloud@0.2.8'
+  - 'assistant-stream@0.3.54'
+  - 'safe-content-frame@0.0.34'
   - electron
   # Capacitor's core/platform packages must stay in one tested release family.
   - '@capacitor/android'

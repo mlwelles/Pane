@@ -46,6 +46,8 @@ import {
   runPanesRename,
   runPanesFocus,
   runReport,
+  runInbox,
+  runInboxAck,
   runPanelsOpen,
   runSessionsAssociate,
   runSessionsCreate,
@@ -76,6 +78,7 @@ import {
   type WrapperTelemetryContext
 } from './telemetry';
 import { printVersion } from './version';
+import { assertSupportedCliRuntime } from './nodeRuntime';
 import {
   readTailnet,
   readWorkspaceSummary,
@@ -92,6 +95,7 @@ import {
 const SOURCE = 'npm' as const;
 
 export async function main(argv: string[]): Promise<number> {
+  assertSupportedCliRuntime(process.versions.node, process.versions.electron);
   if (argv[0] === '__update-runner' && argv.length === 2) return runUpdateHelper(argv[1]);
   const telemetryContext = createInitialTelemetryContext(argv);
   if (argv.length === 0) {
@@ -329,6 +333,8 @@ const commandHandlers = new Map<string, CommandHandler>(Object.entries({
   'report': async (parsed, telemetryContext) => {
     return runReport(parsed);
   },
+  'inbox': async (parsed) => runInbox(parsed),
+  'inbox ack': async (parsed) => runInboxAck(parsed),
   'agents doctor': async (parsed, telemetryContext) => {
     return runAgentsDoctor(parsed);
   },

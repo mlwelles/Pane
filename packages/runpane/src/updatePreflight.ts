@@ -101,7 +101,7 @@ function findUpdateRuntime(): string {
   if (!process.versions.electron) return process.execPath;
   const candidates = (process.env.PATH ?? '').split(path.delimiter).map(directory => path.join(directory, process.platform === 'win32' ? 'node.exe' : 'node'));
   const node = candidates.find(file => fs.existsSync(file) && fs.realpathSync(file) !== fs.realpathSync(process.execPath));
-  if (!node) fail('No independent Node runtime is available; the managed CLI is running inside Electron.', 'Install standalone Node 22 or newer, then retry.');
+  if (!node) fail('No independent Node runtime is available; the managed CLI is running inside Electron.', 'Install standalone patched Node 22.23.4+ (22.x), 24.22.1+ (24.x), or 26.12.1+ (26.x), then retry.');
   return node;
 }
 

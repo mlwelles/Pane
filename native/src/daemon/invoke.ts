@@ -1,3 +1,5 @@
+import { boundary, decodeOptionalBoundary } from '@shared/validation/boundaryDecoder';
+
 interface InvokeClient {
   invoke(channel: string, args?: unknown[]): Promise<unknown>;
 }
@@ -26,5 +28,5 @@ export async function invokeChannel<T>(client: InvokeClient, channel: string, ar
 }
 
 function isIpcResponse(value: unknown): value is IpcLikeResponse {
-  return typeof value === 'object' && value !== null && ('success' in value || 'data' in value || 'error' in value);
+  return decodeOptionalBoundary(value, boundary.object({ success: boundary.boolean })) !== undefined;
 }

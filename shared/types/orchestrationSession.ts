@@ -2,6 +2,7 @@ import type { CustomCommandResume } from './customCommandResume';
 import type { AgentState } from './agentStatus';
 import type { PaneChatAgent } from './paneChat';
 import type { TerminalAgentReport, ToolPanel } from './panels';
+import type { JsonObject } from '../validation/boundaryDecoder';
 
 /** Stable identifier of the built-in orchestration session imported from Pane Chat. */
 export const LEGACY_ORCHESTRATION_SESSION_ID = 'legacy-pane-chat';
@@ -90,6 +91,11 @@ export interface OrchestrationSessionRecord {
   /** Empty uses the selected built-in agent command. */
   launchCommand?: string;
   customResume?: CustomCommandResume | null;
+  /**
+   * A native conversation of `agent` the Session's tab resumes (`runpane handoff` moving a
+   * Session). Saved with the record, so a tab created or repaired at startup still resumes it.
+   */
+  resume?: string;
   /** Snapshot of the behavior profile, independent of app defaults. */
   profile?: string;
   /** Hidden detached Pane session that owns the durable terminal conversation. */
@@ -162,6 +168,17 @@ export interface OrchestrationPanelOverview {
   initialized: boolean;
   lastActivityAt?: string;
   missing?: boolean;
+  /** This panel's latest `runpane report`. */
+  report?: OrchestrationPanelReport;
+}
+
+/**
+ * A panel's report as the overview returns it. `data` is the summary parsed as
+ * given when it is a complete JSON object; a plain-text, array, scalar, invalid,
+ * truncated, or more than 64 levels deep summary has no `data`.
+ */
+export interface OrchestrationPanelReport extends TerminalAgentReport {
+  data?: JsonObject;
 }
 
 export interface OrchestrationPaneOverview {
@@ -197,6 +214,11 @@ export interface OrchestrationSessionCreateInput {
   agent?: PaneChatAgent;
   launchCommand?: string;
   customResume?: CustomCommandResume | null;
+  /**
+   * A native session id of `agent` to resume: the Session's agent tab resumes that conversation
+   * when it first opens, instead of starting a new one. `runpane handoff` uses it to move a Session.
+   */
+  resume?: string;
   profile?: string;
   goal?: string;
   context?: string;

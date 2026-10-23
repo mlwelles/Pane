@@ -1,6 +1,6 @@
 {
   "name": "Pane",
-  "version": "2.4.185-mlwelles.1.1.1",
+  "version": "2.4.194-mlwelles.1.0.0",
   "private": true,
   "description": "Pane - Terminal-first AI code assistant manager with Windows support",
   "author": {
@@ -11,7 +11,7 @@
   "license": "AGPL-3.0",
   "main": "main/dist/main/src/index.js",
   "engines": {
-    "node": ">=22.18.0",
+    "node": "^22.23.4 || ^24.22.1 || ^26.12.1",
     "pnpm": ">=8.0.0"
   },
   "pnpm": {
@@ -50,8 +50,8 @@
     "build:mac:x64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && node scripts/configure-build.js && electron-builder --mac --x64 --publish never",
     "build:mac:arm64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && node scripts/configure-build.js && electron-builder --mac --arm64 --publish never",
     "build:linux": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux --publish never",
-    "build:linux:x64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux --x64 --publish never",
-    "build:linux:arm64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux --arm64 --publish never",
+    "build:linux:x64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux deb:x64 AppImage:x64 --publish never",
+    "build:linux:arm64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux deb:arm64 AppImage:arm64 --publish never",
     "build:linux:ci": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux --publish never",
     "build:mac:ci": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && node scripts/configure-build.js && electron-builder --mac --publish never && node scripts/verify-mac-universal-binaries.js",
     "build:win:x64": "node scripts/build-win.js x64",
@@ -72,6 +72,8 @@
     "release:mac": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && node scripts/configure-build.js && electron-builder --mac --publish always && node scripts/verify-mac-universal-binaries.js",
     "release:mac:universal": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && node scripts/configure-build.js && electron-builder --mac --universal --publish always && node scripts/verify-mac-universal-binaries.js",
     "release:linux": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux --publish always",
+    "release:linux:x64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux deb:x64 AppImage:x64 --publish always",
+    "release:linux:arm64": "pnpm run build:frontend && pnpm run build:main && pnpm run inject-build-info && pnpm run generate-notices && electron-builder --linux deb:arm64 AppImage:arm64 --publish always",
     "preview": "pnpm run --filter frontend preview",
     "lint": "pnpm run lint:ox && pnpm run lint:eslint && pnpm run lint:ox:extra && pnpm run lint:ox:boundary-conformance && pnpm run deadcode",
     "lint:ox": "oxlint --config .oxlintrc.json frontend main packages/runpane shared tests scripts tools playwright.config.ts playwright.shared.ts playwright.ci.config.ts playwright.ci.minimal.config.ts",
@@ -106,6 +108,7 @@
     "test:headed": "playwright test --headed"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "2.0.1",
     "@anthropic-ai/sdk": "^0.60.0",
     "@lydell/node-pty": "1.2.0-beta.3",
     "@modelcontextprotocol/sdk": "^1.12.1",
@@ -128,7 +131,7 @@
     "@playwright/test": "^1.52.0",
     "ajv": "6.12.6",
     "concurrently": "^9.1.0",
-    "electron": "41.10.3",
+    "electron": "43.8.3",
     "electron-builder": "26.7.0",
     "electron-builder-squirrel-windows": "26.7.0",
     "esbuild": "0.25.7",
